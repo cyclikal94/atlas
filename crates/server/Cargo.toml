@@ -1,0 +1,33 @@
+[package]
+name = "atlas-server"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[dependencies]
+atlas-core = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true, features = ["std"] }
+axum = { workspace = true }
+argon2 = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
+uuid = { workspace = true, features = ["v4"] }
+openidconnect = { workspace = true, features = ["reqwest", "rustls-tls", "timing-resistant-secret-traits"] }
+axum-extra = { workspace = true, features = ["cookie"] }
+url = { workspace = true }
+time = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls", "json"] }
+web-push = { workspace = true }
+ring = { workspace = true }
+base64 = { workspace = true }
+chrono-tz = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+tempfile = { workspace = true }
+ece = { workspace = true }

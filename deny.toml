@@ -1,0 +1,23 @@
+[graph]
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+all-features = true
+
+[advisories]
+unmaintained = "workspace"
+unsound = "all"
+# Atlas uses provider PUBLIC keys for OIDC verification, never RSA signing/decryption.
+# Reassess before adding private-key operations; see docs/authentication.md.
+ignore = [{ id = "RUSTSEC-2023-0071", reason = "OIDC public-key verification only; no RSA private keys or private operations in Atlas" }]
+
+[licenses]
+# Web Push uses unmodified MPL-2.0 ece and BSD-2-Clause coarsetime.
+confidence-threshold = 0.95
+allow = ["AGPL-3.0-only", "MIT", "Apache-2.0", "BSD-3-Clause", "BSD-2-Clause", "MPL-2.0", "ISC", "Unicode-3.0", "Zlib", "CDLA-Permissive-2.0"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
