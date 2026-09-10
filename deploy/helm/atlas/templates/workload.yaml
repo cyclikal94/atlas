@@ -1,0 +1,83 @@
+{{- if and (not .Values.postgresql.enabled) (not .Values.database.existingSecret) }}
+{{- fail "PostgreSQL requires database.existingSecret or postgresql.enabled with postgresql.existingSecret" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: api
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: atlas
+          image: {{ printf "%s:%s" .Values.image.repository .Values.image.tag | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: ATLAS_BIND
+              value: 0.0.0.0:3000
+            - name: ATLAS_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ if .Values.postgresql.enabled }}{{ required "postgresql.existingSecret is required" .Values.postgresql.existingSecret }}{{ else }}{{ .Values.database.existingSecret }}{{ end }}
+                  key: ATLAS_DATABASE_URL
+            {{- range $key, $value := .Values.config }}
+            {{- if has $key (list "ATLAS_BIND" "ATLAS_DATABASE_URL" "ATLAS_DATABASE_URL_FILE" "ATLAS_SECRET_KEY" "ATLAS_OIDC_CLIENT_SECRET" "ATLAS_VAPID_PRIVATE_KEY") }}
+            {{- fail (printf "%s must use dedicated configuration or a Secret" $key) }}
+            {{- end }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          {{- with .Values.existingSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ . }}
+          {{- end }}
+          startupProbe:
+            httpGet: {path: /health, port: http}
+            failureThreshold: 30
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+          readinessProbe:
+            httpGet: {path: /ready, port: http}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http

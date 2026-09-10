@@ -1,0 +1,192 @@
+name: Release
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 - <<'PYTHON'
+          import os, re
+          version = '0.0.0-dev'
+          if os.environ['EVENT_NAME'] == 'push':
+              tag = os.environ['REF_NAME']
+              number = r'(?:0|[1-9][0-9]*)'
+              identifier = rf'(?:{number}|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
+              if not re.fullmatch(rf'v{number}\.{number}\.{number}(?:-{identifier}(?:\.{identifier})*)?', tag):
+                  raise SystemExit('Release tags must be vMAJOR.MINOR.PATCH with an optional prerelease suffix')
+              version = tag[1:]
+              if len(tag) > 120:
+                  raise SystemExit('Release tag is too long for container tags')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\n')
+          PYTHON
+  package:
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - run: cargo test --locked --workspace
+      - run: cargo build --release --locked -p atlas-server
+      - run: cargo install cargo-about --version 0.9.2 --locked --features cli
+      - name: Package native executable
+        env:
+          ATLAS_TARGET: ${{ matrix.target }}
+        run: |
+          scripts/package-release.sh "$ATLAS_TARGET" atlas-release
+          tar -czf "atlas-$ATLAS_TARGET.tar.gz" atlas-release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: atlas-${{ matrix.target }}
+          path: atlas-*.tar.gz
+          if-no-files-found: error
+  image:
+    needs: metadata
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: atlas-api:release
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - run: python3 scripts/smoke_container.py atlas-api:release
+      - run: docker save atlas-api:release | gzip > "atlas-image-$RUNNER_ARCH.tar.gz"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: image-${{ runner.arch }}
+          path: atlas-image-*.tar.gz
+          if-no-files-found: error
+
+  chart:
+    needs: metadata
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: helm lint deploy/helm/atlas --set database.existingSecret=release-validation
+      - name: Package chart with release image defaults
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          cp -R deploy/helm/atlas "$RUNNER_TEMP/atlas"
+          python3 - <<'PYTHON'
+          import os, pathlib
+          path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'atlas/values.yaml'
+          image = 'ghcr.io/' + os.environ['GITHUB_REPOSITORY'].lower()
+          text = path.read_text().replace('repository: atlas-api', f'repository: {image}')
+          path.write_text(text.replace('tag: local', 'tag: v' + os.environ['VERSION']))
+          PYTHON
+          helm lint "$RUNNER_TEMP/atlas" --set database.existingSecret=release-validation
+          helm package "$RUNNER_TEMP/atlas" --version "$VERSION" --app-version "$VERSION"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: helm-chart
+          path: atlas-*.tgz
+          if-no-files-found: error
+
+  publish:
+    needs: [metadata, package, image, chart]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.metadata.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: atlas-*
+          path: downloads
+          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: helm-chart
+          path: downloads
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: image-*
+          path: images
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v4
+      - name: Publish tested images and multi-architecture manifest
+        run: |
+          image="ghcr.io/${GH_REPO,,}"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          for arch in X64 ARM64; do
+            case "$arch" in X64) platform=amd64 ;; ARM64) platform=arm64 ;; esac
+            docker load --input "images/atlas-image-$arch.tar.gz"
+            actual="$(docker image inspect atlas-api:release --format '{{.Architecture}}')"
+            test "$actual" = "$platform"
+            docker tag atlas-api:release "$image:$TAG-$platform"
+            docker push "$image:$TAG-$platform"
+          done
+          docker buildx imagetools create --tag "$image:$TAG" "$image:$TAG-amd64" "$image:$TAG-arm64"
+          docker buildx imagetools inspect "$image:$TAG" > downloads/container-image.txt
+      - name: Publish OCI Helm chart
+        run: |
+          printf '%s' "$GH_TOKEN" | helm registry login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          helm push "downloads/atlas-$VERSION.tgz" "oci://ghcr.io/${GH_REPO,,}/charts"
+      - name: Publish GitHub release with checksums
+        working-directory: downloads
+        run: |
+          sha256sum ./*.tar.gz ./*.tgz ./container-image.txt > SHA256SUMS
+          printf 'Container: `ghcr.io/%s:%s`\n\nHelm: `oci://ghcr.io/%s/charts/atlas` (version `%s`)\n' "${GH_REPO,,}" "$TAG" "${GH_REPO,,}" "$VERSION" > "$RUNNER_TEMP/release-notes.md"
+          args=()
+          if [[ "$VERSION" == *-* ]]; then args+=(--prerelease); fi
+          gh release create "$TAG" ./* --verify-tag --title "Atlas $TAG" --generate-notes --notes-file "$RUNNER_TEMP/release-notes.md" "${args[@]}"
+      - name: Clear registry credentials
+        if: always()
+        run: |
+          docker logout ghcr.io
+          helm registry logout ghcr.io

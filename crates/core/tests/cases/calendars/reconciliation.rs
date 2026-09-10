@@ -56,7 +56,7 @@ fn definition() -> Definition {
         allow_streak_exclusions: false,
     }
 }
-async fn scenario(s: Store) -> Result<()> {
+async fn scenario(s: Store, other: Store) -> Result<()> {
     s.migrate().await?;
     let a = account(&s).await?;
     let b = account(&s).await?;
@@ -175,7 +175,9 @@ async fn scenario(s: Store) -> Result<()> {
             .contains("cancelled")
     );
     let old = s.begin_calendar_refresh(&a, &source, now() + 5).await?;
-    let newer = s.begin_calendar_refresh(&a, &source, now() + 66).await?;
+    let newer = other
+        .begin_calendar_refresh(&a, &source, now() + 66)
+        .await?;
     assert_eq!(
         s.finish_calendar_refresh(
             &a,
@@ -241,8 +243,8 @@ async fn scenario(s: Store) -> Result<()> {
         .timestamp();
     s.schedule_reminders(due).await?;
     let lease = s.claim_reminder_delivery(due).await?.unwrap();
-    assert!(s.claim_reminder_delivery(due).await?.is_none());
-    let replacement = s.claim_reminder_delivery(due + 61).await?.unwrap();
+    assert!(other.claim_reminder_delivery(due).await?.is_none());
+    let replacement = other.claim_reminder_delivery(due + 61).await?.unwrap();
     assert_eq!(lease.id, replacement.id);
     assert_ne!(lease.token, replacement.token);
     assert_eq!(
@@ -252,7 +254,8 @@ async fn scenario(s: Store) -> Result<()> {
             .to_string(),
         "stale_delivery"
     );
-    s.finish_reminder_delivery(&replacement.id, &replacement.token, true, false, due + 62)
+    other
+        .finish_reminder_delivery(&replacement.id, &replacement.token, true, false, due + 62)
         .await?;
     s.schedule_reminders(due + 63).await?;
     assert!(s.claim_reminder_delivery(due + 63).await?.is_none());
@@ -413,8 +416,10 @@ async fn scenario(s: Store) -> Result<()> {
 }
 #[tokio::test]
 async fn calendars() -> Result<()> {
-    let (_dir, s) = crate::support::database::fixture().await?;
-    scenario(s.clone()).await?;
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let s = Store::connect(&url).await?;
+    let other = Store::connect(&url).await?;
+    scenario(s.clone(), other).await?;
     people_and_private_anchors(s).await
 }
 

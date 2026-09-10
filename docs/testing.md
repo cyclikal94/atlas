@@ -41,3 +41,59 @@ mentions the same feature.
 Use `crates/core/examples/sync_load.rs` for current-runtime workloads. Record the
 revision, database, architecture, workload and resource limits when reporting capacity;
 results from a different implementation do not establish current throughput.
+
+## Deployment and recovery checks
+
+After building the server, `python3 scripts/test_recovery.py` exercises real SQLite
+exports, credential files, corruption rejection and occupied-destination protection.
+`scripts/test-postgres-release.sh` owns a disposable PostgreSQL cluster and runs two
+actual server processes, alternating domain HTTP requests between them, racing one
+operation ID, measuring a bounded concurrent write sample, stopping one replica and
+restoring an export into a second database. Set `ATLAS_PYTHON` to a Python environment
+with `scripts/requirements-contract.txt` installed. Worker generation and retry fencing
+are also tested through independent database pools in the calendar reconciliation cases.
+
+`python3 scripts/test_deployment_templates.py` validates Helm constraints and Compose
+configuration. It needs Helm and Docker Compose but no live daemon or cluster.
+`python3 scripts/smoke_container.py IMAGE` uses disposable PostgreSQL containers and
+checks generated notices, rejects SQLite/missing database configuration, and exercises
+tasks, people, calendars, persistence and a bounded write sample.
+
+Run `python3 scripts/test_compose.py IMAGE` for supplied/existing PostgreSQL and
+restart checks in an isolated Compose project. For a disposable kind cluster, load
+the image using `kind load docker-image IMAGE --name CLUSTER`, then run `python3 scripts/test_helm.py IMAGE --kubeconfig PATH`.
+The test owns a unique namespace and removes it afterwards; it verifies supplied and
+external PostgreSQL, two API replicas, health probes and restart persistence. Delete
+the disposable cluster after testing. Never supply a personal/production kubeconfig.
+
+Release archives and licence coverage are described in [packaging](packaging.md).
+
+## Validation scope (10 September 2026)
+
+M6 was checked on macOS 26.6.2 ARM64 with Rust 1.98.1 and PostgreSQL 17.11, and in a
+Linux ARM64 VM allocated four CPUs and 6 GiB RAM. Both database suites passed: 68 core
+cases (plus one deliberately ignored crash-process helper), 11 HTTP cases and six
+server unit tests. Real export/restore, concurrent HTTP replicas, native archive
+checksums/execution, generated notice coverage, Compose and Helm checks passed.
+The Helm workload used its configured 512 MiB memory limit for each API/database pod.
+
+The container smoke exercised tasks, people, calendars, receipt replay, restart
+persistence and sanitised logs on Linux ARM64 and emulated AMD64. Its separate bounded
+write sample created 100 people through eight concurrent clients against PostgreSQL:
+
+| Runtime | Write p50 | Write p95 |
+| --- | --- | --- |
+| Linux ARM64 release image | 13.8 ms | 48.4 ms |
+| Linux AMD64 release image under emulation | 14.3 ms | 53.4 ms |
+| Two native macOS debug processes | 12.0 ms | 38.3 ms |
+
+These short samples check concurrent execution; they are not capacity estimates or
+architecture comparisons. The dataset is small, the profiles differ, and the host/VM
+were shared with other validation work. Native Linux CI execution, sustained load,
+production storage characteristics and upgrades from future supported releases remain
+release gates. The container builds are identified by manifest digests
+`c60b83da9098a5d3950dfc20d89fce9711b063140af820ea33b8b63a4d36ad54`
+(ARM64) and `c3589277f424e78e3917cf116e22f788bbeac2366809b9356b0febce4b51c33d`
+(AMD64); native package provenance records the M6 working tree based on `b63bb66` as dirty.
+That original commit is preserved in the archived development history; these results
+have not been relabelled with rewritten commit IDs.

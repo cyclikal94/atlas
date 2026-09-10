@@ -93,6 +93,33 @@ jobs:
         env:
           ATLAS_TEST_POSTGRES_URL: postgres://postgres:local-test-only@localhost:5432/atlas_test
 
+  container:
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: docker build -t atlas-api:test .
+      - run: python3 scripts/smoke_container.py atlas-api:test
+      - run: python3 scripts/test_compose.py atlas-api:test
+      - name: Verify Helm against disposable Kubernetes
+        if: matrix.runner == 'ubuntu-24.04'
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSLO https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+          curl -fsSLO https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64.sha256sum
+          sha256sum -c kind-linux-amd64.sha256sum
+          chmod +x kind-linux-amd64
+          cd "$GITHUB_WORKSPACE"
+          export KUBECONFIG="$RUNNER_TEMP/atlas-kubeconfig"
+          trap '"$RUNNER_TEMP/kind-linux-amd64" delete cluster --name atlas-check' EXIT
+          "$RUNNER_TEMP/kind-linux-amd64" create cluster --name atlas-check --kubeconfig "$KUBECONFIG" --wait 120s
+          "$RUNNER_TEMP/kind-linux-amd64" load docker-image atlas-api:test --name atlas-check
+          python3 scripts/test_helm.py atlas-api:test --kubeconfig "$KUBECONFIG"
+
   dependencies:
     runs-on: ubuntu-24.04
     steps:
@@ -102,3 +129,19 @@ jobs:
       - run: rustup show active-toolchain
       - run: cargo install cargo-deny --version 0.20.2 --locked
       - run: cargo deny --locked check
+
+  recovery-and-replicas:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - run: python -m pip install -r scripts/requirements-contract.txt
+      - run: cargo build --locked -p atlas-server
+      - run: python scripts/test_recovery.py
+      - run: python scripts/test_deployment_templates.py
+      - run: scripts/test-postgres-release.sh

@@ -6,8 +6,19 @@ use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let url = std::env::var("ATLAS_DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite://atlas.sqlite?mode=rwc".into());
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "probe") {
+        ensure!(args.len() == 1, "usage: atlas-server probe");
+        reqwest::Client::new()
+            .get("http://127.0.0.1:3000/ready")
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await?
+            .error_for_status()?;
+        return Ok(());
+    }
+    let url = atlas_server::config::secret("ATLAS_DATABASE_URL")?
+        .unwrap_or_else(|| "sqlite://atlas.sqlite?mode=rwc".into());
     let retention_days = std::env::var("ATLAS_SYNC_RETENTION_DAYS")
         .unwrap_or_else(|_| "90".into())
         .parse()?;
@@ -15,7 +26,15 @@ async fn main() -> Result<()> {
         .await?
         .with_retention_days(retention_days)?;
     store.migrate().await?;
-    let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "prepare-restore") {
+        ensure!(
+            args.len() == 2 && args[1] == "--offline",
+            "usage: atlas-server prepare-restore --offline (all servers must be stopped)"
+        );
+        store.prepare_restored_database().await?;
+        println!("Restored database prepared; clients must log in and resynchronise.");
+        return Ok(());
+    }
     if args.first().is_some_and(|a| a == "invite") {
         ensure!(args.len() == 1, "usage: atlas-server invite");
         println!(
@@ -99,7 +118,7 @@ async fn main() -> Result<()> {
         app = app.oidc(
             &issuer,
             &std::env::var("ATLAS_OIDC_CLIENT_ID")?,
-            std::env::var("ATLAS_OIDC_CLIENT_SECRET").ok(),
+            atlas_server::config::secret("ATLAS_OIDC_CLIENT_SECRET")?,
             std::env::var("ATLAS_OIDC_AUTO_PROVISION")
                 .unwrap_or_else(|_| "false".into())
                 .parse()?,

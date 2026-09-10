@@ -108,7 +108,7 @@ impl IntegrationConfig {
     }
     pub fn from_env() -> Result<Self> {
         Self::new(
-            std::env::var("ATLAS_SECRET_KEY").ok().as_deref(),
+            crate::config::secret("ATLAS_SECRET_KEY")?.as_deref(),
             std::env::var("ATLAS_OUTBOUND_ALLOW_ORIGINS")
                 .unwrap_or_default()
                 .split(',')
@@ -116,7 +116,7 @@ impl IntegrationConfig {
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned)
                 .collect(),
-            std::env::var("ATLAS_VAPID_PRIVATE_KEY").ok(),
+            crate::config::secret("ATLAS_VAPID_PRIVATE_KEY")?,
             std::env::var("ATLAS_VAPID_SUBJECT").ok(),
         )
     }
