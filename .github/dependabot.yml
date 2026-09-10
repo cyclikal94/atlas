@@ -1,0 +1,19 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /scripts
+    schedule:
+      interval: weekly
+    groups:
+      api-contract-tooling:
+        patterns:
+          - openapi-spec-validator
+          - jsonschema
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
