@@ -4,5 +4,6 @@
 *.sqlite-wal
 .DS_Store
 __pycache__/
+/site/
 /.env
 /atlas.env

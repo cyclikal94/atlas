@@ -7,7 +7,19 @@
   },
   "servers": [
     {
-      "url": "/api/experimental/v1"
+      "url": "{scheme}://{host}{basePath}",
+      "variables": {
+        "scheme": {
+          "default": "https",
+          "enum": ["http", "https"]
+        },
+        "host": {
+          "default": "api.example.com"
+        },
+        "basePath": {
+          "default": "/api/experimental/v1"
+        }
+      }
     }
   ],
   "security": [

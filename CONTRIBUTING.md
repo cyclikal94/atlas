@@ -40,6 +40,25 @@ cargo build --locked -p atlas-server
 /tmp/atlas-contract-env/bin/python scripts/smoke_server.py
 ```
 
+Preview the documentation site that GitHub Pages publishes from `main`:
+
+```sh
+python3.14 -m venv /tmp/atlas-site-env
+/tmp/atlas-site-env/bin/python -m pip install -r scripts/requirements-site.txt
+/tmp/atlas-site-env/bin/python scripts/build_site.py site
+/tmp/atlas-site-env/bin/python -m http.server --directory site 8000
+```
+
+Then open `http://localhost:8000`. Serve the site rather than opening the files
+directly; the API explorers fetch the description over HTTP. The pinned Markdown
+release needs Python 3.10 or newer, and CI builds on the 3.14 shown above.
+
+The index page is [nav.md](docs/nav.md): its heading and prose become the
+introduction, and each `## ` section becomes a group of links, so the file also
+serves as the index when reading `docs/` on GitHub. The build refuses a document
+that file does not list, and a link that does not resolve, so give a new document
+a place in that list.
+
 The live smoke owns a disposable server/database. Container changes also require
 `scripts/smoke_container.py IMAGE` on the built image; CI covers native ARM64/AMD64.
 Store routine build logs in CI artifacts, not checked-in milestone directories.
