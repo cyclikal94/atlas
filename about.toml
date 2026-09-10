@@ -1,0 +1,8 @@
+# Distribution notices; deny.toml remains the independent dependency policy.
+accepted = ["MIT", "Apache-2.0", "BSD-3-Clause", "BSD-2-Clause", "MPL-2.0", "ISC", "Unicode-3.0", "Zlib", "CDLA-Permissive-2.0", "OpenSSL", "AGPL-3.0-only"]
+ignore-dev-dependencies = true
+# Include build dependencies conservatively: some supply code embedded in binaries.
+ignore-build-dependencies = false
+workarounds = ["ring"]
+[private]
+ignore = true

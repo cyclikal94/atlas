@@ -3,6 +3,36 @@ use anyhow::{Result, ensure};
 use sqlx::{Acquire, Any, Connection, Transaction, any::AnyPoolOptions};
 
 impl Store {
+    /// Reset delivery and login state on a restored copy, with all servers stopped.
+    /// Domain data and operation receipts retain their original identities.
+    pub async fn prepare_restored_database(&self) -> Result<()> {
+        let mut tx = self.begin_serial().await?;
+        for statement in [
+            "DELETE FROM sync_cursors",
+            "DELETE FROM sync_snapshots",
+            "DELETE FROM sync_devices",
+            "DELETE FROM sessions",
+            "DELETE FROM oidc_flows",
+            "DELETE FROM native_handoffs",
+        ] {
+            sqlx::query(statement).execute(&mut *tx).await?;
+        }
+        sqlx::query("UPDATE accounts SET access_epoch=access_epoch+1")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE account_invitations SET revoked=1")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE calendar_sources SET generation=generation+1,lease_until=0")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE reminder_deliveries SET lease_token=NULL,lease_until=0")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Initialise the current schema atomically, or validate an existing baseline.
     /// Unreleased historical schemas require an explicit operator-managed reset.
     pub async fn migrate(&self) -> Result<()> {

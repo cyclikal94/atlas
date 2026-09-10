@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "replicaCount": {"type": "integer", "minimum": 1},
+    "image": {"type": "object", "additionalProperties": false, "required": ["repository", "tag", "pullPolicy"], "properties": {
+      "repository": {"type": "string", "minLength": 1}, "tag": {"type": "string", "minLength": 1},
+      "pullPolicy": {"enum": ["Always", "IfNotPresent", "Never"]}
+    }},
+    "service": {"type": "object", "additionalProperties": false, "properties": {"port": {"type": "integer", "minimum": 1, "maximum": 65535}}},
+    "config": {"type": "object", "additionalProperties": {"type": ["string", "number", "boolean"]}},
+    "existingSecret": {"type": "string"},
+    "database": {"type": "object", "additionalProperties": false, "properties": {"existingSecret": {"type": "string"}}},
+    "resources": {"type": "object"},
+    "postgresql": {"type": "object", "additionalProperties": false, "properties": {
+      "enabled": {"type": "boolean"}, "image": {"type": "string", "minLength": 1},
+      "existingSecret": {"type": "string"}, "size": {"type": "string"}, "storageClass": {"type": "string"}
+    }}
+  }
+}

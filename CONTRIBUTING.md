@@ -40,7 +40,8 @@ cargo build --locked -p atlas-server
 /tmp/atlas-contract-env/bin/python scripts/smoke_server.py
 ```
 
-The live smoke owns a disposable server/database; CI covers native ARM64/AMD64.
+The live smoke owns a disposable server/database. Container changes also require
+`scripts/smoke_container.py IMAGE` on the built image; CI covers native ARM64/AMD64.
 Store routine build logs in CI artifacts, not checked-in milestone directories.
 Keep documentation about current decisions, behaviour, limits and unresolved work.
 Archived development history retains superseded experiments and reviews.

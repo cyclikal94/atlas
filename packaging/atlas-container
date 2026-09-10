@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+# Container deployments require an explicitly configured writable PostgreSQL database.
+if [ -n "${ATLAS_DATABASE_URL_FILE:-}" ]; then
+  if [ -n "${ATLAS_DATABASE_URL:-}" ]; then
+    echo 'Set ATLAS_DATABASE_URL or ATLAS_DATABASE_URL_FILE, not both.' >&2
+    exit 1
+  fi
+  atlas_database_url="$(cat "$ATLAS_DATABASE_URL_FILE")"
+else
+  atlas_database_url="${ATLAS_DATABASE_URL:-}"
+fi
+case "$atlas_database_url" in
+  postgres://*|postgresql://*) ;;
+  *) echo 'Container deployments require a PostgreSQL ATLAS_DATABASE_URL or ATLAS_DATABASE_URL_FILE.' >&2; exit 1 ;;
+esac
+unset atlas_database_url
+exec atlas-server "$@"

@@ -1,0 +1,84 @@
+name: Release artefacts
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - run: cargo test --locked --workspace
+      - run: cargo build --release --locked -p atlas-server
+      - run: cargo install cargo-about --version 0.9.2 --locked --features cli
+      - name: Package native executable
+        env:
+          ATLAS_TARGET: ${{ matrix.target }}
+        run: |
+          scripts/package-release.sh "$ATLAS_TARGET" atlas-release
+          tar -czf "atlas-$ATLAS_TARGET.tar.gz" atlas-release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: atlas-${{ matrix.target }}
+          path: atlas-*.tar.gz
+          if-no-files-found: error
+  image:
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: atlas-api:release
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - run: python3 scripts/smoke_container.py atlas-api:release
+      - run: docker save atlas-api:release | gzip > atlas-image.tar.gz
+      - uses: actions/upload-artifact@v7
+        with:
+          name: image-${{ runner.arch }}
+          path: atlas-image.tar.gz
+          if-no-files-found: error
+
+  chart:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: helm lint deploy/helm/atlas --set database.existingSecret=release-validation
+      - run: helm package deploy/helm/atlas
+      - uses: actions/upload-artifact@v7
+        with:
+          name: helm-chart
+          path: atlas-*.tgz
+          if-no-files-found: error

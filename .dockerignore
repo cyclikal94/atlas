@@ -1,0 +1,12 @@
+**
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates/
+!crates/**
+!LICENSE
+!about.toml
+!packaging/
+!packaging/**
+!scripts/
+!scripts/notices.sh

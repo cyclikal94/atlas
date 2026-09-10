@@ -1,0 +1,28 @@
+replicaCount: 1
+image:
+  repository: atlas-api
+  tag: local
+  pullPolicy: IfNotPresent
+service:
+  port: 3000
+# Environment variables containing non-secret configuration only.
+config: {}
+# Existing Secret containing ATLAS_SECRET_KEY, OIDC/VAPID credentials as needed.
+existingSecret: ''
+database:
+  # For external PostgreSQL, Secret key ATLAS_DATABASE_URL is required.
+  existingSecret: ''
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+postgresql:
+  enabled: false
+  image: postgres:17.11
+  # Existing Secret must contain POSTGRES_PASSWORD and ATLAS_DATABASE_URL.
+  # URL: postgres://atlas:<URL-encoded password>@<release>-postgres:5432/atlas
+  existingSecret: ''
+  size: 10Gi
+  storageClass: ''

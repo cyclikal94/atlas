@@ -1,0 +1,18 @@
+Atlas third-party Rust dependency notices
+========================================
+
+These notices cover the locked dependency graph for this build target.
+Upstream crate source archives (including the unmodified MPL-2.0 ece source)
+are available using each exact name and version below at:
+https://crates.io/api/v1/crates/NAME/VERSION/download
+Atlas source: https://github.com/cyclikal94/atlas
+
+{{#each licenses}}
+{{name}} ({{id}})
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}: https://crates.io/api/v1/crates/{{crate.name}}/{{crate.version}}/download
+{{/each}}
+
+{{{text}}}
+
+{{/each}}
