@@ -44,18 +44,29 @@ async fn scenario(store: Store) -> anyhow::Result<()> {
         1
     );
     // Bob's same-named device is independent of Alice's device and sessions.
-    assert_eq!(
-        call(
-            &app,
-            "DELETE",
-            "devices/phone",
-            Some(&tokens[2]),
-            Value::Null
-        )
-        .await
-        .0,
-        StatusCode::NO_CONTENT
-    );
+    let (_, bobs) = call(&app, "GET", "devices", Some(&tokens[2]), Value::Null).await;
+    let state = bobs["devices"][0]["state_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let bearer = format!("Bearer {}", tokens[2]);
+    let operation = Uuid::new_v4().to_string();
+    let (status, headers, outcome) = crate::support::http::request(
+        &app,
+        "DELETE",
+        "devices/phone",
+        &[
+            ("authorization", &bearer),
+            ("idempotency-key", &operation),
+            ("atlas-device-state", &state),
+        ],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(outcome["outcome"], "confirmed_applied");
+    assert_eq!(outcome["operation_id"], operation);
+    assert!(!headers.contains_key("set-cookie"));
     assert_eq!(
         call(&app, "GET", "devices", Some(&tokens[2]), Value::Null)
             .await

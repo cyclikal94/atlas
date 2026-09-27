@@ -184,7 +184,16 @@ async fn authenticated_two_device_sharing_and_sync() -> Result<()> {
     assert!(!b.to_string().contains("Surprise"));
     assert!(!b.to_string().contains("Secret gift"));
     assert_eq!(b["batches"][0]["changes"].as_array().unwrap().len(), 2);
-    let edit = json!({"commands":[{"kind":"edit","id":field,"expected_version":1,"label":"Hobby","value":"Surfing"}]});
+    // Bob sends the sharing revision he read from his own page; it is not owner-only.
+    let revision = b["batches"][0]["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["resource"]["id"] == json!(field))
+        .unwrap()["resource"]["policy_version"]
+        .as_i64()
+        .unwrap();
+    let edit = json!({"commands":[{"kind":"edit","id":field,"expected_version":1,"expected_policy_version":revision,"label":"Hobby","value":"Surfing"}]});
     assert_eq!(
         request(
             &app,

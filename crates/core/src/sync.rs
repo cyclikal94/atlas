@@ -20,19 +20,7 @@ impl Store {
                 && cursor.is_none_or(|c| c.len() <= 512),
             ErrorCode::InvalidValue
         );
-        for attempt in 0..16 {
-            match self.sync_once(actor, device, cursor, limit, now).await {
-                Err(error) if attempt < 15 && retryable(&error) => {
-                    let jitter = (device.bytes().map(u64::from).sum::<u64>() + attempt * 7) % 17;
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        (5_u64 << attempt).min(50) + jitter,
-                    ))
-                    .await;
-                }
-                result => return result,
-            }
-        }
-        unreachable!()
+        retry_unit(device, || self.sync_once(actor, device, cursor, limit, now)).await
     }
 
     async fn sync_once(
@@ -422,7 +410,29 @@ impl Store {
     }
 }
 
-fn retryable(error: &anyhow::Error) -> bool {
+/// Run one whole transaction attempt again on a retryable conflict: at most 16 attempts, with
+/// `5 << n` ms (capped at 50) plus jitter derived from `seed` between them. Exhaustion returns the
+/// last error. The attempt must be safe to repeat from the start.
+pub(crate) async fn retry_unit<T, F>(seed: &str, mut attempt: impl FnMut() -> F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    for n in 0..16_u64 {
+        match attempt().await {
+            Err(error) if n < 15 && retryable(&error) => {
+                let jitter = (seed.bytes().map(u64::from).sum::<u64>() + n * 7) % 17;
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    (5_u64 << n).min(50) + jitter,
+                ))
+                .await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!()
+}
+
+pub(crate) fn retryable(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<sqlx::Error>()
         .and_then(|e| e.as_database_error())

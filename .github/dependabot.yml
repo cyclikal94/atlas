@@ -9,6 +9,17 @@ updates:
         patterns:
           - openapi-spec-validator
           - jsonschema
+  # The generator's output is every consumer's view of the API, so a bump is reviewed by
+  # regenerating and diffing the declarations against the previous release.
+  - package-ecosystem: npm
+    directory: /scripts/api-types
+    schedule:
+      interval: weekly
+    groups:
+      api-types-tooling:
+        patterns:
+          - openapi-typescript
+          - typescript
   - package-ecosystem: cargo
     directory: /
     schedule:

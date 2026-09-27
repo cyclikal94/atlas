@@ -82,6 +82,7 @@ async fn lists_and_fields(s: Store) -> Result<()> {
             id: field.clone(),
             parent_id: task.clone(),
             expected_version: None,
+            expected_policy_version: None,
             label: "Target date".into(),
             value: FieldValue::Date {
                 year: None,
@@ -105,6 +106,9 @@ async fn lists_and_fields(s: Store) -> Result<()> {
             &[Command::Edit {
                 id: field.clone(),
                 expected_version: 1,
+                expected_policy_version: Some(
+                    crate::support::projection::policy_version(&s, &a, &field).await?
+                ),
                 label: "Bypass type".into(),
                 value: "bad".into()
             }]

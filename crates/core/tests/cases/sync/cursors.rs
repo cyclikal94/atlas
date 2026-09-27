@@ -1,6 +1,7 @@
 use anyhow::Result;
 use atlas_core::{Command, Store};
 
+use crate::support::devices::retire;
 use crate::support::resources::{account, id, local};
 
 async fn cursor_scenario(store: Store) -> Result<()> {
@@ -27,6 +28,7 @@ async fn cursor_scenario(store: Store) -> Result<()> {
                 &[Command::Edit {
                     id: person.clone(),
                     expected_version: version,
+                    expected_policy_version: Some(1),
                     label: format!("Version {version}"),
                     value: String::new(),
                 }],
@@ -77,7 +79,7 @@ async fn cursor_scenario(store: Store) -> Result<()> {
             .to_string(),
         "resync_required"
     );
-    store.forget_device(&owner, "phone").await?;
+    retire(&store, &owner, "phone", 1200).await?;
     store.sync(&owner, "phone", None, 200, 1201).await?;
     for old in [&cursor] {
         assert_eq!(

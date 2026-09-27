@@ -445,6 +445,7 @@ async fn people_and_private_anchors(s: Store) -> Result<()> {
             id: field.clone(),
             parent_id: person,
             expected_version: None,
+            expected_policy_version: None,
             label: "Birthday".into(),
             value: FieldValue::Date {
                 year: None,
@@ -524,6 +525,9 @@ async fn people_and_private_anchors(s: Store) -> Result<()> {
                 .clone()
                 .unwrap(),
             expected_version: Some(1),
+            expected_policy_version: Some(
+                crate::support::projection::policy_version(&s, &a, &field).await?,
+            ),
             label: "Birthday".into(),
             value: FieldValue::Date {
                 year: None,
@@ -608,7 +612,7 @@ async fn people_and_private_anchors(s: Store) -> Result<()> {
     );
     s.schedule_reminders(due + 1).await?;
     assert!(s.claim_reminder_delivery(due + 61).await?.is_none());
-    s.forget_device(&b, "phone").await?;
+    crate::support::devices::retire(&s, &b, "phone", now()).await?;
     assert_eq!(
         s.notification_subscriptions(&b).await?["subscriptions"][0]["enabled"],
         false

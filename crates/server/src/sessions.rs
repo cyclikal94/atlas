@@ -48,16 +48,63 @@ pub(super) async fn list(
     }
     Ok(Json(json!({"sessions":sessions})))
 }
+/// Exactly one header of this name, or `None` when absent. Repeats are ambiguous, so refused.
+fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>, ApiError> {
+    let mut values = headers.get_all(name).iter();
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    ensure_api(values.next().is_none(), ErrorCode::MalformedRequest)?;
+    Ok(Some(
+        first
+            .to_str()
+            .map_err(|_| anyhow!(ErrorCode::MalformedRequest))?,
+    ))
+}
+
+/// The operation ID a retirement or keyed revocation is recorded under: one `Idempotency-Key`
+/// holding a canonical lower-case UUID, so an ID has a single spelling and a single ledger key.
+fn operation_id(headers: &HeaderMap, required: bool) -> Result<Option<String>, ApiError> {
+    let Some(value) = single_header(headers, "idempotency-key")? else {
+        ensure_api(!required, ErrorCode::MalformedRequest)?;
+        return Ok(None);
+    };
+    ensure_api(
+        Uuid::parse_str(value).is_ok_and(|v| v.to_string() == value),
+        ErrorCode::InvalidValue,
+    )?;
+    Ok(Some(value.to_owned()))
+}
+
+/// `200` with the recorded outcome, or the `409` carrying it when the approved state had changed.
+fn operation_response(operation: atlas_core::operations::Operation) -> Response {
+    if operation.outcome == atlas_core::operations::Outcome::RejectedStale {
+        return crate::error::operation_rejected(&operation);
+    }
+    Json(json!({"operation_id":operation.operation_id,"account_id":operation.account_id,"outcome":operation.outcome})).into_response()
+}
+
+/// Without an operation ID this is the plain revocation of another session: one `DELETE`,
+/// `404` when nothing matched. With one it is recorded, and repeatable, in the operation ledger.
 pub(super) async fn revoke(
     State(app): State<App>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     let (account, _) = identity(&app, &headers).await?;
+    let operation = operation_id(&headers, false)?;
     ensure_api(
         Uuid::parse_str(&id).is_ok_and(|v| v.to_string() == id),
         ErrorCode::InvalidValue,
     )?;
+    if let Some(operation) = operation {
+        return Ok(operation_response(
+            app.store
+                .revoke_session(&account, &id, &operation, now())
+                .await?,
+        ));
+    }
+    hook!(app.store, "session_delete.after_identity");
     let removed: Option<String> = sqlx::query_scalar(
         "DELETE FROM sessions WHERE session_id=$1 AND account_id=$2 RETURNING token_hash",
     )
@@ -65,17 +112,8 @@ pub(super) async fn revoke(
     .bind(account)
     .fetch_optional(&app.store.pool)
     .await?;
-    let Some(removed) = removed else {
-        return Err(anyhow!(ErrorCode::NotFound).into());
-    };
-    let response = StatusCode::NO_CONTENT.into_response();
-    Ok(
-        if removed == digest(&browser::credential(&app, &headers)?) {
-            browser::clear_cookie(&app, response)
-        } else {
-            response
-        },
-    )
+    ensure_api(removed.is_some(), ErrorCode::NotFound)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 #[derive(Deserialize)]
@@ -147,10 +185,7 @@ pub(super) async fn change_password(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(browser::clear_cookie(
-        &app,
-        StatusCode::NO_CONTENT.into_response(),
-    ))
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// Operator recovery. Changing credentials revokes all sessions atomically.
@@ -230,10 +265,7 @@ pub(super) async fn unlink_oidc(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(browser::clear_cookie(
-        &app,
-        StatusCode::NO_CONTENT.into_response(),
-    ))
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 pub(super) async fn devices(
@@ -243,21 +275,26 @@ pub(super) async fn devices(
     let (account, current) = identity(&app, &headers).await?;
     let mut devices = Vec::new();
     for device in app.store.devices(&account, now()).await? {
-        devices.push(json!({"id":device.id,"last_synced_at":device.last_synced_at.map(timestamp).transpose()?,"active_sessions":device.active_sessions,"current":device.id==current}));
+        devices.push(json!({"id":device.id,"last_synced_at":device.last_synced_at.map(timestamp).transpose()?,"active_sessions":device.active_sessions,"current":device.id==current,"state_token":device.state_token,"summary":device.summary}));
     }
     Ok(Json(json!({"devices":devices})))
 }
+/// Retire a device only if its approved state still matches the token the user confirmed.
+/// The credential's own session may be among the members; the response carries no `Set-Cookie`
+/// either way, and the caller recovers the outcome by repeating this call.
 pub(super) async fn forget_device(
     State(app): State<App>,
     headers: HeaderMap,
     Path(device): Path<String>,
 ) -> Result<Response, ApiError> {
-    let (account, current) = identity(&app, &headers).await?;
-    app.store.forget_device(&account, &device).await?;
-    let response = StatusCode::NO_CONTENT.into_response();
-    Ok(if current == device {
-        browser::clear_cookie(&app, response)
-    } else {
-        response
-    })
+    let (account, _) = identity(&app, &headers).await?;
+    let operation =
+        operation_id(&headers, true)?.ok_or_else(|| anyhow!(ErrorCode::MalformedRequest))?;
+    let token = single_header(&headers, "atlas-device-state")?
+        .ok_or_else(|| anyhow!(ErrorCode::MalformedRequest))?;
+    Ok(operation_response(
+        app.store
+            .retire_device(&account, &device, &operation, token, now())
+            .await?,
+    ))
 }

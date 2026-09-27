@@ -129,3 +129,29 @@ impl IntoResponse for ApiError {
         response
     }
 }
+
+/// The `409` answer to a retirement whose approved state changed (`rejected_stale`). It is a
+/// committed outcome, not a failure, so it carries the operation report next to the ordinary
+/// error fields, and logs exactly as `ApiError` does.
+pub(crate) fn operation_rejected(operation: &atlas_core::operations::Operation) -> Response {
+    let id = REQUEST_ID
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| Uuid::new_v4().to_string());
+    eprintln!(
+        "{}",
+        json!({"event":"request_error","request_id":id,"code":"operation_conflict","error_kind":"application"})
+    );
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "code":"operation_conflict",
+            "message":"The request conflicts with existing state.",
+            "request_id":id,
+            "details":[],
+            "operation_id":operation.operation_id,
+            "account_id":operation.account_id,
+            "outcome":operation.outcome,
+        })),
+    )
+        .into_response()
+}

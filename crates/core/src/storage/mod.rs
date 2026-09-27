@@ -1,6 +1,24 @@
 use crate::Store;
-use anyhow::{Result, ensure};
+use anyhow::{Result, anyhow, ensure};
 use sqlx::{Acquire, Any, Connection, Transaction, any::AnyPoolOptions};
+
+/// Version recorded by a freshly initialised database; the last step of `UPGRADES`.
+const SCHEMA_VERSION: i64 = 1001;
+
+/// One additive, in-place step. Steps run inside `migrate()`'s serialising transaction, in
+/// order, and each must move the recorded version forward by exactly its `to`.
+struct Upgrade {
+    from: i64,
+    to: i64,
+    sqlite: &'static str,
+    postgres: &'static str,
+}
+const UPGRADES: &[Upgrade] = &[Upgrade {
+    from: 1000,
+    to: 1001,
+    sqlite: include_str!("schema/upgrade_1001_sqlite.sql"),
+    postgres: include_str!("schema/upgrade_1001_postgres.sql"),
+}];
 
 impl Store {
     /// Reset delivery and login state on a restored copy, with all servers stopped.
@@ -66,9 +84,32 @@ impl Store {
                     .fetch_all(&mut *tx)
                     .await?;
             ensure!(
-                versions == [1000],
+                versions.len() == 1,
                 "unsupported_schema: this pre-release database requires an explicit reset"
             );
+            // An older baseline walks the additive steps; a newer or unknown one has no step
+            // and keeps the operator-managed reset error. A downgrade needs a restore.
+            let mut current = versions[0];
+            while current != SCHEMA_VERSION {
+                let step = UPGRADES.iter().find(|u| u.from == current).ok_or_else(|| {
+                    anyhow!(
+                        "unsupported_schema: this pre-release database requires an explicit reset"
+                    )
+                })?;
+                sqlx::raw_sql(if self.sqlite {
+                    step.sqlite
+                } else {
+                    step.postgres
+                })
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("UPDATE atlas_schema SET version=$1 WHERE version=$2")
+                    .bind(step.to)
+                    .bind(step.from)
+                    .execute(&mut *tx)
+                    .await?;
+                current = step.to;
+            }
         }
         tx.commit().await?;
         Ok(())
@@ -77,6 +118,16 @@ impl Store {
 
 impl Store {
     pub async fn connect(url: &str) -> Result<Self> {
+        Self::connect_with(url, 10_000).await
+    }
+
+    /// As `connect`, with SQLite's busy timeout chosen by the test that induces `SQLITE_BUSY`.
+    #[cfg(feature = "test-hooks")]
+    pub async fn connect_with_busy_timeout(url: &str, milliseconds: u32) -> Result<Self> {
+        Self::connect_with(url, milliseconds).await
+    }
+
+    async fn connect_with(url: &str, busy_timeout: u32) -> Result<Self> {
         sqlx::any::install_default_drivers();
         let sqlite = url.starts_with("sqlite:");
         let pool = AnyPoolOptions::new()
@@ -84,9 +135,11 @@ impl Store {
             .after_connect(move |c, _| {
                 Box::pin(async move {
                     if sqlite {
-                        sqlx::raw_sql("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=10000;")
-                            .execute(c)
-                            .await?;
+                        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                            "PRAGMA foreign_keys=ON; PRAGMA busy_timeout={busy_timeout};"
+                        )))
+                        .execute(c)
+                        .await?;
                     }
                     Ok(())
                 })
@@ -102,6 +155,8 @@ impl Store {
             pool,
             sqlite,
             retention_seconds: 90 * 86400,
+            #[cfg(feature = "test-hooks")]
+            hooks: Default::default(),
         })
     }
 
@@ -114,11 +169,62 @@ impl Store {
         Ok(self)
     }
 
+    /// `begin_serial` for the retirement, which a test may ask to run at REPEATABLE READ.
+    pub(crate) async fn begin_retirement(&self) -> Result<Transaction<'static, Any>> {
+        #[cfg(feature = "test-hooks")]
+        if !self.sqlite && self.hooks.raised_isolation() {
+            let mut tx = self.pool.begin().await?;
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE sync_clock SET revision=revision WHERE id=1")
+                .execute(&mut *tx)
+                .await?;
+            return Ok(tx);
+        }
+        self.begin_serial().await
+    }
+
+    /// Whether member rows are read `FOR UPDATE`: always on PostgreSQL in a release build.
+    pub(crate) fn locks_rows(&self) -> bool {
+        #[cfg(feature = "test-hooks")]
+        if !self.hooks.locking() {
+            return false;
+        }
+        !self.sqlite
+    }
+
     pub async fn begin_serial(&self) -> Result<Transaction<'static, Any>> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE sync_clock SET revision=revision WHERE id=1")
             .execute(&mut *tx)
             .await?;
         Ok(tx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The chain must be contiguous from the first upgradable baseline to the current version,
+    /// or `migrate()` could loop or skip a step.
+    #[test]
+    fn upgrade_chain_is_contiguous_and_ends_at_the_current_version() {
+        let mut version = 1000;
+        for step in UPGRADES {
+            assert_eq!(step.from, version);
+            assert!(step.to > step.from);
+            version = step.to;
+        }
+        assert_eq!(version, SCHEMA_VERSION);
+        for baseline in [
+            include_str!("schema/sqlite.sql"),
+            include_str!("schema/postgres.sql"),
+        ] {
+            assert!(baseline.contains(&format!(
+                "INSERT INTO atlas_schema(version) VALUES({SCHEMA_VERSION});"
+            )));
+        }
     }
 }

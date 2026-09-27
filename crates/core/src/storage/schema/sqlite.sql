@@ -23,6 +23,18 @@ CREATE TABLE receipts (
  payload TEXT NOT NULL, revision BIGINT NOT NULL, digest_version BIGINT NOT NULL DEFAULT 1, PRIMARY KEY(account_id,operation_id)
 );
 
+-- Committed outcome of a device retirement or a keyed session revocation (B7). Rows are
+-- never swept: an outcome must stay recoverable however long a device was offline.
+CREATE TABLE operation_outcomes (
+ account_id TEXT NOT NULL REFERENCES accounts(id), operation_id TEXT NOT NULL,
+ kind TEXT NOT NULL CHECK (kind IN ('retire_device','revoke_session')),
+ digest TEXT NOT NULL,
+ outcome TEXT NOT NULL CHECK (outcome IN ('confirmed_applied','rejected_stale','superseded')),
+ created_at BIGINT NOT NULL,
+ PRIMARY KEY(account_id,operation_id),
+ CHECK (outcome <> 'rejected_stale' OR kind = 'retire_device')
+);
+
 CREATE TABLE sync_batches (
  account_id TEXT NOT NULL REFERENCES accounts(id), revision BIGINT NOT NULL,
  payload TEXT NOT NULL, created_at BIGINT NOT NULL DEFAULT 0, PRIMARY KEY(account_id,revision)
@@ -426,4 +438,4 @@ BEGIN
  SELECT NEW.id,ancestor_id,depth+1 FROM resource_ancestors WHERE resource_id=NEW.parent_id;
 END;
 INSERT INTO sync_clock(id,revision,resource_count) VALUES(1,0,0);
-INSERT INTO atlas_schema(version) VALUES(1000);
+INSERT INTO atlas_schema(version) VALUES(1001);

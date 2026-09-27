@@ -80,9 +80,12 @@ impl Store {
                 Command::CreateField { person_id, .. } => {
                     *person_id = Self::canonical_person(tx, person_id).await?
                 }
-                Command::Edit { id, .. }
-                | Command::Grant { id, .. }
-                | Command::Revoke { id, .. } => *id = Self::canonical_person(tx, id).await?,
+                // An edit is never re-addressed: its counters belong to the resource its
+                // author read, and are checked against that resource below.
+                Command::Edit { id, .. } => identifier(id)?,
+                Command::Grant { id, .. } | Command::Revoke { id, .. } => {
+                    *id = Self::canonical_person(tx, id).await?
+                }
             }
         }
         let commands = resolved.as_slice();
@@ -219,6 +222,7 @@ impl Store {
                 Command::Edit {
                     id,
                     expected_version,
+                    expected_policy_version,
                     label,
                     value,
                 } => {
@@ -228,8 +232,16 @@ impl Store {
                         .get(id)
                         .ok_or_else(|| anyhow!(ErrorCode::NotFound))?;
                     ensure!(p.can_edit, ErrorCode::Forbidden);
+                    // Both counters are local to one resource, so a pair captured from a
+                    // merged person's old ID could equal the canonical person's, whose
+                    // audience differs. The author must read the canonical person and
+                    // review the draft against it, which the conflict asks for.
+                    ensure!(!Self::is_person_alias(tx, id).await?, ErrorCode::Conflict);
                     Self::person_name_authority(tx, actor, id).await?;
                     ensure!(p.version == *expected_version, ErrorCode::Conflict);
+                    // Same transaction and gate as the write: a sharing change committed
+                    // since the author read the resource rejects the whole command.
+                    p.ensure_policy_version(*expected_policy_version)?;
                     ensure!(
                         matches!(p.kind.as_str(), "person" | "field"),
                         ErrorCode::InvalidValue

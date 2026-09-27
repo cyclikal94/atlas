@@ -138,6 +138,10 @@ async fn scenario(store: Store) -> Result<()> {
                 &[Command::Edit {
                     id: progress.clone(),
                     expected_version: 1,
+                    expected_policy_version: Some(
+                        crate::support::projection::policy_version(&store, &owner, &progress)
+                            .await?
+                    ),
                     label: "bypass".into(),
                     value: "{}".into()
                 }]

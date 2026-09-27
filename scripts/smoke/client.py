@@ -11,8 +11,12 @@ class ContractClient:
         self.document = document
         self.request_ids = request_ids
         self.last_headers = {}
+        self.last_status = None
 
     def __call__(self, method, path, token=None, body=None, operation=None, expected=200, extra_headers=None):
+        # `expected` may be a set of statuses for a request whose outcome depends on a race
+        # the caller cannot order; `last_status` then says which one happened.
+        accepted = {expected} if isinstance(expected, int) else set(expected)
         headers = {'Content-Type': 'application/json', **(extra_headers or {})}
         if token:
             headers['Authorization'] = 'Bearer ' + token
@@ -25,8 +29,9 @@ class ContractClient:
         except urllib.error.HTTPError as error:
             response = error
         with response:
-            if response.status != expected:
+            if response.status not in accepted:
                 raise RuntimeError(f'{method} {path}: expected {expected}, got {response.status}')
+            self.last_status = response.status
             raw = response.read()
             value = json.loads(raw) if raw else None
             request_id = response.headers['X-Request-ID']
@@ -44,7 +49,7 @@ class ContractClient:
                 raise RuntimeError(f'No contract route matches {method} {route}')
             route = candidates[0]
             operation_doc = self.document['paths'][route][method.lower()]
-            if body is not None and expected < 400 and 'requestBody' in operation_doc:
+            if body is not None and min(accepted) < 400 and 'requestBody' in operation_doc:
                 request_schema = operation_doc['requestBody']['content']['application/json']['schema']
                 Draft202012Validator({**self.document, **request_schema}, format_checker=FormatChecker()).validate(body)
             contract = operation_doc['responses'][str(response.status)]

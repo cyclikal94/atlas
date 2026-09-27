@@ -1,5 +1,18 @@
 //! Atlas HTTP API with local and OIDC authentication.
 use atlas_core::error::ErrorCode;
+
+/// Names a point where test builds may pause a request. Expands to nothing without the
+/// `test-hooks` feature, so a release build has neither the call nor the point name.
+#[cfg(feature = "test-hooks")]
+macro_rules! hook {
+    ($store:expr, $point:literal) => {
+        $store.hooks().reach($point).await
+    };
+}
+#[cfg(not(feature = "test-hooks"))]
+macro_rules! hook {
+    ($($tokens:tt)*) => {};
+}
 mod household_routes;
 use household_routes::{
     default_templates, defaults, directory, households, invitations, management, resource_policy,
@@ -69,6 +82,9 @@ pub struct App {
     native_redirects: Arc<Vec<String>>,
 }
 
+/// Contract version reported by `/health`, read from `api/openapi.json` `info.version` at build time.
+pub const API_VERSION: &str = env!("ATLAS_API_VERSION");
+
 pub fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -128,6 +144,11 @@ async fn no_store(request: Request, next: Next) -> Response {
 }
 
 tokio::task_local! {static REQUEST_ID:String;}
+
+/// Liveness plus the contract version. Stateless: no database, session or cookie.
+async fn health() -> Json<serde_json::Value> {
+    Json(json!({"status":"ok","api_version":API_VERSION}))
+}
 
 async fn ready(State(app): State<App>) -> Result<Json<serde_json::Value>, ApiError> {
     sqlx::query("SELECT 1")
@@ -256,16 +277,17 @@ async fn identity(app: &App, headers: &HeaderMap) -> Result<(String, String), Ap
     Ok((row.get(0), row.get(1)))
 }
 
+/// Deletes the presented credential's own session row and nothing else. No `Set-Cookie` is
+/// sent: the row's deletion already revokes the credential, and a cookie decision made from state
+/// read now but delivered later could clear the cookie of a newer login.
 async fn logout(State(app): State<App>, headers: HeaderMap) -> Result<Response, ApiError> {
     identity(&app, &headers).await?;
+    hook!(app.store, "session_delete.after_identity");
     sqlx::query("DELETE FROM sessions WHERE token_hash=$1")
         .bind(digest(&browser::credential(&app, &headers)?))
         .execute(&app.store.pool)
         .await?;
-    Ok(browser::clear_cookie(
-        &app,
-        StatusCode::NO_CONTENT.into_response(),
-    ))
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 fn client_source(

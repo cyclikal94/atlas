@@ -3,6 +3,8 @@ WORKDIR /atlas
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 RUN rustup show active-toolchain
 COPY crates crates
+# The server reports this contract's version, read at build time.
+COPY api/openapi.json api/openapi.json
 RUN cargo build --release --locked -p atlas-server
 RUN mkdir /rust-notices && cp "$(rustc --print sysroot)/share/doc/rust/COPYRIGHT-library.html" /rust-notices/ && cp -R "$(rustc --print sysroot)/share/doc/rust/licenses" /rust-notices/
 

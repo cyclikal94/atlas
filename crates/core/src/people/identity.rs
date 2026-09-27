@@ -35,6 +35,17 @@ impl Store {
         )
     }
 
+    /// Whether `id` is a merged or reserved person ID that resolves to another person.
+    pub(crate) async fn is_person_alias(tx: &mut Transaction<'_, Any>, id: &str) -> Result<bool> {
+        Ok(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM person_aliases WHERE source_id=$1")
+                .bind(id)
+                .fetch_one(&mut **tx)
+                .await?
+                > 0,
+        )
+    }
+
     pub(crate) async fn unused_person_id(tx: &mut Transaction<'_, Any>, id: &str) -> Result<()> {
         identifier(id)?;
         ensure!(

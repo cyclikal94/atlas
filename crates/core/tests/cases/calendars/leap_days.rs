@@ -18,6 +18,7 @@ async fn leap_day(s: &Store) -> Result<()> {
             id: field.clone(),
             parent_id: p,
             expected_version: None,
+            expected_policy_version: None,
             label: "Birthday".into(),
             value: FieldValue::Date {
                 year: None,

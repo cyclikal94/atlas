@@ -35,7 +35,7 @@ async fn initialise_and_reopen(url: &str) -> Result<()> {
         .fetch_one(&reopened.pool)
         .await?;
     assert_eq!(found, id);
-    sqlx::query("UPDATE atlas_schema SET version=1000")
+    sqlx::query("UPDATE atlas_schema SET version=1001")
         .execute(&reopened.pool)
         .await?;
     reopened.pool.close().await;

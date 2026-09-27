@@ -20,6 +20,7 @@ This document explains ownership and relationships rather than duplicating every
 | `calendar_sources`, `calendar_events`, `task_anchors`, `anchored_occurrences`, `calendar_reviews` | Imported evidence, stable source identity, task binding and reviewable reconciliation |
 | `reminder_rules`, `notification_subscriptions`, `reminder_deliveries` | Reminder ownership, encrypted destinations and claimed delivery attempts |
 | `receipts`, `sync_clock`, `sync_batches` | Account-scoped operation digests, serial publication revision and content-free change notices |
+| `operation_outcomes` | Durable outcome (`confirmed_applied`, `rejected_stale`, `superseded`) of each device retirement and keyed session revocation, keyed by account and operation ID with a digest of the request; retained indefinitely and never swept |
 | `sync_devices`, `sync_deliveries`, `sync_snapshots`, `snapshot_items`, `sync_cursors` | Device recovery state, delivered-ID ledger, immutable snapshot pages and opaque snapshot cursors |
 
 Field data uses `resources::FieldValue`: text, exact quantity, date, URL, Boolean,
@@ -36,3 +37,9 @@ does not expose previously private contributions to the new identity owner.
 Receipts retain operation identity and a digest, not submitted private content. Request
 payloads can expire while UUID reservations and replay results remain. Device retirement
 cascades its delivered-ID ledger; task/history records are not retention metadata.
+
+`operation_outcomes` is written in the same transaction as the operation it records (or its
+rejection), so a lost response can be answered by repeating the call. A database `CHECK`
+allows `rejected_stale` only for retirement. The row survives the retired device, its
+sessions and restore preparation; it is the only evidence that distinguishes a confirmed
+retirement from a device that disappeared for another reason.

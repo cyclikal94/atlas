@@ -20,15 +20,15 @@ accepts current server defaults. An explicit empty policy creates privately.
 | Command | Behaviour |
 | --- | --- |
 | `create_task` | Client supplies task/execution UUIDs, title, definition and optional policy. Creates the first due occurrence and enrols the creator. |
-| `revise_task` | Version-checked title/definition edit affects occurrences generated afterwards. Existing targets, windows and participants remain frozen. |
+| `revise_task` | Version-checked title/definition edit affects occurrences generated afterwards. Existing targets, windows and participants remain frozen. Also carries the task's `expected_policy_version`. |
 | `materialise` | Generates up to 16 intended periods through a supplied date, at most 31 days ahead of today in the saved zone. Repeated calls continue from durable position. |
 | `record` | Adds checkbox, exact quantity, checklist or explicit observation evidence to an occurrence's participant stream. |
 | `exclude` | Version-checked personal streak exclusion, permitted only by the occurrence's explicit opt-in policy. |
 | `resolve` | Version-checked public workflow closure/reopening. Closing a chore does not fabricate completion or streak credit. |
 | `revise_occurrence` | Explicit version-checked correction of one occurrence's goal/date/window. Retains its ID, intended key and participants; refreshes progress summaries. |
 | `enrol` | Online self-enrolment, withdrawal, progress policy and aggregate consent. Version zero creates the first enrolment. |
-| `create_list`, `edit_list`, `list_item` | Named lists and version-checked task references. Lists do not grant task access. |
-| `put_field` | Create/update a typed contribution under a person or task. Each contribution has its own policy and edit version. |
+| `create_list`, `edit_list`, `list_item` | Named lists and version-checked task references. Lists do not grant task access. `edit_list` also carries the list's `expected_policy_version`. |
+| `put_field` | Create/update a typed contribution under a person or task. Each contribution has its own policy and edit version. Updating sends both `expected_version` and the field's `expected_policy_version`; creating sends neither. |
 | `set_dependencies` | Replaces explicit occurrence prerequisites using the occurrence version; concurrent cycles are rejected. |
 | `complete_dependencies` | Applies a current preview atomically, with an explicit completion mode and optional numeric/checklist root evidence. |
 | `start_timer`, `stop_timer`, `cancel_timer` | Records duration sessions, checking authority, dependencies and interval overlap; a rejected stop can be retried or cancelled. |

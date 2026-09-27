@@ -40,6 +40,36 @@ cargo build --locked -p atlas-server
 /tmp/atlas-contract-env/bin/python scripts/smoke_server.py
 ```
 
+Any edit to `api/openapi.json`, and any change to externally observable behaviour,
+needs a greater `info.version` in the same change. Record the baseline that enforces it
+after advancing the version, and never edit `api/compatibility.json` by hand:
+
+```sh
+ATLAS_RECORD_COMPATIBILITY=1 cargo test --locked -p atlas-server --test api compatibility
+```
+
+A behaviour-changing change must also extend the probes in
+`crates/server/tests/cases/compatibility.rs` to cover what it changes. See
+[API version and compatibility](docs/api.md#api-version-and-compatibility) for the rule.
+
+Validate the API types release package. It needs the Node version in
+`scripts/api-types/.node-version` and generates from the contract committed at `HEAD`, so commit a
+contract change first. A release tag's version must also equal `info.version`
+(see [packaging](docs/packaging.md#api-types-package)):
+
+```sh
+npm ci --ignore-scripts --prefix scripts/api-types
+npm test --prefix scripts/api-types
+/tmp/atlas-contract-env/bin/python scripts/test_release_workflow.py
+```
+
+The workflow test also runs the workflows' generate and verify commands in a scratch checkout;
+it needs `git`, `npm` and the installed generator, and skips its release-mode scenarios unless
+Node matches `.node-version` (CI always does).
+
+CI runs these on every pull request and builds an unshipped `0.0.0-ci` package; nothing is
+published until a release tag is pushed.
+
 Preview the documentation site that GitHub Pages publishes from `main`:
 
 ```sh

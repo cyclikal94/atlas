@@ -3,6 +3,7 @@ import json
 import concurrent.futures
 import statistics
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -70,6 +71,9 @@ try:
     uuid.UUID(account)
     docker('run', '-d', '--name', container, *common, '-p', '127.0.0.1::3000', image)
     base = ready()
+    # The image reports the contract version of the tree it was built from.
+    contract = json.loads((Path(__file__).resolve().parents[1] / 'api/openapi.json').read_text())
+    assert call(base, 'GET', '/health') == {'status':'ok','api_version':contract['info']['version']}
     config = json.loads(docker('inspect', container))[0]
     assert config['Config']['User'] == '10001:10001'
     assert config['HostConfig']['ReadonlyRootfs']

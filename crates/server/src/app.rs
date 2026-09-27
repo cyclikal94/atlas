@@ -80,7 +80,7 @@ impl App {
     }
     pub fn router(self) -> Router {
         Router::new()
-            .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
+            .route("/health", get(health))
             .route("/ready", get(ready))
             .route("/api/experimental/v1/me", get(sessions::me))
             .route(

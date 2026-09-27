@@ -1,0 +1,263 @@
+{
+  "api_version": "0.14.0",
+  "contract_sha256": "46f606ab888f862aeafe8499050560558b4fba70734b47e8e0673f3bbadc120f",
+  "behaviour": {
+    "content_and_retirement": {
+      "current_policy": {
+        "cache_control": "private, no-store",
+        "code": null,
+        "outcome": null,
+        "set_cookie": false,
+        "status": 200
+      },
+      "omitted_policy": {
+        "cache_control": "private, no-store",
+        "code": "conflict",
+        "outcome": null,
+        "set_cookie": false,
+        "status": 409
+      },
+      "retirement_replay": {
+        "cache_control": "private, no-store",
+        "code": null,
+        "outcome": "confirmed_applied",
+        "set_cookie": false,
+        "status": 200
+      },
+      "self_retirement": {
+        "cache_control": "private, no-store",
+        "code": null,
+        "outcome": "confirmed_applied",
+        "set_cookie": false,
+        "status": 200
+      },
+      "stale_policy": {
+        "cache_control": "private, no-store",
+        "code": "conflict",
+        "outcome": null,
+        "set_cookie": false,
+        "status": 409
+      },
+      "stale_retirement": {
+        "cache_control": "private, no-store",
+        "code": "operation_conflict",
+        "outcome": "rejected_stale",
+        "set_cookie": false,
+        "status": 409
+      },
+      "write_after_retirement": {
+        "cache_control": "private, no-store",
+        "code": "unauthenticated",
+        "outcome": null,
+        "set_cookie": false,
+        "status": 401
+      }
+    },
+    "error_mapping": {
+      "access_changed": [
+        409,
+        "access_changed"
+      ],
+      "batch_too_large": [
+        422,
+        "invalid_value"
+      ],
+      "calendar_limit": [
+        422,
+        "calendar_limit"
+      ],
+      "conflict": [
+        409,
+        "conflict"
+      ],
+      "defaults_changed": [
+        409,
+        "defaults_changed"
+      ],
+      "delivery_failed": [
+        500,
+        "internal_error"
+      ],
+      "device_capacity": [
+        503,
+        "device_capacity"
+      ],
+      "expansion_limit": [
+        500,
+        "internal_error"
+      ],
+      "fetch_failed": [
+        502,
+        "fetch_failed"
+      ],
+      "forbidden": [
+        403,
+        "forbidden"
+      ],
+      "identity_grant_required": [
+        422,
+        "invalid_value"
+      ],
+      "integration_unconfigured": [
+        503,
+        "integration_unconfigured"
+      ],
+      "internal_error": [
+        500,
+        "internal_error"
+      ],
+      "invalid_endpoint": [
+        422,
+        "invalid_endpoint"
+      ],
+      "invalid_ics": [
+        422,
+        "invalid_ics"
+      ],
+      "invalid_secret": [
+        500,
+        "internal_error"
+      ],
+      "invalid_subscription": [
+        422,
+        "invalid_subscription"
+      ],
+      "invalid_value": [
+        422,
+        "invalid_value"
+      ],
+      "invitation_expired": [
+        410,
+        "invitation_expired"
+      ],
+      "last_manager": [
+        409,
+        "last_manager"
+      ],
+      "malformed_request": [
+        400,
+        "malformed_request"
+      ],
+      "materialisation_required": [
+        409,
+        "materialisation_required"
+      ],
+      "not_found": [
+        404,
+        "not_found"
+      ],
+      "not_ready": [
+        503,
+        "not_ready"
+      ],
+      "oidc_unavailable": [
+        502,
+        "oidc_unavailable"
+      ],
+      "operation_conflict": [
+        409,
+        "operation_conflict"
+      ],
+      "outbound_denied": [
+        422,
+        "outbound_denied"
+      ],
+      "password_hash_failed": [
+        500,
+        "internal_error"
+      ],
+      "password_length": [
+        500,
+        "internal_error"
+      ],
+      "rate_limited": [
+        429,
+        "rate_limited"
+      ],
+      "refresh_in_progress": [
+        409,
+        "refresh_in_progress"
+      ],
+      "reminder_time_required": [
+        422,
+        "reminder_time_required"
+      ],
+      "resync_required": [
+        410,
+        "resync_required"
+      ],
+      "secret_encryption_failed": [
+        500,
+        "internal_error"
+      ],
+      "slice_capacity": [
+        503,
+        "slice_capacity"
+      ],
+      "source_connection_required": [
+        500,
+        "internal_error"
+      ],
+      "stale_delivery": [
+        409,
+        "stale_delivery"
+      ],
+      "stale_refresh": [
+        409,
+        "stale_refresh"
+      ],
+      "temporarily_unavailable": [
+        500,
+        "internal_error"
+      ],
+      "unauthenticated": [
+        401,
+        "unauthenticated"
+      ],
+      "unsupported_calendar_rule": [
+        422,
+        "unsupported_calendar_rule"
+      ],
+      "unsupported_calendar_timezone": [
+        422,
+        "unsupported_calendar_timezone"
+      ],
+      "unsupported_receipt": [
+        500,
+        "internal_error"
+      ]
+    },
+    "health": {
+      "body": {
+        "status": "ok"
+      },
+      "cache_control": "private, no-store",
+      "content_type": "application/json",
+      "referrer_policy": "no-referrer",
+      "set_cookie": false,
+      "status": 200
+    },
+    "me_unauthenticated": {
+      "body": {
+        "code": "unauthenticated",
+        "details": [],
+        "message": "A valid session is required."
+      },
+      "cache_control": "private, no-store",
+      "content_type": "application/json",
+      "referrer_policy": "no-referrer",
+      "set_cookie": false,
+      "status": 401
+    },
+    "ready": {
+      "body": {
+        "status": "ready"
+      },
+      "cache_control": "private, no-store",
+      "content_type": "application/json",
+      "referrer_policy": "no-referrer",
+      "set_cookie": false,
+      "status": 200
+    }
+  }
+}

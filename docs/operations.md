@@ -13,8 +13,15 @@ recovery. Start `target/debug/atlas-server` with no arguments to serve requests.
 ## Database lifecycle
 
 Atlas is unreleased. Current startup creates the complete schema transactionally,
-or validates its baseline identity. Incompatible experimental databases produce a
-reset-required error. There is no automatic drop, upgrade adapter or data conversion.
+or validates its baseline identity. An ordered chain of additive in-place steps upgrades
+a database recorded at an earlier supported version: today one step, `1000 → 1001`, which
+adds the `operation_outcomes` table and changes no existing row. Each step runs inside the
+serialising startup transaction (an advisory lock on PostgreSQL, an immediate transaction
+on SQLite), so replicas starting together upgrade once. Any other recorded version, and any
+database that is not a single recorded version, produces a reset-required error. There is
+no automatic drop or data conversion, and no downgrade: an older executable reports
+`unsupported_schema` on an upgraded database, so take a backup before upgrading and restore
+it with the matching executable to roll back (see [recovery](recovery.md)).
 For a disposable SQLite database, stop all users of the file and choose a new file.
 For PostgreSQL, provision a fresh dedicated database explicitly. Retain any data you
 need before a reset; do not point reset/testing workflows at personal data.
@@ -28,8 +35,8 @@ Sessions expire independently of content. `ATLAS_SYNC_RETENTION_DAYS` defaults t
 and accepts 1–3650. Retention removes expired delivery metadata, not tasks/history.
 Logs contain request IDs, route templates, status and stable error codes. Sensitive
 content, authentication credentials, feed URLs and push tokens must not be logged.
-`/health` checks process liveness; `/ready` checks database connectivity. SIGTERM/SIGINT
-trigger graceful shutdown.
+`/health` checks process liveness and reports the API contract version; `/ready` checks
+database connectivity. SIGTERM/SIGINT trigger graceful shutdown.
 
 See [authentication](authentication.md) for browser/OIDC/proxy settings and
 [notifications](notifications.md) for integration keys and outbound network settings.
@@ -102,7 +109,11 @@ The chart supports multiple API replicas. The resource requests/limits are start
 allocations, not measured capacity guarantees. PostgreSQL PVCs remain after StatefulSet
 deletion. Stop all API replicas for backup and restore. Rolling application updates
 are only safe when their schema and operation contracts are mutually compatible;
-see the release policy in [recovery](recovery.md).
+see the release policy in [recovery](recovery.md). Replicas may report different
+`api_version` values on `/health` while an update rolls out; do not cache `/health`.
+A client's `/health` answer does not bind the replica that later handles its request,
+so a rolling update across a contract change can still deliver a queued command to an
+incompatible replica (see [API version and compatibility](api.md#api-version-and-compatibility)).
 
 ## Monitoring and recovery
 

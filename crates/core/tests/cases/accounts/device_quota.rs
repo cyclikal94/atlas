@@ -1,6 +1,7 @@
 use anyhow::Result;
 use atlas_core::Store;
 
+use crate::support::devices::retire;
 use crate::support::resources::{account, local};
 
 async fn quota_scenario(store: Store) -> Result<()> {
@@ -20,7 +21,7 @@ async fn quota_scenario(store: Store) -> Result<()> {
         "device_capacity"
     );
     assert_eq!(store.devices(&owner, 1000).await?.len(), 32);
-    store.forget_device(&owner, "device-0").await?;
+    retire(&store, &owner, "device-0", 1000).await?;
     store.sync(&owner, "replacement", None, 200, 1001).await?;
     let devices = store.devices(&owner, 1001).await?;
     assert_eq!(devices.len(), 32);

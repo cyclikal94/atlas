@@ -70,6 +70,7 @@ async fn lifecycle(s: Store) -> Result<()> {
         TaskCommand::ReviseTask {
             id: teeth.clone(),
             expected_version: 1,
+            expected_policy_version: Some(1),
             title: "Changed future target".into(),
             definition: revised,
         },

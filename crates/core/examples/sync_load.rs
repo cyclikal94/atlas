@@ -69,6 +69,8 @@ async fn main() -> Result<()> {
                 &[Command::Edit {
                     id: target.clone(),
                     expected_version: n,
+                    // Fixture rows keep their default sharing revision throughout.
+                    expected_policy_version: Some(1),
                     label: format!("Edit {n}"),
                     value: String::new(),
                 }],

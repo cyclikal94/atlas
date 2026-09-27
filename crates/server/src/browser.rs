@@ -164,17 +164,6 @@ pub(super) async fn current(
     ))
 }
 
-pub(super) fn clear_cookie(app: &App, mut response: Response) -> Response {
-    if let Some(config) = &app.browser {
-        let mut cookie = config.cookie(String::new());
-        cookie.make_removal();
-        response
-            .headers_mut()
-            .append("set-cookie", cookie.to_string().parse().unwrap());
-    }
-    response
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

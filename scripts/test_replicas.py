@@ -1,19 +1,140 @@
 #!/usr/bin/env python3
 """Two actual server processes against a fresh, harness-owned PostgreSQL database."""
+import collections
 import concurrent.futures
 import json
 import os
 from pathlib import Path
+import random
+import shutil
 import statistics
 import subprocess
 import tempfile
+import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from smoke.client import ContractClient
-from smoke import calendars, sharing, households, tasks, people
+from smoke import calendars, sharing, households, tasks, people, devices
 
 ROOT = Path(__file__).resolve().parents[1]
-SERVER = ROOT / 'target/debug/atlas-server'
+# ATLAS_TEST_BINARY names the exact executable under test (the release-shaped build).
+SERVER = Path(os.environ.get('ATLAS_TEST_BINARY', ROOT / 'target/debug/atlas-server'))
+V1 = '/api/experimental/v1'
+
+
+def raw(base, method, path, token, headers=None):
+    """One request with no status expectation, for races where several answers are lawful."""
+    request = urllib.request.Request(base + path, method=method, headers={
+        'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', **(headers or {})})
+    try:
+        response = urllib.request.urlopen(request, timeout=30)
+    except urllib.error.HTTPError as error:
+        response = error
+    with response:
+        body = response.read()
+        return response.status, (json.loads(body) if body else None), dict(response.headers)
+
+
+def psql(sql):
+    result = subprocess.run([shutil.which('psql'), os.environ['ATLAS_DATABASE_URL'], '-XAt',
+                             '-v', 'ON_ERROR_STOP=1', '-c', sql], capture_output=True, check=True)
+    return result.stdout.decode().strip()
+
+
+def race_retirements(clients, document, tokens, secrets, rounds):
+    """Real cross-process races on PostgreSQL between a retirement and a writer of its member row.
+
+    Each round: a fresh device with one session, a retirement sent to one process (authenticated by
+    the account's stable session) and a revoke of that session sent to the other, started together
+    with jitter. The interleaving is chosen by the servers and PostgreSQL, so this is statistical
+    and complements the deterministic hook schedules; it proves the protocol holds between real
+    processes, sockets and connection pools. Invariants, every round:
+
+    * the retirement never reports rejected_stale (the only possible change is the revoke's removal);
+    * "confirmed_applied" is never credited when the revoke itself removed the row (ordinary revoke:
+      204 means one row deleted), and "superseded" only when it did (a 204 from the logout route is
+      not evidence: it is also returned when the request authenticated before the retirement
+      committed and deleted nothing);
+    * exactly one ledger row per operation ID, recording the reported outcome; no session remains.
+    """
+    alice = tokens['alice']
+    password = secrets[0]
+    seen = collections.Counter()
+    started = time.monotonic()
+    for index in range(rounds):
+        # Login is rate limited per source; spacing rounds keeps every process well under it.
+        round_started = time.monotonic()
+        retiring, writing = clients[index % 2], clients[(index + 1) % 2]
+        kind = 'revoke' if index % 2 == 0 else 'logout'
+        device = f'race-{index}'
+        session = retiring('POST', V1 + '/sessions', body={
+            'username': 'alice', 'password': password, 'device_id': device})['access_token']
+        secrets.append(session)
+        session_id = next(s['id'] for s in retiring('GET', V1 + '/sessions', alice)['sessions']
+                          if s['device_id'] == device)
+        state = next(d['state_token'] for d in retiring('GET', V1 + '/devices', alice)['devices']
+                     if d['id'] == device)
+        operation = str(uuid.uuid4())
+        barrier = threading.Barrier(2)
+
+        def retire():
+            barrier.wait()
+            time.sleep(random.uniform(0, 0.004))
+            return raw(retiring.base, 'DELETE', f'{V1}/devices/{device}', alice,
+                       {'Idempotency-Key': operation, 'Atlas-Device-State': state})
+
+        def write():
+            barrier.wait()
+            time.sleep(random.uniform(0, 0.004))
+            path = f'{V1}/sessions/{session_id}' if kind == 'revoke' else V1 + '/sessions/current'
+            return raw(writing.base, 'DELETE', path, session)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            retirement, writer = pool.submit(retire), pool.submit(write)
+            (r_status, r_body, r_headers), (w_status, _, w_headers) = retirement.result(), writer.result()
+        assert r_status == 200, (kind, r_status, r_body)
+        outcome = r_body['outcome']
+        assert outcome in ('confirmed_applied', 'superseded'), r_body
+        assert 'set-cookie' not in {k.lower() for k in r_headers | w_headers}
+        assert w_status in (204, 404, 401), (kind, w_status)
+        if kind == 'revoke':
+            allowed = (404, 401) if outcome == 'confirmed_applied' else (204,)
+        else:
+            allowed = (204, 401) if outcome == 'confirmed_applied' else (204,)
+        assert w_status in allowed, f'{kind}: retirement {outcome} with writer {w_status}'
+        rows = psql(f"SELECT outcome FROM operation_outcomes WHERE operation_id='{operation}'").splitlines()
+        assert rows == [outcome], (rows, outcome)
+        assert psql(f"SELECT count(*) FROM sessions WHERE device_id='{device}'") == '0'
+        seen[(kind, outcome, w_status)] += 1
+        time.sleep(max(0.0, 0.6 - (time.monotonic() - round_started)))
+
+    # The same operation ID sent to both processes at once: one evaluation, one replay, identical.
+    for index in range(max(2, rounds // 10)):
+        device = f'race-twin-{index}'
+        session = clients[0]('POST', V1 + '/sessions', body={
+            'username': 'alice', 'password': password, 'device_id': device})['access_token']
+        secrets.append(session)
+        state = next(d['state_token'] for d in clients[0]('GET', V1 + '/devices', alice)['devices']
+                     if d['id'] == device)
+        operation = str(uuid.uuid4())
+        barrier = threading.Barrier(2)
+
+        def twin(client):
+            barrier.wait()
+            time.sleep(random.uniform(0, 0.004))
+            return raw(client.base, 'DELETE', f'{V1}/devices/{device}', alice,
+                       {'Idempotency-Key': operation, 'Atlas-Device-State': state})
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            first, second = [f.result() for f in [pool.submit(twin, c) for c in clients]]
+        assert first[0] == second[0] == 200 and first[1] == second[1], (first, second)
+        assert first[1]['outcome'] == 'confirmed_applied'
+        assert psql(f"SELECT count(*) FROM operation_outcomes WHERE operation_id='{operation}'") == '1'
+        time.sleep(0.6)
+    return {'rounds': rounds, 'twin_rounds': max(2, rounds // 10),
+            'elapsed_seconds': round(time.monotonic() - started, 1),
+            'orders_observed': {f'{k[0]}/{k[1]}/writer_{k[2]}': v for k, v in sorted(seen.items())}}
 
 
 def main():
@@ -40,9 +161,12 @@ def main():
                 address = json.loads(path.read_text().splitlines()[0])['address']
                 client = ContractClient('http://' + address, document, set())
                 client('GET', '/ready')
+                # Every replica reports the contract version it was built with.
+                health = client('GET', '/health')
+                assert health == {'status': 'ok', 'api_version': document['info']['version']}, health
                 clients.append(client)
             accounts = {}
-            for name in ['alice', 'bob']:
+            for name in ['alice', 'bob', 'carol']:
                 result = subprocess.run([str(SERVER), 'account', name], input=secrets[0].encode(), env=env, check=True, capture_output=True)
                 accounts[name] = result.stdout.decode().strip()
             tokens = {name: clients[0]('POST', '/api/experimental/v1/sessions', body={
@@ -54,14 +178,35 @@ def main():
                 nonlocal index
                 index += 1
                 client = clients[index % 2]
+                call.process = index % 2
                 result = client(*args, **kwargs)
                 call.last_headers = client.last_headers
                 return result
             calendars.run(call, tokens, secrets)
             person, field = sharing.run(call, accounts, tokens, secrets)
+            # The sharing change and the stale write it invalidates reach different processes.
+            # One lane per process, so in the overlapping rounds the owner's narrowing and the
+            # collaborator's save are served by different processes against one database.
+            lanes = [ContractClient(client.base, document, set()) for client in clients]
+            race = {**sharing.policy_precondition(call, accounts, tokens, lanes),
+                    'overlap_owner_process': 0, 'overlap_collaborator_process': 1}
+            assert race['policy_change_process'] is not None and race['policy_change_process'] != race['stale_write_process'], race
+            sharing.alias_edit(call, accounts, tokens)
             households.run(call, accounts, tokens, secrets, person, field)
             workflow = tasks.run(call, accounts, tokens, document)
             people.run(call, accounts, tokens, workflow)
+            def seed(account, device, kind):
+                """Fixture rows for devices.run: no OpenID provider or push endpoint exists here."""
+                expires = int(time.time()) + 3600
+                if kind == 'handoff':
+                    psql("INSERT INTO native_handoffs(code_hash,account_id,device_id,challenge,"
+                         "configuration_hash,redirect_uri,expires_at) VALUES "
+                         f"('{uuid.uuid4()}','{account}','{device}','c','h','r',{expires})")
+                else:
+                    psql("INSERT INTO notification_subscriptions(id,account_id,device_id,transport,"
+                         "secret,version,active) VALUES "
+                         f"('{uuid.uuid4()}','{account}','{device}','ntfy','fixture',1,1)")
+            devices.run(call, tokens, secrets, seed)
             operation = str(uuid.uuid4())
             body = {'commands': [{'kind': 'create_person', 'id': str(uuid.uuid4()), 'name': 'Concurrent receipt'}]}
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -79,6 +224,9 @@ def main():
             print(json.dumps({'scenario': 'two-postgres-processes', 'concurrent_clients': 8,
                               'writes': len(elapsed), 'elapsed_seconds': time.monotonic() - start,
                               'write_p50_ms': statistics.median(elapsed), 'write_p95_ms': elapsed[94]}))
+            rounds = int(os.environ.get('ATLAS_RACE_ROUNDS', '200'))
+            if rounds:
+                print(json.dumps({'scenario': 'device-retirement-races', **race_retirements(clients, document, tokens, secrets, rounds)}))
             # A surviving replica must serve committed state and the same session.
             processes[0].terminate()
             processes[0].wait(timeout=15)
@@ -96,7 +244,8 @@ def main():
                 output.close()
         assert all(process.returncode == 0 for process in processes)
         assert not any(secret in path.read_text() for path, _ in logs for secret in secrets)
-    print('Two-replica HTTP, concurrent receipt and failover checks passed')
+    print(json.dumps({'scenario': 'policy-precondition-across-processes', **race}))
+    print('Two-replica HTTP, concurrent receipt, device-retirement race and failover checks passed')
 
 
 if __name__ == '__main__':

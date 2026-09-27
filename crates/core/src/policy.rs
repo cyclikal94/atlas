@@ -34,8 +34,21 @@ pub struct Defaults {
 }
 
 // Each query is built only from these repository-owned fragments; user values bind.
-pub(super) const COLUMNS: &str = "r.id,r.kind,r.parent_id,r.label,r.value,r.version,CASE WHEN r.owner_id=$1 THEN r.policy_version ELSE NULL END AS policy_version,CASE WHEN EXISTS(SELECT 1 FROM person_accounts pa WHERE pa.person_id=r.id AND pa.account_id<>$1) THEN 0 WHEN r.owner_id=$1 OR COALESCE(g.can_edit,0)=1 OR EXISTS(SELECT 1 FROM resource_household_grants hg JOIN household_memberships hm ON hm.household_id=hg.household_id WHERE hg.resource_id=r.id AND hm.account_id=$1 AND hg.can_edit=1) THEN 1 ELSE 0 END AS editable,r.archived";
+pub(super) const COLUMNS: &str = "r.id,r.kind,r.parent_id,r.label,r.value,r.version,r.policy_version AS policy_version,CASE WHEN EXISTS(SELECT 1 FROM person_accounts pa WHERE pa.person_id=r.id AND pa.account_id<>$1) THEN 0 WHEN r.owner_id=$1 OR COALESCE(g.can_edit,0)=1 OR EXISTS(SELECT 1 FROM resource_household_grants hg JOIN household_memberships hm ON hm.household_id=hg.household_id WHERE hg.resource_id=r.id AND hm.account_id=$1 AND hg.can_edit=1) THEN 1 ELSE 0 END AS editable,r.archived";
 pub(super) const VISIBLE: &str = "NOT (r.owner_id=$1 AND EXISTS(SELECT 1 FROM frozen_owner_visibility f WHERE f.resource_id=r.id)) AND (r.owner_id=$1 OR ((g.account_id=$1 OR EXISTS(SELECT 1 FROM resource_household_grants hg JOIN household_memberships hm ON hm.household_id=hg.household_id WHERE hg.resource_id=r.id AND hm.account_id=$1)) AND NOT EXISTS(SELECT 1 FROM resource_exclusions x WHERE x.resource_id=r.id AND x.account_id=$1))) AND NOT EXISTS(SELECT 1 FROM resource_ancestors a JOIN resources p ON p.id=a.ancestor_id WHERE a.resource_id=r.id AND NOT (p.owner_id=$1 OR ((EXISTS(SELECT 1 FROM resource_grants pg WHERE pg.resource_id=p.id AND pg.account_id=$1) OR EXISTS(SELECT 1 FROM resource_household_grants phg JOIN household_memberships phm ON phm.household_id=phg.household_id WHERE phg.resource_id=p.id AND phm.account_id=$1)) AND NOT EXISTS(SELECT 1 FROM resource_exclusions px WHERE px.resource_id=p.id AND px.account_id=$1))))";
+
+impl Projection {
+    /// Fail-closed precondition for a content write: the caller must present the policy
+    /// revision it last saw, the resource must report one, and the two must match. Absence
+    /// on either side never passes, so a legacy or in-flight projection cannot authorise.
+    pub(crate) fn ensure_policy_version(&self, expected: Option<i64>) -> Result<()> {
+        ensure!(
+            matches!((expected, self.policy_version), (Some(e), Some(c)) if e == c),
+            ErrorCode::Conflict
+        );
+        Ok(())
+    }
+}
 
 impl Store {
     pub(super) async fn audience(
@@ -372,6 +385,12 @@ impl Store {
         }
         let visible = Self::subset(&mut tx, actor, &BTreeSet::from([id.to_owned()])).await?;
         let version = if let Some(p) = visible.get(id) {
+            // Every reader receives the counter, but only the owner may see the ACL.
+            let owner: String = sqlx::query_scalar("SELECT owner_id FROM resources WHERE id=$1")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+            ensure!(owner == actor, ErrorCode::Forbidden);
             p.policy_version
                 .ok_or_else(|| anyhow!(ErrorCode::Forbidden))?
         } else {
@@ -405,5 +424,50 @@ impl Store {
                 exclude_accounts,
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn projection(policy_version: Option<i64>) -> Projection {
+        Projection {
+            id: "id".into(),
+            kind: "field".into(),
+            parent_id: None,
+            label: "Label".into(),
+            value: serde_json::Value::Null,
+            version: 1,
+            policy_version,
+            can_edit: true,
+            archived: false,
+        }
+    }
+
+    #[test]
+    fn only_a_present_matching_revision_authorises_a_write() {
+        let check = |current, expected| {
+            projection(current)
+                .ensure_policy_version(expected)
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(check(Some(3), Some(3)), Ok(()));
+        for (current, expected) in [
+            (Some(3), Some(2)),
+            (Some(3), Some(4)),
+            (Some(3), Some(0)),
+            (Some(3), Some(-3)),
+            // Absence is never a match, including on both sides at once.
+            (Some(3), None),
+            (None, Some(3)),
+            (None, None),
+        ] {
+            assert_eq!(
+                check(current, expected),
+                Err("conflict".into()),
+                "{current:?} against {expected:?}"
+            );
+        }
     }
 }

@@ -76,6 +76,8 @@ pub enum TaskCommand {
     ReviseTask {
         id: String,
         expected_version: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_policy_version: Option<i64>,
         title: String,
         definition: Definition,
     },
@@ -125,6 +127,8 @@ pub enum TaskCommand {
     EditList {
         id: String,
         expected_version: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_policy_version: Option<i64>,
         name: String,
     },
     ListItem {
@@ -142,6 +146,8 @@ pub enum TaskCommand {
         id: String,
         parent_id: String,
         expected_version: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_policy_version: Option<i64>,
         label: String,
         value: FieldValue,
         initial_policy: Option<Policy>,

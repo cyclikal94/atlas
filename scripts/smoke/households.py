@@ -83,7 +83,10 @@ def run(call, accounts, tokens, secrets, person, field):
     call('GET', '/api/experimental/v1/sync', extra_headers=browser_headers)
     devices = call('GET', '/api/experimental/v1/devices', tokens['alice'])['devices']
     assert any(item['id']=='browser' for item in devices)
-    call('DELETE', '/api/experimental/v1/devices/unused-device', tokens['alice'], expected=204)
+    # A device with nothing left is `superseded` (recorded, not applied); the token is not compared.
+    ghost = call('DELETE', '/api/experimental/v1/devices/unused-device', tokens['alice'],
+        operation=str(uuid.uuid4()), extra_headers={'Atlas-Device-State': 'v1.' + 'A' * 43})
+    assert ghost['outcome'] == 'superseded'
     sessions = call('GET', '/api/experimental/v1/sessions', tokens['alice'])['sessions']
     browser_id = next(item['id'] for item in sessions if item['device_id']=='browser')
     call('DELETE', '/api/experimental/v1/sessions/'+browser_id, tokens['alice'], expected=204)

@@ -16,6 +16,7 @@ async fn policy_revisions(store: &Store) -> Result<()> {
             &[Command::Edit {
                 id: person.clone(),
                 expected_version: 1,
+                expected_policy_version: Some(2),
                 label: "Renamed".into(),
                 value: String::new(),
             }],
@@ -26,8 +27,14 @@ async fn policy_revisions(store: &Store) -> Result<()> {
         panic!("missing person")
     };
     assert_eq!((resource.version, resource.policy_version), (2, Some(2)));
+    // A reader now receives the sharing revision it needs to edit safely, but nothing
+    // that identifies who else can see the resource.
     let page = store.sync(&reader, "reader", None, 200, 1000).await?;
-    assert!(!serde_json::to_string(&page)?.contains("policy_version"));
+    let Change::Upsert { resource } = &page.batches[0].changes[0] else {
+        panic!("missing person")
+    };
+    assert_eq!((resource.version, resource.policy_version), (2, Some(2)));
+    assert!(!serde_json::to_string(&page)?.contains(&owner));
     Ok(())
 }
 

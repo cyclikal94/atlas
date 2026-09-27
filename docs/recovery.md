@@ -37,7 +37,8 @@ whether or not you include a secrets file. The script does not discover those se
 After loading the data, restore invokes `atlas-server prepare-restore --offline`.
 This transaction invalidates login sessions, in-flight OIDC flows, signup invitations,
 snapshot cursors and signed delta cursor keys; resets calendar/delivery leases; and
-preserves domain data, resource IDs, history and operation receipts. Clients log in
+preserves domain data, resource IDs, history, operation receipts and the device-retirement
+operation ledger (so a recorded outcome still replays). Clients log in
 again and replace their cached view with a new snapshot. They must retain pending
 operation IDs for retries. Operations committed after the backup point are absent from
 the restored copy; this is the backup's recovery point, not a guarantee of zero data loss.
@@ -52,9 +53,11 @@ restore the saved database with its matching executable and keys.
 
 ## Release compatibility
 
-Atlas is unreleased. The current backup format is 1 and schema baseline is 1000.
-Restore requires that baseline; incompatible experimental schemas are rejected.
-At the first published release, this baseline becomes the supported starting point.
+Atlas is unreleased. The current backup format is 1 and the current schema is 1001. A
+bundle records the schema it holds. Backup and restore accept 1000 (the previous baseline,
+which is what a "back up before upgrading" bundle contains; the executable upgrades it in
+place when restore prepares it) and 1001; incompatible experimental schemas are rejected.
+At the first published release, the then-current schema becomes the supported starting point.
 Subsequent releases must provide transactional, ordered schema migrations and tests
 from every supported prior release before publishing. No down-migration is promised:
 rollback restores the pre-upgrade backup and matching binary. Versioned HTTP contracts

@@ -67,3 +67,38 @@ pub(crate) async fn command_request(
         .unwrap();
     (status, serde_json::from_slice(&bytes).unwrap())
 }
+
+/// A request with arbitrary headers (repeated names allowed), returning the status, headers and
+/// JSON body (`Null` when empty).
+pub(crate) async fn request(
+    app: &Router,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Value,
+) -> (StatusCode, axum::http::HeaderMap, Value) {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(format!("/api/experimental/v1/{path}"))
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = app
+        .clone()
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    (
+        status,
+        headers,
+        if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        },
+    )
+}

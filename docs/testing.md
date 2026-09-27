@@ -22,23 +22,72 @@ a subprocess helper invoked by the sync lifecycle test; do not run it directly.
 | Atomic dependency consent and cycle prevention | `tasks/dependencies` | Task HTTP routes |
 | Timer overlap, rejection recovery, durable completion successors and rotas | `tasks/timers`, `timer_recovery`, `successors`, `missed_recurrence`, `completion_worker`, `rotas` | Task HTTP routes |
 | Parent visibility, independent policies and policy/content versions | `resources` | Authenticated cross-device HTTP sync |
+| Content writes rejected atomically when sharing changed since they were read, for owners and collaborators, on both engines; held-gate ordering of `replace_policy` and existing-field `put_field`; edits never re-addressed through a merged alias | `resources/policy_precondition`, `tasks/policy_precondition`, `storage/contention`, `people/workflows` | Server `policy_precondition`; smoke and replica runs, including overlapping narrowing and save |
 | Household membership, defaults, invitations and exclusions | `households` | Onboarding HTTP routes |
 | Merge aliases, owner visibility, linked identity, consent and request replay | `people` | Sync and calendar anchor interactions |
-| Device quota/retirement, cursor bounds, retention without content loss | `accounts`, `sync` | Sessions and HTTP sync |
+| Device quota, cursor bounds, retention without content loss | `accounts`, `sync` | Sessions and HTTP sync |
+| Atomic device retirement: approved-state token and snapshot listing, ledger-first replay, stale/superseded/applied outcomes, operation-ID reuse | `accounts/approved_state`, `accounts/retirement_ledger` | Server `devices`; real processes in `scripts/smoke/devices.py` |
+| Retirement ordered against every writer of a member row, retry as a unit, the rows-affected assertion, READ COMMITTED and REPEATABLE READ | `accounts/retirement_coordination` (engine-specific schedules: revoke, sweeps, retention cleanup, registration create and `last_seen`, and the real `reminder_command` subscription set) | Server `devices` (ordinary revoke and `DELETE /sessions/current` route table) and server `writers` (the real routes for session issue, handoff create and consume, password change); two real PostgreSQL processes in `scripts/test_replicas.py` |
+| Every device holding a live member is listed with a token, including one left with only a handoff or subscription | `accounts/approved_state` | Server `devices`; `scripts/smoke/devices.py` (seeded fixture rows, real server) |
+| No unlisted or moved writer of an approved-state member | `accounts/writer_inventory` | — |
+| Additive `1000 → 1001` upgrade, unknown versions, concurrent upgrade | `storage/migration` | `scripts/test_recovery.py` restores a 1000 bundle |
 | Atomic receipts/publication, read/write contention and real process crash recovery | `sync`, `storage/contention` | SQLite and PostgreSQL execution |
 | Clean startup/reopen, concurrent initialisation, incompatible-schema rejection | `storage/initialisation` | Both database engines |
 | Foreign keys and failed-initialisation rollback | `resources/hierarchy`, `storage/initialisation` | SQLite connection pool; transactional DDL on both engines |
 | ICS exceptions/cancellation, event reconciliation, private anchors, leap birthdays | `calendars` | Calendar HTTP routes and integration worker |
 | Authentication, CSRF, session revocation, OIDC signatures and replay | — | Server `browser`, `sessions`, `onboarding`, `oidc` |
+| API version signal, contract hash and probed behaviour baseline | — | Server `compatibility`, `scripts/validate_contract.py` |
 | Fetch address rules, secret scope and real encrypted push payloads | — | Server `integrations` |
 
+The server `compatibility` cases check `/health`'s `api_version` and compare the contract
+hash and a probe transcript with `api/compatibility.json`. After a deliberate change with
+a greater `info.version`, record with `ATLAS_RECORD_COMPATIBILITY=1 cargo test --locked -p
+atlas-server --test api compatibility`; see [API](api.md#api-version-and-compatibility).
+The probes are a floor, not a proof, and cover only what they record.
+
 The unreleased migration-chain tests were deliberately removed with the clean
-baseline. Runtime receipt replay, alias resolution, request-ID reservation, and
+baseline; the single additive `1000 → 1001` step has its own case (`storage/migration`),
+and earlier experimental schemas still require a reset. Runtime receipt replay, alias resolution, request-ID reservation, and
 snapshot/delta recovery remain supported and tested. Similar unit, database and
 HTTP checks exercise different boundaries; do not remove one merely because it
 mentions the same feature.
 
-Use `crates/core/examples/sync_load.rs` for current-runtime workloads. Record the
+## Deterministic schedules and test hooks
+
+The retirement's concurrency cases force named interleavings with test-only hooks (the
+`test-hooks` Cargo feature of both crates): `retire.before_begin`, `retire.after_ledger_read`,
+`retire.after_locking_reads`, `retire.before_effects`, `retire.before_commit`,
+`devices.between_reads` and, in the server, `session_delete.after_identity`. A test arms a
+point, holds the transaction there, lets a competing writer run, then releases it; a point can
+also run one injected statement on the transaction's own connection, and PostgreSQL row locking
+can be switched off as a negative control. Registries belong to one `Store`, never the process.
+The feature is enabled only through a self dev-dependency, so the call sites expand to nothing
+and no point name reaches a normal or release build. Two consequences: `cargo tree -p
+atlas-server -e no-dev,features` must not show it (plain `-e features` includes dev edges),
+and `cargo test` leaves a hook-enabled `target/debug/atlas-server`. Build real-process evidence
+with a fresh `cargo build --locked -p atlas-server` and no `cargo test` after it, and check
+`strings target/debug/atlas-server | grep -c retire.after_ledger_read` prints `0`.
+
+The two engines order a competing writer differently, so each schedule names the engine's
+point: on SQLite `begin_serial()`'s first statement takes the single write lock, so a writer
+can commit first only at `retire.before_begin`; on PostgreSQL a writer that does not take
+`sync_clock` can also commit at `retire.after_ledger_read`, and a blocked writer is
+identified by `pg_blocking_pids` naming the retirement's own backend. PostgreSQL also reruns
+every schedule that can be raised with the retirement at `REPEATABLE READ` (`every_schedule_also_passes_at_repeatable_read`
+and `replay_survives_device_recreation_at_repeatable_read` in core; `every_route_schedule_also_passes_at_repeatable_read` and
+`every_real_writer_also_passes_at_repeatable_read` in the server), and each of those schedules asserts the level it
+observed (`READ COMMITTED` unless raised), so a raise that did nothing fails. The writers run in the server crate are the real
+routes (`POST /sessions`, `GET /oidc/callback`, `POST /oidc/native/exchange`, `POST /password`,
+`DELETE /sessions/{id}`, `DELETE /sessions/current`), not a stand-in statement. The activation-grant
+writers are not covered: their table belongs to BE-Q19. These in-process
+schedules prove the protocol's outcomes for the interleavings they force. They are not
+release evidence: `scripts/smoke_server.py` and `scripts/test-postgres-release.sh` exercise
+the release-shaped binary over real sockets, and the latter races retirements against
+revokes and logouts between two server processes (`ATLAS_RACE_ROUNDS`, default 200).
+
+Use `crates/core/examples/sync_load.rs` for current-runtime workloads, and
+`crates/core/examples/retire_load.rs` (with `ATLAS_TEST_POSTGRES_URL` for PostgreSQL) for the
+cost of a retirement, of the device listing, and of unrelated writers beside retirements. Record the
 revision, database, architecture, workload and resource limits when reporting capacity;
 results from a different implementation do not establish current throughput.
 
@@ -48,8 +97,9 @@ After building the server, `python3 scripts/test_recovery.py` exercises real SQL
 exports, credential files, corruption rejection and occupied-destination protection.
 `scripts/test-postgres-release.sh` owns a disposable PostgreSQL cluster and runs two
 actual server processes, alternating domain HTTP requests between them, racing one
-operation ID, measuring a bounded concurrent write sample, stopping one replica and
-restoring an export into a second database. Set `ATLAS_PYTHON` to a Python environment
+operation ID, racing device retirements against revokes and logouts, measuring a bounded
+concurrent write sample, stopping one replica and restoring an export into a second database
+(the operation ledger must survive the restore). Set `ATLAS_PYTHON` to a Python environment
 with `scripts/requirements-contract.txt` installed. Worker generation and retry fencing
 are also tested through independent database pools in the calendar reconciliation cases.
 
@@ -65,6 +115,16 @@ the image using `kind load docker-image IMAGE --name CLUSTER`, then run `python3
 The test owns a unique namespace and removes it afterwards; it verifies supplied and
 external PostgreSQL, two API replicas, health probes and restart persistence. Delete
 the disposable cluster after testing. Never supply a personal/production kubeconfig.
+
+The API types package has its own suite: `npm test --prefix scripts/api-types` builds packages
+from tiny OpenAPI fixtures in temporary git repositories, with negative controls for
+non-deterministic generation, umask leaks, release gates, damaged assets and misattributed provenance.
+`scripts/test_release_workflow.py`, run in the contract environment (it needs PyYAML), guards
+the workflow configuration and runs each workflow's own generate and verify commands through
+`npm run --prefix` in a scratch checkout, asserting that its upload path finds the tarball and
+sidecar. Neither uses the network beyond `npm ci`, GitHub or a running backend,
+so they show the code behaves as designed, not that a `Release` run has published a good asset;
+only a real tagged release does that. See [packaging](packaging.md#api-types-package).
 
 Release archives and licence coverage are described in [packaging](packaging.md).
 

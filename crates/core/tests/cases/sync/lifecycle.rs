@@ -6,10 +6,11 @@ use uuid::Uuid;
 fn id() -> String {
     Uuid::new_v4().to_string()
 }
-fn edit(id: &str, version: i64, label: &str) -> Command {
+fn edit(id: &str, version: i64, policy_version: i64, label: &str) -> Command {
     Command::Edit {
         id: id.into(),
         expected_version: version,
+        expected_policy_version: Some(policy_version),
         label: label.into(),
         value: String::new(),
     }
@@ -102,13 +103,13 @@ async fn scenario(url: &str) -> Result<()> {
     assert!(visible[&shared].can_edit);
     assert!(
         store
-            .apply(&bob, &id(), &[edit(&private, 1, "steal")])
+            .apply(&bob, &id(), &[edit(&private, 1, 1, "steal")])
             .await
             .is_err()
     );
     assert!(
         store
-            .apply(&bob, &id(), &[edit(&person, 2, "rename")])
+            .apply(&bob, &id(), &[edit(&person, 2, 2, "rename")])
             .await
             .is_err()
     );
@@ -125,10 +126,11 @@ async fn scenario(url: &str) -> Result<()> {
             &alice,
             &id(),
             &[
-                edit(&person, 1, "Morgan Smith"),
+                edit(&person, 1, 2, "Morgan Smith"),
                 Command::Edit {
                     id: shared.clone(),
                     expected_version: 1,
+                    expected_policy_version: Some(2),
                     label: "Hobbies".into(),
                     value: "Surfing and music".into(),
                 },
@@ -151,12 +153,12 @@ async fn scenario(url: &str) -> Result<()> {
             .apply(
                 &alice,
                 "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
-                &[edit(&person, 2, "Non-canonical")]
+                &[edit(&person, 2, 2, "Non-canonical")]
             )
             .await
             .is_err()
     );
-    let command = edit(&person, 2, "After rollback");
+    let command = edit(&person, 2, 2, "After rollback");
     let mut failed = store.begin_serial().await?;
     Store::apply_in(
         &mut failed,
@@ -181,7 +183,7 @@ async fn scenario(url: &str) -> Result<()> {
     );
     assert!(
         store
-            .apply(&alice, &operation, &[edit(&person, 3, "different")])
+            .apply(&alice, &operation, &[edit(&person, 3, 2, "different")])
             .await
             .is_err()
     );
@@ -189,7 +191,7 @@ async fn scenario(url: &str) -> Result<()> {
     // SYNC-003: a later writer cannot publish past an in-flight earlier writer.
     let mut first = store.begin_serial().await?;
     let first_revision =
-        Store::apply_in(&mut first, &alice, &id(), &[edit(&person, 3, "First")]).await?;
+        Store::apply_in(&mut first, &alice, &id(), &[edit(&person, 3, 2, "First")]).await?;
     let other = store.clone();
     let who = alice.clone();
     let target = person.clone();
@@ -197,7 +199,7 @@ async fn scenario(url: &str) -> Result<()> {
     let writer = tokio::spawn(async move {
         entered_tx.send(()).unwrap();
         other
-            .apply(&who, &id(), &[edit(&target, 4, "Second")])
+            .apply(&who, &id(), &[edit(&target, 4, 2, "Second")])
             .await
     });
     entered_rx.await?;
@@ -228,6 +230,7 @@ async fn scenario(url: &str) -> Result<()> {
             &[Command::Edit {
                 id: shared.clone(),
                 expected_version: 2,
+                expected_policy_version: Some(2),
                 label: "Later".into(),
                 value: "New".into(),
             }],
@@ -307,7 +310,7 @@ async fn scenario(url: &str) -> Result<()> {
 
     // SYNC-005: concurrent retries and restart retain account-wide operation identity.
     let replay = id();
-    let cmd = edit(&person, 5, "One logical edit");
+    let cmd = edit(&person, 5, 4, "One logical edit");
     let mut jobs = tokio::task::JoinSet::new();
     for _ in 0..6 {
         let s = store.clone();

@@ -5,8 +5,13 @@ edition = "2024"
 license = "AGPL-3.0-only"
 publish = false
 
+[features]
+# Test-only schedule control for the retirement protocol. Never enabled by a normal build.
+test-hooks = ["tokio/sync"]
+
 [dependencies]
 anyhow = { workspace = true }
+base64 = { workspace = true }
 chrono = { workspace = true, features = ["std"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -20,5 +25,7 @@ url = { workspace = true }
 ical = { workspace = true }
 
 [dev-dependencies]
+# Enables the feature above for this crate's own tests only (dev edges are not built otherwise).
+atlas-core = { path = ".", features = ["test-hooks"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
 tempfile = { workspace = true }

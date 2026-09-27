@@ -189,7 +189,22 @@ impl Store {
             !commands.is_empty() && commands.len() <= 20,
             ErrorCode::InvalidValue
         );
-        let mut tx = self.begin_serial().await?;
+        let tx = self.begin_serial().await?;
+        let (revision, tx) = Self::management_on(tx, actor, operation, commands, now).await?;
+        tx.commit().await?;
+        Ok(revision)
+    }
+
+    /// Transaction seam used by concurrency tests: runs `management` on a transaction the
+    /// caller opened with `begin_serial` and hands it back uncommitted, still holding the gate.
+    /// Callers validate `operation` and `commands` as `management` does.
+    pub async fn management_on(
+        mut tx: Transaction<'static, Any>,
+        actor: &str,
+        operation: &str,
+        commands: &[ManagementCommand],
+        now: i64,
+    ) -> Result<(i64, Transaction<'static, Any>)> {
         Self::epoch(&mut tx, actor).await?;
         let payload = receipt_digest(&format!(
             "management-v1\n{}",
@@ -205,7 +220,7 @@ impl Store {
         {
             ensure!(row.get::<i64, _>(2) == 1, ErrorCode::UnsupportedReceipt);
             ensure!(row.get::<String, _>(0) == payload, ErrorCode::OperationConflict);
-            return Ok(row.get(1));
+            return Ok((row.get(1), tx));
         }
         let mut touched = BTreeSet::new();
         let mut accounts = BTreeSet::from([actor.to_owned()]);
@@ -514,7 +529,6 @@ impl Store {
         .bind(revision)
         .execute(&mut *tx)
         .await?;
-        tx.commit().await?;
-        Ok(revision)
+        Ok((revision, tx))
     }
 }

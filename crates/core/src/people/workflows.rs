@@ -278,8 +278,11 @@ impl Store {
                 ..
             } => {
                 let p = Self::task_resource(&mut tx, actor, &person_id, "person", false).await?;
+                // Readers also see the counter, so ownership is checked explicitly.
                 ensure!(
-                    p.policy_version.is_some() && p.version == *expected_version && !p.archived,
+                    Self::person_owner(&mut tx, &person_id).await? == actor
+                        && p.version == *expected_version
+                        && !p.archived,
                     ErrorCode::Conflict
                 );
                 ensure!(
@@ -301,7 +304,9 @@ impl Store {
                         person_id: person_id.clone(),
                         account_id: account_id.clone(),
                         person_version: p.version,
-                        policy_version: p.policy_version.unwrap(),
+                        policy_version: p
+                            .policy_version
+                            .ok_or_else(|| anyhow!(ErrorCode::Conflict))?,
                         name: p.label,
                     },
                     now,

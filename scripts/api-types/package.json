@@ -4,12 +4,15 @@
   "version": "0.0.0",
   "type": "module",
   "engines": {
-    "node": ">=22.22.2"
+    "node": "22.23.2"
   },
   "scripts": {
-    "generate": "node generate.mjs"
+    "generate": "node generate.mjs",
+    "verify": "node verify.mjs",
+    "test": "node --test test/*.test.mjs"
   },
   "devDependencies": {
-    "openapi-typescript": "7.4.3"
+    "openapi-typescript": "7.4.3",
+    "typescript": "5.9.3"
   }
 }

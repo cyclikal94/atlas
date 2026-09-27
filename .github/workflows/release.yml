@@ -134,29 +134,48 @@ jobs:
   api-types:
     needs: metadata
     runs-on: ubuntu-24.04
+    env:
+      # One absolute location for generation, verification and upload. npm runs the scripts from
+      # scripts/api-types, so a relative path would resolve there and the upload would find nothing.
+      API_TYPES_OUTPUT: ${{ github.workspace }}/target/api-types
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22.23.2
+          node-version-file: scripts/api-types/.node-version
           cache: npm
           cache-dependency-path: scripts/api-types/package-lock.json
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.14'
       - run: python -m pip install -r scripts/requirements-contract.txt
       - run: python scripts/validate_contract.py
       - run: npm ci --ignore-scripts --prefix scripts/api-types
+      - run: npm test --prefix scripts/api-types
       - name: Generate reproducible API types
         env:
           VERSION: ${{ needs.metadata.outputs.version }}
-        run: npm run generate --prefix scripts/api-types -- --version "$VERSION" --output target/api-types
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          # Only a pushed tag builds a releasable version; manual dispatch stays 0.0.0-dev.
+          flags=()
+          if [[ "$EVENT_NAME" == push ]]; then flags+=(--release); fi
+          npm run generate --prefix scripts/api-types -- --version "$VERSION" --output "$API_TYPES_OUTPUT" "${flags[@]}"
+      - name: Verify generated API types
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          # A pushed tag also proves the package came from this checkout, which is at that tag.
+          flags=()
+          if [[ "$EVENT_NAME" == push ]]; then flags+=(--release); fi
+          npm run verify --prefix scripts/api-types -- "$API_TYPES_OUTPUT/atlas-api-types-$VERSION.tgz" --version "$VERSION" "${flags[@]}"
       - uses: actions/upload-artifact@v7
         with:
           name: atlas-api-types
-          path: target/api-types/*
+          path: ${{ env.API_TYPES_OUTPUT }}/*
           if-no-files-found: error
 
   publish:
@@ -186,6 +205,13 @@ jobs:
           pattern: image-*
           path: images
           merge-multiple: true
+      - name: Verify API types asset before publishing anything
+        working-directory: downloads
+        run: |
+          asset="atlas-api-types-$VERSION.tgz"
+          test -f "$asset"
+          test "$(find . -maxdepth 1 -name 'atlas-api-types-*.tgz' | wc -l)" -eq 1
+          sha256sum -c "$asset.sha256"
       - uses: docker/setup-buildx-action@v4
       - name: Publish tested images and multi-architecture manifest
         run: |
@@ -210,6 +236,7 @@ jobs:
         run: |
           sha256sum ./*.tar.gz ./*.tgz ./container-image.txt > SHA256SUMS
           printf 'Container: `ghcr.io/%s:%s`\n\nHelm: `oci://ghcr.io/%s/charts/atlas` (version `%s`)\n' "${GH_REPO,,}" "$TAG" "${GH_REPO,,}" "$VERSION" > "$RUNNER_TEMP/release-notes.md"
+          printf '\nAPI types: `atlas-api-types-%s.tgz` (`@atlas/api-types`), SHA-256 `%s`\n' "$VERSION" "$(cut -d' ' -f1 "atlas-api-types-$VERSION.tgz.sha256")" >> "$RUNNER_TEMP/release-notes.md"
           args=()
           if [[ "$VERSION" == *-* ]]; then args+=(--prerelease); fi
           gh release create "$TAG" ./* --verify-tag --title "Atlas $TAG" --generate-notes --notes-file "$RUNNER_TEMP/release-notes.md" "${args[@]}"

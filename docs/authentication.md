@@ -29,8 +29,14 @@ After a page reload, `GET /api/experimental/v1/browser-sessions/current` with
 `X-Atlas-Session: 1` returns the account, expiry and CSRF token. This bootstrap does
 not itself require a CSRF token. The custom header requires a preflight for
 cross-origin JavaScript, and Atlas grants no CORS access. Keep the eventual client
-on the configured origin. `DELETE /api/experimental/v1/sessions/current` revokes the
-session and clears the cookie. Responses use private/no-store and no-referrer headers.
+on the configured origin. `DELETE /api/experimental/v1/sessions/current` deletes the
+session row of the credential it carries, and nothing else. No response that revokes the
+caller's own session (logout, revoking your own session, changing your password, unlinking
+a provider or retiring your own device) sets or clears a cookie: the row's deletion already
+revokes the credential, so later use of it returns `401`, whereas a cookie decision made from
+state read at request time but delivered later could clear the cookie of a newer login. A
+client discards its own copy when it learns the session has ended. Responses use
+private/no-store and no-referrer headers.
 
 ## OpenID Connect
 
@@ -184,14 +190,74 @@ synthetic tokens. It is not an application/deployment key and must never become 
 
 ## Device retirement
 
-`GET /api/experimental/v1/devices` lists your sync devices and devices with active
-sessions, including the current device, last sync time (or null) and active session
-count. `DELETE /api/experimental/v1/devices/{device_id}` frees its sync quota and
-revokes every session and pending native handoff for that account/device. It also
-invalidates its cursors and delivery ledger. Content and account-wide command receipts
-survive, so pending operations can be retried after login and a fresh snapshot.
-Retiring your current device logs you out. These are online, authenticated operations;
-cookie authentication requires the normal CSRF header. Device IDs are account-scoped.
+`GET /api/experimental/v1/devices` lists every device of your account that holds any member of
+the approved state (a sync registration, a live session, a live native handoff or an active
+notification subscription), including the current device, last sync time (or null) and
+active session count. Each device also carries the *approved state* a user could confirm
+retiring, as an opaque `state_token` and a `summary` (sessions, native handoffs, notification
+subscriptions, pending sign-ins, whether a sync registration exists) read together from one
+database snapshot, so what a confirmation dialog shows is exactly what the token covers.
+
+The listing set is the union of the same member predicates the token covers, so a device
+that can be retired always offers a token. In particular, a device whose last session has
+gone but which still holds a live native handoff or an active subscription stays listed
+with a fresh token and a `sessions` count of `0`; that is how a client that has just
+received `rejected_stale` reads the state it must confirm again. A device appears until
+nothing live remains: once every member is gone or expired it is no longer listed (and a
+retirement of it would be `superseded`).
+
+### Retiring a device
+
+`DELETE /api/experimental/v1/devices/{device_id}` requires an `Idempotency-Key` (a
+canonical lower-case UUID, the *operation ID*) and the `Atlas-Device-State` header holding
+the token the user confirmed. It retires the device only if its complete approved state
+still equals that token, and records the outcome durably in the same transaction:
+
+| Outcome | Status | Meaning |
+| --- | --- | --- |
+| `confirmed_applied` | `200` | This operation retired the device: sessions and native handoffs deleted, subscriptions deactivated (secret erased), sync registration, cursors and delivery ledger removed. Content and account-wide command receipts survive. |
+| `superseded` | `200` | Nothing was left to retire: every member was already gone. Nothing was changed, and this is **not** a confirmation. |
+| `rejected_stale` | `409 operation_conflict` | The state changed after the user confirmed it (a session, handoff, subscription or registration was added, replaced or partly removed). Nothing was changed. |
+
+The approved state has four components today: live sessions, live native handoffs, active
+notification subscriptions (by ID and version) and the sync registration (by a digest of its
+cursor key); pending-sign-in grants join it when they exist. Expired rows, inactive
+subscriptions, `last_seen` and cursor churn are not state. A device that is retired and
+recreated always has a different token. A user must confirm again, and the client must send a
+**new** operation ID, after a `rejected_stale` outcome: it is never retried against the
+changed state.
+
+The outcome is recoverable. A self-retirement revokes the caller's own session, and a
+response can be lost, so the client repeats the identical call (same ID, device and token)
+under any other valid session of the account; the recorded outcome is returned without
+evaluating anything again, even after the device has since been recreated. A repeat under
+the revoked credential is `401`, which is not an answer. Reusing an ID for a different
+device or token is `422`. An ID with no record is unresolved: absence of a device, an
+expired session or a missing subscription is never evidence that a retirement happened.
+`DELETE /api/experimental/v1/sessions/{id}` records the same way when it carries an
+optional `Idempotency-Key` (`confirmed_applied` or `superseded`, never `rejected_stale`);
+without one it remains a plain revocation (`204`, or `404` when nothing matched). A keyed
+revocation credits only a live session row that this call removed.
+
+Correctness under concurrency does not rest on client checks. The retirement runs in one
+serialised transaction, retried as a unit on `SQLITE_BUSY` or PostgreSQL `40001`/`40P01`
+(exhaustion is `503` with no record and no effect, so the client repeats the identical call).
+It reads the ledger first, orders itself against sync-registration creation with a no-op
+update of the account row, then re-reads every member, `FOR UPDATE` on PostgreSQL, so each row
+it compares is locked until commit; on SQLite the write lock taken by the first statement
+already excludes every writer. It then deletes, deactivates and cancels exactly the locked
+identities, asserting each statement's rows-affected: any discrepancy means a writer escaped
+the protocol, so the transaction rolls back with no record and the request fails `500`. A
+removal by another cause is never credited to the retirement (or to a keyed revocation). The
+transaction runs at PostgreSQL's default `READ COMMITTED`. Every writer of a member row must
+either run inside `begin_serial()` or be ordered by its own row lock; a test lists every such
+statement and fails when one is added or moved (see [testing](testing.md)).
+
+Ledger rows are kept indefinitely, like receipts: an expiry would silently turn a confirmed
+retirement into a hidden one after a long absence. They survive restore preparation, so a
+recorded outcome still replays after a restore. Retirement and keyed revocation are online,
+authenticated operations; cookie authentication requires the normal CSRF header. Device IDs
+are account-scoped.
 
 Per-device cursor keys are protected database state. See [operations](operations.md)
 for the pre-release reset policy and [testing](testing.md) for provider test scope.

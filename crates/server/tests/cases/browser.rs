@@ -178,7 +178,9 @@ async fn cookies_require_csrf_and_revocation_survives_reload() -> anyhow::Result
     );
     let (status, headers, _) = call(&app, "DELETE", "sessions/current", &good, Value::Null).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    assert!(headers["set-cookie"].to_str()?.contains("Max-Age=0"));
+    // The row's deletion revokes the credential. No Set-Cookie: a delayed cookie decision could
+    // clear the cookie of a newer login.
+    assert!(!headers.contains_key("set-cookie"));
     assert_eq!(
         call(&app, "GET", "sync", &good, Value::Null).await.0,
         StatusCode::UNAUTHORIZED

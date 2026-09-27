@@ -104,18 +104,23 @@ async fn membership_and_defaults(s: &Store) -> Result<()> {
         .await?;
     assert!(visible(&shared, &p));
     assert!(!visible(&shared, &private));
-    // A member can edit shared content, but cannot invite or read the owner's ACL.
-    s.apply(
-        &bob,
-        &id(),
-        &[Command::Edit {
-            id: p.clone(),
-            expected_version: 1,
-            label: "Shared rename".into(),
-            value: String::new(),
-        }],
-    )
-    .await?;
+    // A member can edit shared content, but cannot invite or read the owner's ACL. Their
+    // authority comes from the household default, which is still a policy state: an edit
+    // that omits or misstates the revision it was based on is rejected.
+    let rename = |policy_version| Command::Edit {
+        id: p.clone(),
+        expected_version: 1,
+        expected_policy_version: policy_version,
+        label: "Shared rename".into(),
+        value: String::new(),
+    };
+    let current = crate::support::projection::policy_version(s, &bob, &p).await?;
+    for wrong in [None, Some(current + 1)] {
+        let error = s.apply(&bob, &id(), &[rename(wrong)]).await.unwrap_err();
+        assert_eq!(error.to_string(), "conflict");
+    }
+    // A household member obtains the revision from their own projection.
+    s.apply(&bob, &id(), &[rename(Some(current))]).await?;
     assert!(s.resource_policy(&bob, &p).await.is_err());
     let version = s.households(&alice).await?[0].version;
     assert!(

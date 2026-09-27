@@ -25,5 +25,5 @@ if "${ATLAS_PYTHON:-python3}" scripts/backup.py restore "$atlas_tmp/export" --en
   echo 'Restore incorrectly accepted an occupied database' >&2
   exit 1
 fi
-atlas_valid="$("$atlas_pg_bin/psql" "$ATLAS_DATABASE_URL" -XAt -v ON_ERROR_STOP=1 -c "SELECT (SELECT count(*) FROM accounts)>=2 AND (SELECT count(*) FROM receipts)>0 AND (SELECT count(*) FROM sessions)=0")"
+atlas_valid="$("$atlas_pg_bin/psql" "$ATLAS_DATABASE_URL" -XAt -v ON_ERROR_STOP=1 -c "SELECT (SELECT count(*) FROM accounts)>=2 AND (SELECT count(*) FROM receipts)>0 AND (SELECT count(*) FROM operation_outcomes)>0 AND (SELECT count(*) FROM sessions)=0")"
 [ "$atlas_valid" = t ]

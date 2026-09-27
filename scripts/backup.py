@@ -13,6 +13,9 @@ import sys
 import urllib.parse
 
 FORMAT = 1
+# Schema versions a bundle may hold. 1000 is the previous baseline: it is what a "back up before
+# upgrading" bundle contains, and the server upgrades it in place when restore prepares it.
+SUPPORTED_SCHEMAS = (1000, 1001)
 
 
 def run(command, env=None):
@@ -68,21 +71,24 @@ def backup(args):
         if not args.sqlite or not args.sqlite.is_file():
             raise ValueError('--sqlite must name an existing database')
         with sqlite3.connect(args.sqlite.resolve().as_uri() + '?mode=ro', uri=True) as source:
-            if source.execute('SELECT version FROM atlas_schema').fetchall() != [(1000,)]:
+            versions = source.execute('SELECT version FROM atlas_schema').fetchall()
+            if len(versions) != 1 or versions[0][0] not in SUPPORTED_SCHEMAS:
                 raise ValueError('unsupported schema')
+            schema = versions[0][0]
             with sqlite3.connect(payload) as target:
                 source.backup(target)
     else:
         env = pg_env()
         version = run(['psql', '-XAt', '-v', 'ON_ERROR_STOP=1', '-c', 'SELECT version FROM atlas_schema'], env)
-        if version.strip() != b'1000':
+        if not version.strip().isdigit() or int(version) not in SUPPORTED_SCHEMAS:
             raise ValueError('unsupported schema')
+        schema = int(version)
         run(['pg_dump', '--format=custom', '--no-owner', '--no-acl', '--file', str(payload)], env)
     files = {'database': digest(payload)}
     if args.secrets_file:
         shutil.copyfile(args.secrets_file, args.bundle / 'secrets.env')
         files['secrets.env'] = digest(args.bundle / 'secrets.env')
-    manifest = {'format': FORMAT, 'schema': 1000, 'engine': args.engine,
+    manifest = {'format': FORMAT, 'schema': schema, 'engine': args.engine,
                 'created_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 'files': files}
     for name in files:
@@ -94,7 +100,7 @@ def backup(args):
 
 def restore(args):
     manifest = json.loads((args.bundle / 'manifest.json').read_text())
-    if manifest.get('format') != FORMAT or manifest.get('schema') != 1000:
+    if manifest.get('format') != FORMAT or manifest.get('schema') not in SUPPORTED_SCHEMAS:
         raise ValueError('unsupported backup format/schema')
     if manifest.get('engine') != args.engine:
         raise ValueError('cross-engine restore is not supported')

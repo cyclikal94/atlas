@@ -216,6 +216,18 @@ CREATE TABLE oidc_flows (
     native_state text
 );
 
+CREATE TABLE operation_outcomes (
+    account_id text NOT NULL,
+    operation_id text NOT NULL,
+    kind text NOT NULL,
+    digest text NOT NULL,
+    outcome text NOT NULL,
+    created_at bigint NOT NULL,
+    CONSTRAINT operation_outcomes_check CHECK (((outcome <> 'rejected_stale'::text) OR (kind = 'retire_device'::text))),
+    CONSTRAINT operation_outcomes_kind_check CHECK ((kind = ANY (ARRAY['retire_device'::text, 'revoke_session'::text]))),
+    CONSTRAINT operation_outcomes_outcome_check CHECK ((outcome = ANY (ARRAY['confirmed_applied'::text, 'rejected_stale'::text, 'superseded'::text])))
+);
+
 CREATE TABLE people_request_ids (
     id text NOT NULL
 );
@@ -562,6 +574,9 @@ ALTER TABLE ONLY occurrence_participants
 ALTER TABLE ONLY oidc_flows
     ADD CONSTRAINT oidc_flows_pkey PRIMARY KEY (state_hash);
 
+ALTER TABLE ONLY operation_outcomes
+    ADD CONSTRAINT operation_outcomes_pkey PRIMARY KEY (account_id, operation_id);
+
 ALTER TABLE ONLY people_request_ids
     ADD CONSTRAINT people_request_ids_pkey PRIMARY KEY (id);
 
@@ -865,6 +880,9 @@ ALTER TABLE ONLY occurrence_participants
 ALTER TABLE ONLY occurrence_participants
     ADD CONSTRAINT occurrence_participants_progress_id_fkey FOREIGN KEY (progress_id) REFERENCES resources(id);
 
+ALTER TABLE ONLY operation_outcomes
+    ADD CONSTRAINT operation_outcomes_account_id_fkey FOREIGN KEY (account_id) REFERENCES accounts(id);
+
 ALTER TABLE ONLY people_requests
     ADD CONSTRAINT people_requests_recipient_id_fkey FOREIGN KEY (recipient_id) REFERENCES accounts(id);
 
@@ -1015,4 +1033,4 @@ ALTER TABLE ONLY timer_sessions
 
 
 INSERT INTO sync_clock(id,revision,resource_count) VALUES(1,0,0);
-INSERT INTO atlas_schema(version) VALUES(1000);
+INSERT INTO atlas_schema(version) VALUES(1001);

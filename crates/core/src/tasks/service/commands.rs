@@ -11,14 +11,31 @@ impl Store {
         now: i64,
     ) -> Result<TaskResult> {
         identifier(operation)?;
-        let mut tx = self.begin_serial().await?;
+        let tx = self.begin_serial().await?;
+        let (result, tx) =
+            Self::task_command_on(tx, actor, operation, command, defaults_revision, now).await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    /// Transaction seam used by concurrency tests: runs `task_command` on a transaction the
+    /// caller opened with `begin_serial` and hands it back uncommitted, still holding the
+    /// gate. Callers validate `operation` as `task_command` does.
+    pub async fn task_command_on(
+        mut tx: Transaction<'static, Any>,
+        actor: &str,
+        operation: &str,
+        command: &TaskCommand,
+        defaults_revision: Option<&str>,
+        now: i64,
+    ) -> Result<(TaskResult, Transaction<'static, Any>)> {
         Self::epoch(&mut tx, actor).await?;
         let payload = receipt_digest(&format!(
             "task-command-v1\n{defaults_revision:?}\n{}",
             serde_json::to_string(command)?
         ));
         if let Some(r)=sqlx::query("SELECT payload,revision,digest_version FROM receipts WHERE account_id=$1 AND operation_id=$2").bind(actor).bind(operation).fetch_optional(&mut *tx).await? {
-            ensure!(r.get::<i64,_>(2)==1, ErrorCode::UnsupportedReceipt);ensure!(r.get::<String,_>(0)==payload, ErrorCode::OperationConflict);return Ok(TaskResult{revision:r.get(1)});
+            ensure!(r.get::<i64,_>(2)==1, ErrorCode::UnsupportedReceipt);ensure!(r.get::<String,_>(0)==payload, ErrorCode::OperationConflict);return Ok((TaskResult{revision:r.get(1)}, tx));
         }
         let mut resolved = command.clone();
         match &mut resolved {
@@ -209,11 +226,13 @@ impl Store {
             TaskCommand::ReviseTask {
                 id,
                 expected_version,
+                expected_policy_version,
                 title,
                 definition,
             } => {
                 let task = Self::task_resource(&mut tx, actor, id, "task", true).await?;
                 ensure!(task.version == *expected_version, ErrorCode::Conflict);
+                task.ensure_policy_version(*expected_policy_version)?;
                 let execution = Self::execution(&mut tx, actor, id, true).await?;
                 definition.validate()?;
                 ensure!(
@@ -509,10 +528,12 @@ impl Store {
             TaskCommand::EditList {
                 id,
                 expected_version,
+                expected_policy_version,
                 name,
             } => {
                 let p = Self::task_resource(&mut tx, actor, id, "list", true).await?;
                 ensure!(p.version == *expected_version, ErrorCode::Conflict);
+                p.ensure_policy_version(*expected_policy_version)?;
                 Self::value(&mut tx, id, name, "").await?;
             }
             TaskCommand::ListItem {
@@ -570,6 +591,7 @@ impl Store {
                 id,
                 parent_id,
                 expected_version,
+                expected_policy_version,
                 label,
                 value,
                 initial_policy,
@@ -584,12 +606,16 @@ impl Store {
                     ensure!(initial_policy.is_none(), ErrorCode::InvalidValue);
                     let p = Self::task_resource(&mut tx, actor, id, "field", true).await?;
                     ensure!(p.version == *version, ErrorCode::Conflict);
+                    p.ensure_policy_version(*expected_policy_version)?;
                     ensure!(
                         p.parent_id.as_ref() == Some(parent_id),
                         ErrorCode::InvalidValue
                     );
                     Self::value(&mut tx, id, label, &serde_json::to_string(value)?).await?;
                 } else {
+                    // Creation has no earlier policy to race; it is guarded by the
+                    // defaults revision instead.
+                    ensure!(expected_policy_version.is_none(), ErrorCode::InvalidValue);
                     let policy = Self::person_field_policy(
                         &mut tx,
                         actor,
@@ -638,8 +664,7 @@ impl Store {
         .bind(revision)
         .execute(&mut *tx)
         .await?;
-        tx.commit().await?;
-        Ok(TaskResult { revision })
+        Ok((TaskResult { revision }, tx))
     }
     pub(super) async fn ensure_own_participation(
         tx: &mut Transaction<'_, Any>,

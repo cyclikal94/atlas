@@ -1,7 +1,11 @@
 pub mod calendars;
 pub mod database;
+pub mod devices;
+pub mod projection;
 pub mod resource_commands;
 pub mod resources;
+pub mod schedule;
+pub mod sharing;
 pub mod task_fixtures;
 pub mod task_workflows;
 pub mod tasks;

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use atlas_core::Store;
 
+use crate::support::devices::retire;
 use crate::support::task_fixtures::{account, ledger, person, setup};
 
 async fn device_cleanup(s: &Store) -> Result<()> {
@@ -9,7 +10,7 @@ async fn device_cleanup(s: &Store) -> Result<()> {
     let page = s.sync(&a, "phone", None, 200, 1000).await?;
     s.sync(&a, "tablet", None, 200, 1000).await?;
     assert_eq!(ledger(s, &a, "phone").await?, 1);
-    s.forget_device(&a, "phone").await?;
+    retire(s, &a, "phone", 1000).await?;
     assert_eq!(ledger(s, &a, "phone").await?, 0);
     assert_eq!(ledger(s, &a, "tablet").await?, 1);
     assert!(

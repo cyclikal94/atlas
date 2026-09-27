@@ -5,11 +5,32 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Any, AnyPool, Row, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Names a point in a transaction where test builds may pause or run an injected statement.
+/// Without the `test-hooks` feature it expands to nothing, so a release build has neither the
+/// call nor the point name.
+#[cfg(feature = "test-hooks")]
+macro_rules! hook {
+    ($store:expr, $point:literal) => {
+        $store.hooks.reach($point).await
+    };
+    ($store:expr, $point:literal, $tx:expr) => {
+        $store.hooks.reach_in($point, $tx, $store.sqlite).await?
+    };
+}
+#[cfg(not(feature = "test-hooks"))]
+macro_rules! hook {
+    ($($tokens:tt)*) => {};
+}
+
 pub mod accounts;
 pub mod calendars;
 pub mod devices;
 pub mod error;
+#[cfg(feature = "test-hooks")]
+pub mod hooks;
 pub mod households;
+pub mod operations;
 pub mod people;
 pub mod policy;
 pub mod resources;
@@ -24,6 +45,16 @@ pub struct Store {
     pub pool: AnyPool,
     sqlite: bool,
     retention_seconds: i64,
+    #[cfg(feature = "test-hooks")]
+    pub(crate) hooks: std::sync::Arc<hooks::Hooks>,
+}
+
+#[cfg(feature = "test-hooks")]
+impl Store {
+    /// Schedule control shared by this store and every clone of it.
+    pub fn hooks(&self) -> &hooks::Hooks {
+        &self.hooks
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -82,6 +113,8 @@ pub enum Command {
     Edit {
         id: String,
         expected_version: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_policy_version: Option<i64>,
         label: String,
         value: String,
     },

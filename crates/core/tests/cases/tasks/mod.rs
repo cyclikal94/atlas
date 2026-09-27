@@ -8,6 +8,7 @@ mod lists_fields;
 mod missed_recurrence;
 mod numeric;
 mod participation;
+mod policy_precondition;
 mod rotas;
 mod successors;
 mod timer_recovery;

@@ -135,6 +135,7 @@ async fn merge_scenario(s: &Store) -> Result<()> {
             id: typed.clone(),
             parent_id: source.clone(),
             expected_version: None,
+            expected_policy_version: None,
             label: "Birthday".into(),
             value: FieldValue::Date {
                 year: None,
@@ -264,6 +265,7 @@ async fn linking_scenario(s: &Store) -> Result<()> {
             &[Command::Edit {
                 id: source.clone(),
                 expected_version: p.version,
+                expected_policy_version: p.policy_version,
                 label: "Wrong name".into(),
                 value: "".into()
             }]
@@ -538,6 +540,7 @@ async fn merge_preserves_birthday_anchor_reference_and_occurrences() -> Result<(
             id: date.clone(),
             parent_id: source.clone(),
             expected_version: None,
+            expected_policy_version: None,
             label: "Birthday".into(),
             value: FieldValue::Date {
                 year: None,
@@ -694,5 +697,211 @@ async fn people_requests_can_expire_decline_or_be_cancelled() -> Result<()> {
         );
     }
     assert!(s.person_detail(&a, &p).await?.linked_account_id.is_none());
+    Ok(())
+}
+
+/// Readers and editors may hold a person without owning it. Sending a link request and
+/// reading the ACL stay owner-only whatever else a reader can see about the resource.
+#[tokio::test]
+async fn request_link_and_acl_read_still_require_ownership() -> Result<()> {
+    let (s, _dir) = setup().await?;
+    let a = account(&s).await?;
+    let b = account(&s).await?;
+    let c = account(&s).await?;
+    let p = person(&s, &a, "Morgan", share(&b)).await?;
+    let request = id();
+    let error = s
+        .people_command(
+            &b,
+            &id(),
+            &PeopleCommand::RequestLink {
+                id: request.clone(),
+                person_id: p.clone(),
+                account_id: c.clone(),
+                expected_version: 1,
+            },
+            NOW,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "conflict");
+    assert!(s.people_requests(&c, NOW).await?.is_empty());
+    match s.resource_policy(&b, &p).await {
+        Ok(_) => panic!("a non-owner must not read the ACL"),
+        Err(error) => assert_eq!(error.to_string(), "forbidden"),
+    }
+    // The owner keeps both capabilities.
+    command(
+        &s,
+        &a,
+        PeopleCommand::RequestLink {
+            id: request,
+            person_id: p.clone(),
+            account_id: c.clone(),
+            expected_version: 1,
+        },
+    )
+    .await?;
+    assert_eq!(s.people_requests(&c, NOW).await?.len(), 1);
+    assert!(s.resource_policy(&a, &p).await.is_ok());
+    Ok(())
+}
+
+/// The counters of an edit belong to the resource its author read. After a merge the source
+/// person's old ID resolves to the canonical person, whose own counters can coincide with
+/// the source's while its audience differs, so the edit is refused rather than re-addressed.
+#[tokio::test]
+async fn edit_through_a_merged_alias_is_refused_even_when_the_counters_coincide() -> Result<()> {
+    use crate::support::projection::projection;
+    use crate::support::sharing::ledger;
+    let (s, _dir) = setup().await?;
+    let a = account(&s).await?;
+    let b = account(&s).await?;
+    let source = person(&s, &a, "Morgan", Policy::default()).await?;
+    let target = person(&s, &a, "Morgan Jones", Policy::default()).await?;
+    let edit = |id: &str, version, policy_version, label: &str| Command::Edit {
+        id: id.into(),
+        expected_version: version,
+        expected_policy_version: Some(policy_version),
+        label: label.into(),
+        value: String::new(),
+    };
+    let grant = |id: &str, version| Command::Grant {
+        id: id.into(),
+        expected_version: version,
+        account_id: b.clone(),
+        edit: false,
+    };
+    // The source is edited once, shared with bob and unshared again: private, at (2, 3).
+    s.apply(&a, &id(), &[edit(&source, 1, 1, "Morgan")]).await?;
+    s.apply(&a, &id(), &[grant(&source, 1)]).await?;
+    s.apply(
+        &a,
+        &id(),
+        &[Command::Revoke {
+            id: source.clone(),
+            expected_version: 2,
+            account_id: b.clone(),
+        }],
+    )
+    .await?;
+    // The target is shared with bob at (1, 2). Alice's unsent draft is captured against the
+    // source's private projection.
+    s.apply(&a, &id(), &[grant(&target, 1)]).await?;
+    let captured = projection(&s, &a, &source).await?;
+    assert_eq!((captured.version, captured.policy_version), (2, Some(3)));
+    assert!(projection(&s, &b, &source).await.is_err());
+    let before_merge = projection(&s, &a, &target).await?;
+    assert_eq!(
+        (before_merge.version, before_merge.policy_version),
+        (1, Some(2))
+    );
+    // Another session merges the source into the target.
+    let preview = s.merge_preview(&a, &source, &target).await?;
+    command(
+        &s,
+        &a,
+        PeopleCommand::Merge {
+            source_id: source.clone(),
+            target_id: target.clone(),
+            preview_token: preview.token,
+            name: "Morgan Jones".into(),
+        },
+    )
+    .await?;
+    let canonical = projection(&s, &a, &target).await?;
+    // The premise: the target's counters now equal the captured pair, and bob can read it.
+    assert_eq!(
+        (canonical.version, canonical.policy_version),
+        (captured.version, captured.policy_version)
+    );
+    assert!(projection(&s, &b, &target).await.is_ok());
+
+    let unchanged = ledger(&s, &target).await?;
+    let unsent = edit(
+        &source,
+        captured.version,
+        captured.policy_version.unwrap(),
+        "Unsent text",
+    );
+    let operation = id();
+    let error = s
+        .apply(&a, &operation, std::slice::from_ref(&unsent))
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "conflict");
+    // Nothing was written, receipted or published, and bob never saw the text.
+    assert_eq!(ledger(&s, &target).await?, unchanged);
+    assert_eq!(projection(&s, &b, &target).await?.label, "Morgan Jones");
+    assert_eq!(
+        s.person_detail(&a, &source).await?.person.label,
+        "Morgan Jones"
+    );
+    // A rejected write stores no receipt, so retrying the same body is refused again.
+    let retry = s
+        .apply(&a, &operation, std::slice::from_ref(&unsent))
+        .await
+        .unwrap_err();
+    assert_eq!(retry.to_string(), "conflict");
+    assert_eq!(ledger(&s, &target).await?, unchanged);
+
+    // After reading the canonical person, an edit addressed to it commits normally.
+    s.apply(
+        &a,
+        &id(),
+        &[edit(
+            &target,
+            canonical.version,
+            canonical.policy_version.unwrap(),
+            "Reviewed text",
+        )],
+    )
+    .await?;
+    assert_eq!(projection(&s, &b, &target).await?.label, "Reviewed text");
+    Ok(())
+}
+
+/// A committed edit addressed to an ID that later became an alias still replays: the
+/// receipt is read before any identity is resolved.
+#[tokio::test]
+async fn an_edit_receipted_before_a_merge_still_replays_afterwards() -> Result<()> {
+    use crate::support::sharing::ledger;
+    let (s, _dir) = setup().await?;
+    let a = account(&s).await?;
+    let source = person(&s, &a, "Morgan", Policy::default()).await?;
+    let target = person(&s, &a, "Morgan Jones", Policy::default()).await?;
+    let rename = |label: &str| Command::Edit {
+        id: source.clone(),
+        expected_version: 1,
+        expected_policy_version: Some(1),
+        label: label.into(),
+        value: String::new(),
+    };
+    let operation = id();
+    let revision = s.apply(&a, &operation, &[rename("Renamed")]).await?;
+    let preview = s.merge_preview(&a, &source, &target).await?;
+    command(
+        &s,
+        &a,
+        PeopleCommand::Merge {
+            source_id: source.clone(),
+            target_id: target.clone(),
+            preview_token: preview.token,
+            name: "Morgan Jones".into(),
+        },
+    )
+    .await?;
+    let unchanged = ledger(&s, &target).await?;
+    assert_eq!(
+        s.apply(&a, &operation, &[rename("Renamed")]).await?,
+        revision
+    );
+    assert_eq!(ledger(&s, &target).await?, unchanged);
+    // The receipt binds the original payload; a different body is still a conflict.
+    let other = s
+        .apply(&a, &operation, &[rename("Other")])
+        .await
+        .unwrap_err();
+    assert_eq!(other.to_string(), "operation_conflict");
     Ok(())
 }

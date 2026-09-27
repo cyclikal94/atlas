@@ -56,8 +56,11 @@ alter the public token; their current audiences are preserved at commit time.
 A merge keeps field IDs, values, ownership and birthday/task references. Source fields
 move under the target, with a version change for the parent update. The source becomes
 an archived alias and alias chains flatten. Offline field creation using an old parent
-ID resolves to the canonical person; existing operation receipts remain valid. Merging
-two account-linked identities is rejected. A linked identity retains its account's name.
+ID resolves to the canonical person; existing operation receipts remain valid. An `edit`
+of the person under its old ID is refused with `conflict`, because the version and sharing
+revision it carries were read from the old identity; read the canonical person and
+resubmit. Merging two account-linked identities is rejected. A linked identity retains
+its account's name.
 
 Combining identity audiences could otherwise expose a contribution whose own grant was
 previously blocked by its parent. To prevent this, merging and linking freeze each

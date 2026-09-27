@@ -5,6 +5,10 @@ edition = "2024"
 license = "AGPL-3.0-only"
 publish = false
 
+[features]
+# Test-only schedule control; enables the same feature in atlas-core. Never enabled by a normal build.
+test-hooks = ["atlas-core/test-hooks"]
+
 [dependencies]
 atlas-core = { workspace = true }
 anyhow = { workspace = true }
@@ -27,7 +31,12 @@ ring = { workspace = true }
 base64 = { workspace = true }
 chrono-tz = { workspace = true }
 
+[build-dependencies]
+serde_json = { workspace = true }
+
 [dev-dependencies]
+# Enables the feature above for this crate's own tests only (dev edges are not built otherwise).
+atlas-server = { path = ".", features = ["test-hooks"] }
 tower = { workspace = true, features = ["util"] }
 tempfile = { workspace = true }
 ece = { workspace = true }

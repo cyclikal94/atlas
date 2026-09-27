@@ -17,7 +17,12 @@ children precede parents on removal. The per-device delivered-ID ledger ensures 
 removal identifies only a resource delivered to that device. Snapshot and delta retries
 must preserve operation and resource identity.
 
-Content and policy versions are independent. Ordinary access changes deliver removals;
+Content and policy versions are independent, and every reader receives both. A policy
+change is delivered to each reader who keeps access as an upsert carrying the new
+`policy_version`; a queued edit must send the revision captured with its draft, and is
+rejected on replay if sharing has changed since (see [sharing](sharing.md)). Snapshot
+pages created before contract 0.13.0 may still lack the revision for at most one hour;
+refetch such a resource before editing it. Ordinary access changes deliver removals;
 large changes affecting more than 200 resources advance the affected account's recovery
 floor. `resync_required` means replace the authorised cache from a new snapshot.
 `access_changed` invalidates an in-progress snapshot. Neither response deletes pending

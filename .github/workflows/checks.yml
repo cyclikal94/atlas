@@ -28,6 +28,43 @@ jobs:
       - run: python -m pip install -r scripts/requirements-contract.txt
       - run: python scripts/validate_contract.py
 
+  api-types:
+    runs-on: ubuntu-24.04
+    env:
+      # The same absolute location the Release workflow generates into and uploads from. npm runs the
+      # scripts from scripts/api-types, so a relative path would resolve there instead.
+      API_TYPES_OUTPUT: ${{ github.workspace }}/target/api-types
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: scripts/api-types/.node-version
+          cache: npm
+          cache-dependency-path: scripts/api-types/package-lock.json
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: scripts/requirements-contract.txt
+      - run: python -m pip install -r scripts/requirements-contract.txt
+      - run: python scripts/validate_contract.py
+      - run: npm ci --ignore-scripts --prefix scripts/api-types
+      # Runs the workflows' own generate and verify commands and checks that the upload globs find their output.
+      - run: python scripts/test_release_workflow.py
+      - run: npm test --prefix scripts/api-types
+      # A non-release build: it proves generation is deterministic on every change and publishes nothing.
+      - run: npm run generate --prefix scripts/api-types -- --version 0.0.0-ci --output "$API_TYPES_OUTPUT"
+      - run: npm run verify --prefix scripts/api-types -- "$API_TYPES_OUTPUT/atlas-api-types-0.0.0-ci.tgz" --version 0.0.0-ci
+      # Exercise the real upload path so a misplaced output fails here rather than at release time.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: atlas-api-types-check
+          path: ${{ env.API_TYPES_OUTPUT }}/*
+          retention-days: 1
+          if-no-files-found: error
+
   rust:
     strategy:
       fail-fast: false
