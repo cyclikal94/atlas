@@ -77,6 +77,13 @@ with tempfile.TemporaryDirectory(prefix='atlas-server-smoke-') as temporary:
                             'INSERT INTO native_handoffs(code_hash,account_id,device_id,challenge,'
                             'configuration_hash,redirect_uri,expires_at) VALUES (?,?,?,?,?,?,?)',
                             (str(uuid.uuid4()), account, device, 'c', 'h', 'r', expires))
+                    elif kind == 'grant':
+                        database.execute(
+                            'INSERT INTO activation_grants(grant_hash,grant_id,account_id,device_id,'
+                            'auth_kind,challenge_hash,state,failed_verifiers,created_at,expires_at) '
+                            "VALUES (?,?,?,?,'local',?,'issued',0,?,?)",
+                            (str(uuid.uuid4()), str(uuid.uuid4()), account, device,
+                             str(uuid.uuid4()), int(time.time()), expires))
                     else:
                         database.execute(
                             'INSERT INTO notification_subscriptions(id,account_id,device_id,transport,'

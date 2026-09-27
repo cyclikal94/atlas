@@ -1,19 +1,55 @@
 use crate::support::http::session_request as call;
+use crate::support::retirement::activate;
 use atlas_core::Store;
 use atlas_server::{App, hash_password, reset_password};
+use axum::Router;
 use axum::http::StatusCode;
+use openidconnect::PkceCodeChallenge;
 use serde_json::{Value, json};
 use uuid::Uuid;
+
+/// The grant, and whether it is still `issued`, for `account`/`device`.
+async fn grant_state(store: &Store, account: &str, device: &str) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT state FROM activation_grants WHERE account_id=$1 AND device_id=$2 ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(account)
+    .bind(device)
+    .fetch_optional(&store.pool)
+    .await
+    .unwrap()
+}
+
+/// A BE-Q19 grant for `session-alice`/`device` under her current `password`, and the verifier
+/// that redeems it.
+async fn issue(app: &Router, device: &str, password: &str) -> (String, String) {
+    let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
+    let (status, _, body) = crate::support::http::request(
+        app,
+        "POST",
+        "browser-sessions",
+        &[("origin", "https://atlas.example")],
+        json!({"username":"session-alice","password":password,"device_id":device,"attempt_challenge":challenge.as_str()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    (
+        body["grant"].as_str().unwrap().to_owned(),
+        verifier.secret().to_owned(),
+    )
+}
 async fn scenario(store: Store) -> anyhow::Result<()> {
     store.migrate().await?;
     let hash = hash_password("initial-password-123".into()).await?;
-    store
-        .add_account(&Uuid::new_v4().to_string(), "session-alice", &hash)
-        .await?;
+    let alice = Uuid::new_v4().to_string();
+    store.add_account(&alice, "session-alice", &hash).await?;
     store
         .add_account(&Uuid::new_v4().to_string(), "session-bob", &hash)
         .await?;
-    let app = App::new(store.clone()).await?.router();
+    let app = App::new(store.clone())
+        .await?
+        .public_origin("https://atlas.example")?
+        .router();
     let mut tokens = Vec::new();
     for (user, device) in [
         ("session-alice", "phone"),
@@ -139,6 +175,13 @@ async fn scenario(store: Store) -> anyhow::Result<()> {
         .0,
         StatusCode::UNAUTHORIZED
     );
+    // An `issued` grant for the account is cancelled by the change; a `redeemed` one survives
+    // untouched (BE-Q19 item 7).
+    issue(&app, "grant-only", "initial-password-123").await;
+    let (redeem_grant, redeem_verifier) =
+        issue(&app, "grant-redeemed", "initial-password-123").await;
+    let (status, _, redeemed) = activate(&app, &redeem_grant, &redeem_verifier).await;
+    assert_eq!(status, StatusCode::OK, "{redeemed}");
     assert_eq!(
         call(
             &app,
@@ -150,6 +193,18 @@ async fn scenario(store: Store) -> anyhow::Result<()> {
         .await
         .0,
         StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        grant_state(&store, &alice, "grant-only").await.as_deref(),
+        Some("cancelled"),
+        "change_password cancels an issued grant"
+    );
+    assert_eq!(
+        grant_state(&store, &alice, "grant-redeemed")
+            .await
+            .as_deref(),
+        Some("redeemed"),
+        "change_password leaves a redeemed grant untouched"
     );
     assert_eq!(
         call(&app, "GET", "sessions", Some(&tokens[0]), Value::Null)
@@ -173,7 +228,20 @@ async fn scenario(store: Store) -> anyhow::Result<()> {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    issue(&app, "grant-only", "changed-password-456").await;
     reset_password(&store, "session-alice", &hash).await?;
+    assert_eq!(
+        grant_state(&store, &alice, "grant-only").await.as_deref(),
+        Some("cancelled"),
+        "the operator reset_password also cancels an issued grant"
+    );
+    assert_eq!(
+        grant_state(&store, &alice, "grant-redeemed")
+            .await
+            .as_deref(),
+        Some("redeemed"),
+        "reset_password leaves a redeemed grant untouched"
+    );
     assert_eq!(
         call(
             &app,

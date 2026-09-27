@@ -1,7 +1,49 @@
 {
-  "api_version": "0.14.0",
-  "contract_sha256": "46f606ab888f862aeafe8499050560558b4fba70734b47e8e0673f3bbadc120f",
+  "api_version": "0.16.0",
+  "contract_sha256": "94e4de57045b9c4b758fff47f257414e7d5e0c6b65785066b0ff2f9e7d8b5ef9",
   "behaviour": {
+    "activation": {
+      "activate": {
+        "code": null,
+        "fields": [
+          "account_id",
+          "csrf_token",
+          "expires_at",
+          "session_id"
+        ],
+        "set_cookie": true,
+        "status": 200
+      },
+      "activate_cancel": {
+        "code": null,
+        "fields": [
+          "result"
+        ],
+        "set_cookie": false,
+        "status": 200
+      },
+      "credential_mismatch": {
+        "code": "credential_mismatch",
+        "fields": [
+          "code",
+          "details",
+          "message",
+          "request_id"
+        ],
+        "set_cookie": false,
+        "status": 403
+      },
+      "grant_only_login": {
+        "code": null,
+        "fields": [
+          "account_id",
+          "grant",
+          "grant_expires_at"
+        ],
+        "set_cookie": false,
+        "status": 200
+      }
+    },
     "content_and_retirement": {
       "current_policy": {
         "cache_control": "private, no-store",
@@ -69,6 +111,10 @@
       "conflict": [
         409,
         "conflict"
+      ],
+      "credential_mismatch": [
+        403,
+        "credential_mismatch"
       ],
       "defaults_changed": [
         409,

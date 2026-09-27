@@ -1,3 +1,4 @@
+mod activation;
 mod browser;
 mod calendars;
 mod compatibility;

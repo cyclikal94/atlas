@@ -2,7 +2,7 @@
   "openapi": "3.1.1",
   "info": {
     "title": "Atlas API",
-    "version": "0.14.0",
+    "version": "0.16.0",
     "description": "Pre-release API. Breaking changes and explicit database resets are permitted until a supported release."
   },
   "servers": [
@@ -280,7 +280,8 @@
             "temporarily_unavailable"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ]
         }
       }
@@ -374,7 +375,8 @@
             "temporarily_unavailable"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ]
         },
         "description": "Revoke the session presented by this request, and nothing else. No Set-Cookie is sent: the row's deletion already revokes the credential, and a cookie decision made from state read at request time but delivered later could clear a newer login's cookie. Later use of the credential returns 401."
@@ -564,7 +566,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -794,7 +797,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -1041,7 +1045,8 @@
             "internal_error"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ]
         },
         "description": "No cursor starts a consistent staged snapshot; replace cached server state only after its final page. Snapshot sessions last one hour; delta cursors follow configured retention (90 days by default). Delta limits count indivisible publication batches, each containing at most 200 changed resources plus required ancestors (at most three per changed resource). Deltas resolve current authorised content; they are a state synchronisation feed, not an audit history. Revocations emit removals only for resources previously delivered to this device. Snapshot permission reductions return access_changed; deltas recover incrementally. Expired or pruned history requires a fresh snapshot; retain pending drafts separately.",
@@ -1325,7 +1330,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -1490,7 +1496,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -1652,7 +1659,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -1814,7 +1822,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -1986,7 +1995,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -2164,7 +2174,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -2393,7 +2404,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -2451,7 +2463,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BrowserSession"
+                  "$ref": "#/components/schemas/BrowserGrant"
                 }
               }
             },
@@ -2462,12 +2474,6 @@
                   "type": "string",
                   "format": "uuid"
                 }
-              },
-              "Set-Cookie": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "HttpOnly session cookie, Path=/, SameSite=Lax; Secure and __Host- prefix on HTTPS."
               }
             }
           },
@@ -2647,13 +2653,450 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/Login"
+                "$ref": "#/components/schemas/BrowserLogin"
               }
             }
           }
         },
         "security": [],
-        "description": "Requires ATLAS_PUBLIC_ORIGIN and an exact matching Origin header. Sets an HttpOnly session cookie; returns no bearer credential.",
+        "description": "Requires ATLAS_PUBLIC_ORIGIN and an exact matching Origin header. Returns a one-time activation grant, not a session: sets no cookie. Redeem it with POST /browser-sessions/activate, the only route that sets the session cookie.",
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/browser-sessions/activate": {
+      "post": {
+        "operationId": "activateBrowserSession",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserSession"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              },
+              "Set-Cookie": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "HttpOnly session cookie, Path=/, SameSite=Lax; Secure and __Host- prefix on HTTPS. The only response in this contract that sets it."
+              }
+            }
+          },
+          "400": {
+            "description": "malformed_request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "unauthenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "invalid_value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "internal_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "temporarily_unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          }
+        },
+        "x-error-codes": {
+          "400": [
+            "malformed_request"
+          ],
+          "401": [
+            "unauthenticated"
+          ],
+          "403": [
+            "forbidden"
+          ],
+          "404": [
+            "not_found"
+          ],
+          "422": [
+            "invalid_value"
+          ],
+          "429": [
+            "rate_limited"
+          ],
+          "500": [
+            "internal_error"
+          ],
+          "503": [
+            "temporarily_unavailable",
+            "device_capacity"
+          ]
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Activate"
+              }
+            }
+          }
+        },
+        "security": [],
+        "description": "Redeems a grant returned by login, registration or the OIDC callback. A wrong verifier is unauthenticated and does not redeem; the fifth wrong verifier for one grant also cancels it. A device-capacity rollback leaves the grant issued and still redeemable until it expires. Requires ATLAS_PUBLIC_ORIGIN and an exact matching Origin header.",
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
+    "/browser-sessions/activate/cancel": {
+      "post": {
+        "operationId": "cancelBrowserSessionActivation",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivateCancelResult"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "malformed_request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "invalid_value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "rate_limited",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "internal_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "temporarily_unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          }
+        },
+        "x-error-codes": {
+          "400": [
+            "malformed_request"
+          ],
+          "403": [
+            "forbidden"
+          ],
+          "404": [
+            "not_found"
+          ],
+          "422": [
+            "invalid_value"
+          ],
+          "429": [
+            "rate_limited"
+          ],
+          "500": [
+            "internal_error"
+          ],
+          "503": [
+            "temporarily_unavailable"
+          ]
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ActivateCancel"
+              }
+            }
+          }
+        },
+        "security": [],
+        "description": "Abandons an in-flight activation attempt by its verifier alone, resolved by S256(verifier)=challenge_hash: no grant reference or cookie is needed or set. Idempotent. Reports not_activated for an issued-then-cancelled or already-expired-unredeemed grant, session_revoked for an already-redeemed one (only the live session is revoked; the grant record itself stays redeemed as evidence), or unknown for an unrecognised or already-swept verifier. Requires ATLAS_PUBLIC_ORIGIN and an exact matching Origin header.",
         "parameters": [
           {
             "name": "Origin",
@@ -2807,7 +3250,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -3087,7 +3531,7 @@
       "get": {
         "operationId": "finishOidc",
         "security": [],
-        "description": "Provider callback. Requires the initiating browser binding cookie and one-use state. Successful authentication sets a browser session and redirects to the fixed public origin. Native flows redirect to the currently allowed app URI with a 60-second one-use code and the original client state; the native PKCE exchange is required to obtain an Atlas session.",
+        "description": "Provider callback. Requires the initiating browser binding cookie and one-use state. Successful browser authentication issues an activation grant and redirects to the fixed public origin with #atlas_grant, #atlas_attempt and #atlas_account in the URL fragment (never sent to the server); redeem the grant with POST /browser-sessions/activate to obtain the session. Native flows redirect to the currently allowed app URI with a 60-second one-use code and the original client state; the native PKCE exchange is required to obtain an Atlas session.",
         "parameters": [
           {
             "in": "query",
@@ -3116,17 +3560,12 @@
         ],
         "responses": {
           "303": {
-            "description": "Authenticated browser session established.",
+            "description": "Redirects to the public origin with an activation grant in the fragment (native flows redirect to the app's redirect_uri with a one-use code instead). No Set-Cookie.",
             "headers": {
               "Location": {
                 "schema": {
                   "type": "string",
                   "format": "uri"
-                }
-              },
-              "Set-Cookie": {
-                "schema": {
-                  "type": "string"
                 }
               }
             }
@@ -3523,7 +3962,8 @@
             "temporarily_unavailable"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -3725,7 +4165,8 @@
             "temporarily_unavailable"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "400": [
             "malformed_request"
@@ -3947,7 +4388,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -4175,7 +4617,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -4387,7 +4830,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -4663,7 +5107,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BrowserSession"
+                  "$ref": "#/components/schemas/BrowserGrant"
                 }
               }
             }
@@ -4876,13 +5320,13 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/Registration"
+                "$ref": "#/components/schemas/BrowserRegistration"
               }
             }
           }
         },
         "security": [],
-        "description": "Registration with an HttpOnly browser session. Requires configured ATLAS_PUBLIC_ORIGIN and a matching Origin header.",
+        "description": "Redeems the invitation and creates the account atomically, exactly as POST /registration, but returns an activation grant instead of a session: sets no cookie. Redeem it with POST /browser-sessions/activate. Requires configured ATLAS_PUBLIC_ORIGIN and a matching Origin header.",
         "parameters": [
           {
             "name": "Origin",
@@ -5709,7 +6153,8 @@
             "temporarily_unavailable"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ]
         }
       }
@@ -5898,7 +6343,8 @@
             "temporarily_unavailable"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "400": [
             "malformed_request"
@@ -6016,7 +6462,8 @@
             "temporarily_unavailable"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ]
         },
         "summary": "List this account\u2019s sync devices and devices with active sessions",
@@ -6176,7 +6623,8 @@
             "temporarily_unavailable"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "400": [
             "malformed_request"
@@ -6409,7 +6857,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -6640,7 +7089,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -6871,7 +7321,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -7120,7 +7571,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -7369,7 +7821,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -7618,7 +8071,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -7867,7 +8321,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -8116,7 +8571,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -8336,7 +8792,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -8556,7 +9013,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -8788,7 +9246,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -9087,7 +9546,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -9386,7 +9846,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -9646,7 +10107,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -9911,7 +10373,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -10176,7 +10639,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -10450,7 +10914,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -10724,7 +11189,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -10998,7 +11464,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -11272,7 +11739,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -11546,7 +12014,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -11810,7 +12279,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -12064,7 +12534,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -12308,7 +12779,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -12552,7 +13024,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -12798,7 +13271,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -13019,7 +13493,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -13258,7 +13733,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -13487,7 +13963,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -13708,7 +14185,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -13929,7 +14407,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -14168,7 +14647,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -14379,7 +14859,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -14611,7 +15092,8 @@
             "unauthenticated"
           ],
           "403": [
-            "forbidden"
+            "forbidden",
+            "credential_mismatch"
           ],
           "404": [
             "not_found"
@@ -14690,6 +15172,37 @@
           "username",
           "password",
           "device_id"
+        ],
+        "additionalProperties": false
+      },
+      "BrowserLogin": {
+        "type": "object",
+        "properties": {
+          "username": {
+            "type": "string",
+            "maxLength": 100
+          },
+          "password": {
+            "type": "string",
+            "maxLength": 1024,
+            "writeOnly": true
+          },
+          "device_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "attempt_challenge": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{43}$",
+            "description": "S256(verifier). Stored verbatim as the issued grant's challenge_hash."
+          }
+        },
+        "required": [
+          "username",
+          "password",
+          "device_id",
+          "attempt_challenge"
         ],
         "additionalProperties": false
       },
@@ -16147,7 +16660,8 @@
         "required": [
           "account_id",
           "expires_at",
-          "csrf_token"
+          "csrf_token",
+          "session_id"
         ],
         "properties": {
           "account_id": {
@@ -16161,6 +16675,90 @@
           "csrf_token": {
             "type": "string",
             "pattern": "^[0-9a-f]{64}$"
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "BrowserGrant": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "grant",
+          "grant_expires_at",
+          "account_id"
+        ],
+        "properties": {
+          "grant": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Bearer-shaped one-time credential, returned once. Redeem it with POST /browser-sessions/activate within 60 seconds."
+          },
+          "grant_expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "account_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "Activate": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "grant",
+          "verifier"
+        ],
+        "properties": {
+          "grant": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "verifier": {
+            "type": "string",
+            "minLength": 43,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._~-]+$",
+            "writeOnly": true,
+            "description": "RFC 7636 code verifier; S256(verifier) must equal the grant's stored challenge_hash."
+          }
+        }
+      },
+      "ActivateCancel": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "verifier"
+        ],
+        "properties": {
+          "verifier": {
+            "type": "string",
+            "minLength": 43,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._~-]+$",
+            "writeOnly": true,
+            "description": "S256(verifier)=challenge_hash alone locates the record; no grant reference is needed."
+          }
+        }
+      },
+      "ActivateCancelResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "result"
+        ],
+        "properties": {
+          "result": {
+            "type": "string",
+            "enum": [
+              "not_activated",
+              "session_revoked",
+              "unknown"
+            ]
           }
         }
       },
@@ -16168,7 +16766,9 @@
         "type": "object",
         "additionalProperties": false,
         "required": [
-          "device_id"
+          "device_id",
+          "attempt_id",
+          "attempt_challenge"
         ],
         "properties": {
           "device_id": {
@@ -16179,6 +16779,17 @@
           "link": {
             "type": "boolean",
             "default": false
+          },
+          "attempt_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "description": "Opaque, client-chosen; returned unchanged in the callback's redirect fragment."
+          },
+          "attempt_challenge": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{43}$",
+            "description": "S256(verifier), the same shape as the native flow's code_challenge. Stored verbatim as the issued grant's challenge_hash."
           }
         }
       },
@@ -16374,6 +16985,44 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 100
+          }
+        }
+      },
+      "BrowserRegistration": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "token",
+          "username",
+          "password",
+          "device_id",
+          "attempt_challenge"
+        ],
+        "properties": {
+          "token": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "username": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "pattern": "^[a-z0-9_.-]+$"
+          },
+          "password": {
+            "type": "string",
+            "minLength": 12,
+            "maxLength": 1024
+          },
+          "device_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "attempt_challenge": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{43}$",
+            "description": "S256(verifier). Stored verbatim as the issued grant's challenge_hash."
           }
         }
       },

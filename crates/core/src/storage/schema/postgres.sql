@@ -57,6 +57,24 @@ CREATE TABLE accounts (
     preferences_version bigint DEFAULT 1 NOT NULL
 );
 
+CREATE TABLE activation_grants (
+    grant_hash text NOT NULL,
+    grant_id text NOT NULL,
+    account_id text NOT NULL,
+    device_id text NOT NULL,
+    auth_kind text NOT NULL,
+    challenge_hash text NOT NULL,
+    state text NOT NULL,
+    session_id text,
+    failed_verifiers bigint DEFAULT 0 NOT NULL,
+    created_at bigint NOT NULL,
+    expires_at bigint NOT NULL,
+    redeemed_at bigint,
+    cancelled_at bigint,
+    CONSTRAINT activation_grants_auth_kind_check CHECK ((auth_kind = ANY (ARRAY['local'::text, 'oidc'::text]))),
+    CONSTRAINT activation_grants_state_check CHECK ((state = ANY (ARRAY['issued'::text, 'redeemed'::text, 'cancelled'::text])))
+);
+
 CREATE TABLE anchored_occurrences (
     occurrence_id text NOT NULL,
     task_id text NOT NULL,
@@ -213,7 +231,9 @@ CREATE TABLE oidc_flows (
     expires_at bigint NOT NULL,
     native_redirect text,
     native_challenge text,
-    native_state text
+    native_state text,
+    attempt_id text,
+    attempt_challenge text
 );
 
 CREATE TABLE operation_outcomes (
@@ -499,6 +519,12 @@ ALTER TABLE ONLY accounts
 ALTER TABLE ONLY accounts
     ADD CONSTRAINT accounts_username_key UNIQUE (username);
 
+ALTER TABLE ONLY activation_grants
+    ADD CONSTRAINT activation_grants_pkey PRIMARY KEY (grant_hash);
+
+ALTER TABLE ONLY activation_grants
+    ADD CONSTRAINT activation_grants_challenge_hash_key UNIQUE (challenge_hash);
+
 ALTER TABLE ONLY anchored_occurrences
     ADD CONSTRAINT anchored_occurrences_pkey PRIMARY KEY (occurrence_id);
 
@@ -695,6 +721,12 @@ CREATE INDEX account_invitation_household ON account_invitations USING btree (ho
 
 CREATE INDEX account_invitation_issuer ON account_invitations USING btree (issuer_id, expires_at);
 
+CREATE UNIQUE INDEX activation_grant_identity ON activation_grants USING btree (grant_id);
+
+CREATE INDEX activation_grants_account_device ON activation_grants USING btree (account_id, device_id, state);
+
+CREATE INDEX activation_grants_expiry ON activation_grants USING btree (expires_at);
+
 CREATE INDEX ancestors_descendants ON resource_ancestors USING btree (ancestor_id, resource_id);
 
 CREATE INDEX anchor_reference ON anchored_occurrences USING btree (reference_id, task_id);
@@ -786,6 +818,9 @@ ALTER TABLE ONLY account_invitations
 
 ALTER TABLE ONLY accounts
     ADD CONSTRAINT accounts_primary_household_id_fkey FOREIGN KEY (primary_household_id) REFERENCES households(id);
+
+ALTER TABLE ONLY activation_grants
+    ADD CONSTRAINT activation_grants_account_id_fkey FOREIGN KEY (account_id) REFERENCES accounts(id);
 
 ALTER TABLE ONLY anchored_occurrences
     ADD CONSTRAINT anchored_occurrences_occurrence_id_fkey FOREIGN KEY (occurrence_id) REFERENCES task_occurrences(id);
@@ -1033,4 +1068,4 @@ ALTER TABLE ONLY timer_sessions
 
 
 INSERT INTO sync_clock(id,revision,resource_count) VALUES(1,0,0);
-INSERT INTO atlas_schema(version) VALUES(1001);
+INSERT INTO atlas_schema(version) VALUES(1002);

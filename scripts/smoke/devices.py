@@ -5,8 +5,10 @@ retirement) with real sessions over real sockets. Every response is validated ag
 contract by `ContractClient`, including the `409` body, and none may set a cookie.
 
 A device that holds only a live native handoff, or only an active subscription, once its last
-session has gone must still be listed with a fresh token (R1). The smoke has no OpenID provider
-or push endpoint to create those rows through the API, so the caller's optional `seed` writes them
+session has gone must still be listed with a fresh token (R1). A device holding only a pending
+activation grant (BE-Q19), with no session ever established, must be listed too. The smoke has
+no OpenID provider or push endpoint to create those rows through the API, and no browser client
+to obtain a grant through `POST /browser-sessions`, so the caller's optional `seed` writes them
 directly into the disposable database: they are **fixtures**. Everything after that (listing,
 stale refusal, retirement, replay, account isolation) is the real server over real sockets. The
 rows the real writers produce, and how they order against a retirement, are proved by the
@@ -116,6 +118,7 @@ def run(call, tokens, secrets, seed=None):
 
     if seed is not None:
         _left_with_one_member(call, tokens, login, retire, account, seed)
+        _grant_only_device(call, tokens, retire, account, seed)
 
 
 def _left_with_one_member(call, tokens, login, retire, account, seed):
@@ -154,3 +157,30 @@ def _left_with_one_member(call, tokens, login, retire, account, seed):
         assert all(d['id'] != device for d in call('GET', V1 + '/devices', phone)['devices'])
         assert retire(phone, device, operation, left['state_token'], 200) == done
         assert retire(phone, device, stale, offered['state_token'], 409)['outcome'] == 'rejected_stale'
+
+
+def _grant_only_device(call, tokens, retire, account, seed):
+    """BE-Q19: a device whose only remaining state is a pending activation grant (a browser tab
+    that logged in but never redeemed it) is still listed, with a fresh token and
+    `pending_sign_ins` counting it. No session ever existed for this device, unlike
+    `_left_with_one_member`'s handoff/subscription cases."""
+    phone, bob = tokens['alice'], tokens['bob']
+    device = 'kiosk'
+    seed(account, device, 'grant')
+    offered = _state(call, phone, device)
+    assert offered['active_sessions'] == 0 and offered['summary']['sessions'] == 0, offered
+    assert offered['summary']['pending_sign_ins'] == 1, offered
+
+    # Another account neither sees the device nor can affect it with Alice's token.
+    assert all(d['id'] != device for d in call('GET', V1 + '/devices', bob)['devices'])
+    foreign = retire(bob, device, str(uuid.uuid4()), offered['state_token'], 200)
+    assert foreign['outcome'] == 'superseded', foreign
+    assert _state(call, phone, device)['summary']['pending_sign_ins'] == 1
+
+    operation = str(uuid.uuid4())
+    done = retire(phone, device, operation, offered['state_token'], 200)
+    assert done == {'operation_id': operation, 'account_id': account,
+                    'outcome': 'confirmed_applied'}, done
+    _no_cookie(call)
+    assert all(d['id'] != device for d in call('GET', V1 + '/devices', phone)['devices'])
+    assert retire(phone, device, operation, offered['state_token'], 200) == done

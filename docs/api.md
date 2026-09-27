@@ -20,7 +20,14 @@ cookie the API sets. The combined 0.14.0 contract makes
 the device-retirement headers required and its success status `200` with a recorded outcome,
 adds the state token and summary to `GET /devices`, adds an optional operation ID to
 `DELETE /sessions/{id}`, and removes `Set-Cookie` from every response that revokes the
-caller's own session.
+caller's own session. The `0.15.0` contract replaces cookie-setting login, registration
+and OIDC-callback responses with an activation grant, adds `POST
+/browser-sessions/activate` (the only cookie-setting response) and `.../cancel`, adds
+`session_id` to `BrowserSession`, and distinguishes `credential_mismatch` from
+`forbidden`. `0.16.0` makes no wire-format change: it extends the recorded compatibility
+baseline (below) to also probe grant-only browser login, `credential_mismatch`,
+activation and cancellation, which `0.15.0` introduced but the baseline had not yet
+recorded — the probes are a floor, and this closes a gap in it.
 
 Mutations require an account-scoped UUID `Idempotency-Key` and explicit version
 preconditions where defined. Commands that replace existing authored text also carry the
@@ -52,7 +59,7 @@ statuses and [sync](sync.md) for client recovery.
 `GET /health` returns the version of the API contract the running server was built with:
 
 ```json
-{"status": "ok", "api_version": "0.14.0"}
+{"status": "ok", "api_version": "0.16.0"}
 ```
 
 `api_version` is exactly `info.version` in [the contract](../api/openapi.json), read from

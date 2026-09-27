@@ -33,6 +33,7 @@ const ERROR_CODES: &[ErrorCode] = &[
     ErrorCode::BatchTooLarge,
     ErrorCode::CalendarLimit,
     ErrorCode::Conflict,
+    ErrorCode::CredentialMismatch,
     ErrorCode::DefaultsChanged,
     ErrorCode::DeliveryFailed,
     ErrorCode::DeviceCapacity,
@@ -327,9 +328,100 @@ async fn content_and_retirement() -> Result<Value> {
     Ok(Value::Object(results))
 }
 
-/// The probe transcript (v2). `/health` omits `api_version`, which is asserted separately.
+/// BE-Q19 activation-grant probes (plan §5.4): grant-only browser login, activation,
+/// cancellation and a real `credential_mismatch` response. Records cookie presence/absence and
+/// the normalised response shape (status, error code, sorted field names) — never the grant,
+/// verifier, account ID or a timestamp, all of which are random or real-clock and would make the
+/// recorded transcript non-deterministic.
+async fn activation_probes() -> Result<Value> {
+    use crate::support::http::request;
+    use crate::support::retirement::{
+        ORIGIN, PASSWORD, activate, activate_cancel, attempt, cookie_login, id, world,
+    };
+
+    fn shape(reply: &(StatusCode, axum::http::HeaderMap, Value)) -> Value {
+        let mut fields: Vec<String> = reply
+            .2
+            .as_object()
+            .map(|object| object.keys().cloned().collect())
+            .unwrap_or_default();
+        fields.sort();
+        json!({
+            "status": reply.0.as_u16(),
+            "code": reply.2.get("code"),
+            "set_cookie": reply.1.contains_key("set-cookie"),
+            "fields": fields,
+        })
+    }
+
+    let w = world(true).await?;
+    let mut results = serde_json::Map::new();
+
+    let (verifier, challenge) = attempt();
+    let granted = request(
+        &w.app,
+        "POST",
+        "browser-sessions",
+        &[("origin", ORIGIN)],
+        json!({"username":"device-alice","password":PASSWORD,"device_id":"compat-probe",
+               "attempt_challenge":challenge}),
+    )
+    .await;
+    assert_eq!(granted.0, StatusCode::OK, "{}", granted.2);
+    assert!(
+        !granted.1.contains_key("set-cookie"),
+        "login issues no cookie"
+    );
+    results.insert("grant_only_login".into(), shape(&granted));
+
+    let grant = granted.2["grant"].as_str().unwrap().to_owned();
+    let activated = activate(&w.app, &grant, &verifier).await;
+    assert_eq!(activated.0, StatusCode::OK, "{}", activated.2);
+    assert!(
+        activated.1.contains_key("set-cookie"),
+        "activate is the only cookie writer"
+    );
+    results.insert("activate".into(), shape(&activated));
+
+    let (cancel_verifier, cancel_challenge) = attempt();
+    let cancel_granted = request(
+        &w.app,
+        "POST",
+        "browser-sessions",
+        &[("origin", ORIGIN)],
+        json!({"username":"device-alice","password":PASSWORD,"device_id":"compat-probe-cancel",
+               "attempt_challenge":cancel_challenge}),
+    )
+    .await;
+    assert_eq!(cancel_granted.0, StatusCode::OK, "{}", cancel_granted.2);
+    let cancelled = activate_cancel(&w.app, &cancel_verifier).await;
+    assert_eq!(cancelled.0, StatusCode::OK, "{}", cancelled.2);
+    assert!(!cancelled.1.contains_key("set-cookie"));
+    assert_eq!(cancelled.2["result"], "not_activated");
+    results.insert("activate_cancel".into(), shape(&cancelled));
+
+    let (cookie_a, _) = cookie_login(&w.app, "compat-probe-a").await;
+    let (_cookie_b, csrf_b) = cookie_login(&w.app, "compat-probe-b").await;
+    let mismatch = request(
+        &w.app,
+        "POST",
+        "commands",
+        &[("cookie", &cookie_a), ("x-csrf-token", &csrf_b)],
+        json!({"commands":[{"kind":"create_person","id":id(),"name":"Compat probe"}]}),
+    )
+    .await;
+    assert_eq!(mismatch.0, StatusCode::FORBIDDEN, "{}", mismatch.2);
+    assert_eq!(mismatch.2["code"], "credential_mismatch");
+    results.insert("credential_mismatch".into(), shape(&mismatch));
+
+    Ok(Value::Object(results))
+}
+
+/// The probe transcript (v3, BE-Q19 revision: adds `activation`). `/health` omits `api_version`,
+/// which is asserted separately.
 async fn observe(app: &Router) -> Value {
     json!({
+        "activation": activation_probes().await.expect("activation-grant protocol probes"),
         "error_mapping": error_mapping().await,
         "content_and_retirement": content_and_retirement().await.expect("combined protocol probes"),
         "health": probe(app, "/health", &["api_version"]).await,

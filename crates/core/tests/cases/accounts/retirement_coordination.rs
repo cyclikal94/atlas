@@ -13,6 +13,65 @@ use crate::support::devices::{
     FAR, add_registration, add_session, add_session_named, add_subscription, expected_token, id,
     ledger_rows, populate, snapshot,
 };
+
+/// Simulates the real grant-issuing writer (`server/src/activation.rs::issue_grant`, BE-Q19): a
+/// single `INSERT` inside `begin_serial()`, exactly the coordination the real writer uses. No
+/// server-crate function is called from `atlas-core`'s own tests, so this is raw SQL, as the
+/// session/handoff/subscription writers already simulated in this file are.
+async fn issue_grant_serial(s: &Store, a: &str, device: &str) -> Result<String> {
+    let grant_id = id();
+    let mut tx = s.begin_serial().await?;
+    sqlx::query("INSERT INTO activation_grants(grant_hash,grant_id,account_id,device_id,auth_kind,challenge_hash,state,failed_verifiers,created_at,expires_at) VALUES ($1,$2,$3,$4,'local',$5,'issued',0,1,$6)")
+        .bind(id())
+        .bind(&grant_id)
+        .bind(a)
+        .bind(device)
+        .bind(id())
+        .bind(FAR)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(grant_id)
+}
+
+/// Simulates the real grant-redeeming writer (`activation::activate`): reads the grant's state
+/// first, exactly as the real handler does, and only inserts a session and redeems the grant when
+/// it is still `issued` — `None` otherwise, with no session created, mirroring `activate`'s `401`
+/// without a `sessions::issue` call.
+async fn redeem_grant_serial(
+    s: &Store,
+    a: &str,
+    device: &str,
+    grant_id: &str,
+) -> Result<Option<String>> {
+    let mut tx = s.begin_serial().await?;
+    let state: String = sqlx::query_scalar("SELECT state FROM activation_grants WHERE grant_id=$1")
+        .bind(grant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if state != "issued" {
+        tx.commit().await?;
+        return Ok(None);
+    }
+    let session_id = id();
+    sqlx::query("INSERT INTO sessions(token_hash,account_id,device_id,expires_at,session_id,created_at,auth_kind) VALUES ($1,$2,$3,$4,$5,1,'local')")
+        .bind(id())
+        .bind(a)
+        .bind(device)
+        .bind(FAR)
+        .bind(&session_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE activation_grants SET state='redeemed',session_id=$1 WHERE grant_id=$2 AND state='issued'",
+    )
+    .bind(&session_id)
+    .bind(grant_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some(session_id))
+}
 use crate::support::resource_commands::{account, fixture};
 use crate::support::schedule::{
     BEFORE_BEGIN, RETIREMENT_FIRST, assert_blocked, assert_isolation, pause, postgres,
@@ -762,6 +821,126 @@ async fn a_new_subscription_after_the_retirement_belongs_to_the_new_incarnation(
     subscription_set_retirement_first(false, false).await
 }
 
+// ---------------------------------------------------------------- (ae) grant issue/redeem (BE-Q19)
+
+/// (ae) Grant issuance: a `begin_serial()` writer like every other. Writer first: a new grant the
+/// retirement never saw, so `rejected_stale`, and nothing else changes.
+async fn grant_issue_writer_first(raise: bool) -> Result<()> {
+    let (_d, s, a) = setup(raise).await?;
+    let session = add_session(&s, &a, PHONE, FAR).await?;
+    let token = expected_token(&s, &a, PHONE, NOW).await?;
+    let paused = pause(&s, &a, PHONE, &id(), &token, NOW, BEFORE_BEGIN).await;
+    let grant = issue_grant_serial(&s, &a, PHONE).await?;
+    let after_writer = snapshot(&s, &a, PHONE).await?;
+    let done = paused.finish().await?;
+    assert_eq!(done.outcome, Outcome::RejectedStale);
+    let after = snapshot(&s, &a, PHONE).await?;
+    assert_eq!(after, after_writer, "(af) nothing else changed");
+    assert_eq!(after.sessions, [session]);
+    assert_eq!(after.grants, [(grant, "issued".to_owned())]);
+    assert_eq!(outcomes(&ledger_rows(&s, &a).await?), ["rejected_stale"]);
+    assert_isolation(&s, raise);
+    Ok(())
+}
+
+/// Retirement first: the writer waits for the commit, then issues a grant that belongs to the
+/// device's new incarnation, untouched by the retirement.
+async fn grant_issue_retirement_first(raise: bool) -> Result<()> {
+    let (_d, s, a) = setup(raise).await?;
+    add_session(&s, &a, PHONE, FAR).await?;
+    let token = expected_token(&s, &a, PHONE, NOW).await?;
+    let paused = pause(&s, &a, PHONE, &id(), &token, NOW, RETIREMENT_FIRST).await;
+    let mut writer = {
+        let (s, a) = (s.clone(), a.clone());
+        tokio::spawn(async move { issue_grant_serial(&s, &a, PHONE).await })
+    };
+    assert_blocked(&s, paused.point, &mut writer).await?;
+    assert_eq!(paused.finish().await?.outcome, Outcome::ConfirmedApplied);
+    let grant = writer.await??;
+    let after = snapshot(&s, &a, PHONE).await?;
+    assert!(
+        after.sessions.is_empty(),
+        "the retirement removed the session"
+    );
+    assert_eq!(after.grants, [(grant, "issued".to_owned())]);
+    assert_isolation(&s, raise);
+    Ok(())
+}
+
+/// (r) A grant redeemed in the window: a session is added and the grant leaves component 4.
+/// Writer first: the retirement never saw either change, so `rejected_stale`, and neither the new
+/// session nor the redemption is undone.
+async fn grant_redeem_writer_first(raise: bool) -> Result<()> {
+    let (_d, s, a) = setup(raise).await?;
+    let existing = add_session(&s, &a, PHONE, FAR).await?;
+    let pending = issue_grant_serial(&s, &a, PHONE).await?;
+    let token = expected_token(&s, &a, PHONE, NOW).await?;
+    let paused = pause(&s, &a, PHONE, &id(), &token, NOW, BEFORE_BEGIN).await;
+    let issued = redeem_grant_serial(&s, &a, PHONE, &pending)
+        .await?
+        .expect("the grant is still issued");
+    let after_writer = snapshot(&s, &a, PHONE).await?;
+    let done = paused.finish().await?;
+    assert_eq!(done.outcome, Outcome::RejectedStale);
+    let after = snapshot(&s, &a, PHONE).await?;
+    assert_eq!(after, after_writer, "(af) nothing else changed");
+    assert_eq!(after.sessions.len(), 2);
+    assert!(after.sessions.contains(&existing) && after.sessions.contains(&issued));
+    assert_eq!(after.grants, [(pending, "redeemed".to_owned())]);
+    assert_eq!(outcomes(&ledger_rows(&s, &a).await?), ["rejected_stale"]);
+    assert_isolation(&s, raise);
+    Ok(())
+}
+
+/// Retirement first: the retirement cancels the still-`issued` grant as one of its own effects
+/// (component 4), so the redemption that follows finds it no longer `issued` and does nothing.
+async fn grant_redeem_retirement_first(raise: bool) -> Result<()> {
+    let (_d, s, a) = setup(raise).await?;
+    add_session(&s, &a, PHONE, FAR).await?;
+    let pending = issue_grant_serial(&s, &a, PHONE).await?;
+    let token = expected_token(&s, &a, PHONE, NOW).await?;
+    let paused = pause(&s, &a, PHONE, &id(), &token, NOW, RETIREMENT_FIRST).await;
+    let mut writer = {
+        let (s, a, pending) = (s.clone(), a.clone(), pending.clone());
+        tokio::spawn(async move { redeem_grant_serial(&s, &a, PHONE, &pending).await })
+    };
+    assert_blocked(&s, paused.point, &mut writer).await?;
+    assert_eq!(paused.finish().await?.outcome, Outcome::ConfirmedApplied);
+    // The grant is already `cancelled` by the time the writer's own transaction reads it, so it
+    // creates no session at all, exactly as the real `activate` returns `401` without ever
+    // calling `sessions::issue`.
+    let redeemed = writer.await??;
+    assert!(redeemed.is_none(), "{redeemed:?}");
+    let after = snapshot(&s, &a, PHONE).await?;
+    assert!(
+        after.sessions.is_empty(),
+        "the retirement removed the session"
+    );
+    assert_eq!(after.grants, [(pending, "cancelled".to_owned())]);
+    assert_isolation(&s, raise);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_grant_issue_first_makes_the_retirement_stale() -> Result<()> {
+    grant_issue_writer_first(false).await
+}
+
+#[tokio::test]
+async fn a_grant_issue_after_the_retirement_belongs_to_the_new_incarnation() -> Result<()> {
+    grant_issue_retirement_first(false).await
+}
+
+#[tokio::test]
+async fn a_grant_redeem_first_makes_the_retirement_stale() -> Result<()> {
+    grant_redeem_writer_first(false).await
+}
+
+#[tokio::test]
+async fn a_grant_redeem_after_the_retirement_finds_it_already_cancelled() -> Result<()> {
+    grant_redeem_retirement_first(false).await
+}
+
 // ---------------------------------------------------------------- (al) rows-affected assertion
 
 /// (al) A statement injected between the locking reads and the effects deletes a locked member.
@@ -923,6 +1102,18 @@ async fn every_schedule_also_passes_at_repeatable_read() -> Result<()> {
             .await
             .context("(ae) subscription set, retirement first")?;
     }
+    grant_issue_writer_first(true)
+        .await
+        .context("(ae) grant issue, writer first")?;
+    grant_issue_retirement_first(true)
+        .await
+        .context("(ae) grant issue, retirement first")?;
+    grant_redeem_writer_first(true)
+        .await
+        .context("(r) grant redeem, writer first")?;
+    grant_redeem_retirement_first(true)
+        .await
+        .context("(r) grant redeem, retirement first")?;
     serialisation_failures(true)
         .await
         .context("(ah) serialisation failures")?;

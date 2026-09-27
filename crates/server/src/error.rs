@@ -41,6 +41,7 @@ impl IntoResponse for ApiError {
             Some(ErrorCode::OidcUnavailable) => (StatusCode::BAD_GATEWAY, "oidc_unavailable"),
             Some(ErrorCode::Unauthenticated) => (StatusCode::UNAUTHORIZED, "unauthenticated"),
             Some(ErrorCode::Forbidden) => (StatusCode::FORBIDDEN, "forbidden"),
+            Some(ErrorCode::CredentialMismatch) => (StatusCode::FORBIDDEN, "credential_mismatch"),
             Some(ErrorCode::NotFound) => (StatusCode::NOT_FOUND, "not_found"),
             Some(ErrorCode::AccessChanged) => (StatusCode::CONFLICT, "access_changed"),
             Some(ErrorCode::ResyncRequired) => (StatusCode::GONE, "resync_required"),

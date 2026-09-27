@@ -227,6 +227,14 @@ impl App {
                 post(browser::login),
             )
             .route(
+                "/api/experimental/v1/browser-sessions/activate",
+                post(activation::activate),
+            )
+            .route(
+                "/api/experimental/v1/browser-sessions/activate/cancel",
+                post(activation::activate_cancel),
+            )
+            .route(
                 "/api/experimental/v1/browser-sessions/current",
                 get(browser::current),
             )

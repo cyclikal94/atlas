@@ -53,10 +53,11 @@ restore the saved database with its matching executable and keys.
 
 ## Release compatibility
 
-Atlas is unreleased. The current backup format is 1 and the current schema is 1001. A
-bundle records the schema it holds. Backup and restore accept 1000 (the previous baseline,
-which is what a "back up before upgrading" bundle contains; the executable upgrades it in
-place when restore prepares it) and 1001; incompatible experimental schemas are rejected.
+Atlas is unreleased. The current backup format is 1 and the current schema is 1002. A
+bundle records the schema it holds. Backup and restore accept 1000 and 1001 (previous
+baselines, which are what a "back up before upgrading" bundle contains; the executable
+upgrades either in place when restore prepares it) and 1002; incompatible experimental
+schemas are rejected.
 At the first published release, the then-current schema becomes the supported starting point.
 Subsequent releases must provide transactional, ordered schema migrations and tests
 from every supported prior release before publishing. No down-migration is promised:

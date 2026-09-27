@@ -99,6 +99,56 @@ pub(super) struct Registration {
     password: String,
     device_id: String,
 }
+/// The invitation-lookup/manager-check/account-insert/household-join/invitation-redeem sequence
+/// shared by native and browser registration (BE-Q19). Takes the already-hashed password and the
+/// raw invitation token/username, not a whole request struct, so a caller that has already moved
+/// its own `password` field out (to hash it in a blocking task) can still pass its other fields
+/// by reference afterwards.
+async fn create_account(
+    tx: &mut Transaction<'_, Any>,
+    token: &str,
+    username: &str,
+    password: &str,
+) -> Result<String, ApiError> {
+    let invitation=sqlx::query("SELECT id,issuer_id,household_id FROM account_invitations WHERE token_hash=$1 AND expires_at>$2 AND redeemed_by IS NULL AND revoked=0").bind(digest(token)).bind(now()).fetch_optional(&mut **tx).await?.ok_or_else(||anyhow!(ErrorCode::Unauthenticated))?;
+    let household: Option<String> = invitation.get(2);
+    if let Some(household) = &household {
+        manager(
+            tx,
+            household,
+            &invitation
+                .get::<Option<String>, _>(1)
+                .ok_or_else(|| anyhow!(ErrorCode::Forbidden))?,
+        )
+        .await?;
+    }
+    let account = Uuid::new_v4().to_string();
+    Store::add_account_in(tx, &account, username, password).await?;
+    if let Some(household) = household {
+        sqlx::query("INSERT INTO household_memberships(household_id,account_id,role) VALUES ($1,$2,'member')").bind(&household).bind(&account).execute(&mut **tx).await?;
+        sqlx::query("UPDATE accounts SET primary_household_id=$1 WHERE id=$2")
+            .bind(&household)
+            .bind(&account)
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("UPDATE households SET version=version+1 WHERE id=$1")
+            .bind(household)
+            .execute(&mut **tx)
+            .await?;
+        // This account has never had a client projection. Its first snapshot
+        // reads all current grants, including existing household-shared records.
+        sqlx::query("UPDATE sync_clock SET revision=revision+1 WHERE id=1")
+            .execute(&mut **tx)
+            .await?;
+    }
+    sqlx::query("UPDATE account_invitations SET redeemed_by=$1 WHERE id=$2")
+        .bind(&account)
+        .bind(invitation.get::<String, _>(0))
+        .execute(&mut **tx)
+        .await?;
+    Ok(account)
+}
+
 pub(super) async fn register(
     State(app): State<App>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
@@ -117,8 +167,7 @@ pub(super) async fn register(
         ErrorCode::InvalidValue,
     )?;
     source_attempt(&app, peer, &headers)?;
-    let hash = digest(&input.token);
-    let valid:i64=sqlx::query_scalar("SELECT COUNT(*) FROM account_invitations WHERE token_hash=$1 AND expires_at>$2 AND redeemed_by IS NULL AND revoked=0").bind(&hash).bind(now()).fetch_one(&app.store.pool).await?;
+    let valid:i64=sqlx::query_scalar("SELECT COUNT(*) FROM account_invitations WHERE token_hash=$1 AND expires_at>$2 AND redeemed_by IS NULL AND revoked=0").bind(digest(&input.token)).bind(now()).fetch_one(&app.store.pool).await?;
     ensure_api(valid == 1, ErrorCode::Unauthenticated)?;
     let permit = app.password_permit().await?;
     let password = tokio::task::spawn_blocking(move || -> Result<String> {
@@ -131,43 +180,8 @@ pub(super) async fn register(
     .await
     .map_err(|_| anyhow!(ErrorCode::InternalError))??;
     let mut tx = app.store.begin_serial().await?;
-    let invitation=sqlx::query("SELECT id,issuer_id,household_id FROM account_invitations WHERE token_hash=$1 AND expires_at>$2 AND redeemed_by IS NULL AND revoked=0").bind(hash).bind(now()).fetch_optional(&mut *tx).await?.ok_or_else(||anyhow!(ErrorCode::Unauthenticated))?;
-    let household: Option<String> = invitation.get(2);
-    if let Some(household) = &household {
-        manager(
-            &mut tx,
-            household,
-            &invitation
-                .get::<Option<String>, _>(1)
-                .ok_or_else(|| anyhow!(ErrorCode::Forbidden))?,
-        )
-        .await?;
-    }
-    let account = Uuid::new_v4().to_string();
-    Store::add_account_in(&mut tx, &account, &input.username, &password).await?;
-    if let Some(household) = household {
-        sqlx::query("INSERT INTO household_memberships(household_id,account_id,role) VALUES ($1,$2,'member')").bind(&household).bind(&account).execute(&mut *tx).await?;
-        sqlx::query("UPDATE accounts SET primary_household_id=$1 WHERE id=$2")
-            .bind(&household)
-            .bind(&account)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("UPDATE households SET version=version+1 WHERE id=$1")
-            .bind(household)
-            .execute(&mut *tx)
-            .await?;
-        // This account has never had a client projection. Its first snapshot
-        // reads all current grants, including existing household-shared records.
-        sqlx::query("UPDATE sync_clock SET revision=revision+1 WHERE id=1")
-            .execute(&mut *tx)
-            .await?;
-    }
-    sqlx::query("UPDATE account_invitations SET redeemed_by=$1 WHERE id=$2")
-        .bind(&account)
-        .bind(invitation.get::<String, _>(0))
-        .execute(&mut *tx)
-        .await?;
-    let session = sessions::issue(&mut tx, &account, &input.device_id, "local").await?;
+    let account = create_account(&mut tx, &input.token, &input.username, &password).await?;
+    let (session, _) = sessions::issue(&mut tx, &account, &input.device_id, "local").await?;
     tx.commit().await?;
     Ok(Json(session))
 }
@@ -183,19 +197,68 @@ pub async fn revoke_operator_invitation(store: &Store, id: &str) -> Result<()> {
     tx.commit().await?;
     Ok(())
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct BrowserRegistration {
+    token: String,
+    username: String,
+    password: String,
+    device_id: String,
+    attempt_challenge: String,
+}
+
+/// Issues a grant, not a session (BE-Q19): the account and the invitation redemption still
+/// commit atomically, since both remain inside the one `create_account` transaction; only what
+/// happens after account creation (session vs. grant) differs from native registration.
 pub(super) async fn browser_register(
     State(app): State<App>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
-    body: Result<Json<Registration>, JsonRejection>,
-) -> Result<Response, ApiError> {
+    body: Result<Json<BrowserRegistration>, JsonRejection>,
+) -> Result<Json<activation::BrowserGrant>, ApiError> {
     let config = app
         .browser
         .as_ref()
         .ok_or_else(|| anyhow!(ErrorCode::NotFound))?;
     config.origin(&headers, true)?;
-    let Json(session) = register(State(app.clone()), peer, headers, body).await?;
-    Ok(browser::establish(config, session))
+    let Json(input) = body.map_err(|_| anyhow!(ErrorCode::MalformedRequest))?;
+    ensure_api(
+        input.token.len() == 64
+            && input.token.bytes().all(|c| c.is_ascii_hexdigit())
+            && !input.username.is_empty()
+            && input.username.len() <= 100
+            && (12..=1024).contains(&input.password.len())
+            && !input.device_id.is_empty()
+            && input.device_id.len() <= 100
+            && activation::valid_challenge(&input.attempt_challenge),
+        ErrorCode::InvalidValue,
+    )?;
+    source_attempt(&app, peer, &headers)?;
+    let valid:i64=sqlx::query_scalar("SELECT COUNT(*) FROM account_invitations WHERE token_hash=$1 AND expires_at>$2 AND redeemed_by IS NULL AND revoked=0").bind(digest(&input.token)).bind(now()).fetch_one(&app.store.pool).await?;
+    ensure_api(valid == 1, ErrorCode::Unauthenticated)?;
+    let permit = app.password_permit().await?;
+    let password = tokio::task::spawn_blocking(move || -> Result<String> {
+        let _permit = permit;
+        Argon2::default()
+            .hash_password(input.password.as_bytes())
+            .map(|h| h.to_string())
+            .map_err(|_| anyhow!(ErrorCode::InternalError))
+    })
+    .await
+    .map_err(|_| anyhow!(ErrorCode::InternalError))??;
+    let mut tx = app.store.begin_serial().await?;
+    let account = create_account(&mut tx, &input.token, &input.username, &password).await?;
+    let grant = activation::issue_grant(
+        &mut tx,
+        &account,
+        &input.device_id,
+        "local",
+        &input.attempt_challenge,
+        now(),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(grant))
 }
 
 #[derive(Deserialize)]

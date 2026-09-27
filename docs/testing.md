@@ -78,12 +78,15 @@ and `replay_survives_device_recreation_at_repeatable_read` in core; `every_route
 `every_real_writer_also_passes_at_repeatable_read` in the server), and each of those schedules asserts the level it
 observed (`READ COMMITTED` unless raised), so a raise that did nothing fails. The writers run in the server crate are the real
 routes (`POST /sessions`, `GET /oidc/callback`, `POST /oidc/native/exchange`, `POST /password`,
-`DELETE /sessions/{id}`, `DELETE /sessions/current`), not a stand-in statement. The activation-grant
-writers are not covered: their table belongs to BE-Q19. These in-process
+`DELETE /sessions/{id}`, `DELETE /sessions/current`, `POST /browser-sessions`, `POST
+/browser-sessions/activate`, `POST /browser-sessions/activate/cancel`), not a stand-in
+statement. These in-process
 schedules prove the protocol's outcomes for the interleavings they force. They are not
 release evidence: `scripts/smoke_server.py` and `scripts/test-postgres-release.sh` exercise
 the release-shaped binary over real sockets, and the latter races retirements against
-revokes and logouts between two server processes (`ATLAS_RACE_ROUNDS`, default 200).
+revokes and logouts, and activation-grant redemption against both a retirement of the
+same device and a concurrent cancellation of the same grant, between two server
+processes (`ATLAS_RACE_ROUNDS`, default 200).
 
 Use `crates/core/examples/sync_load.rs` for current-runtime workloads, and
 `crates/core/examples/retire_load.rs` (with `ATLAS_TEST_POSTGRES_URL` for PostgreSQL) for the
@@ -97,9 +100,11 @@ After building the server, `python3 scripts/test_recovery.py` exercises real SQL
 exports, credential files, corruption rejection and occupied-destination protection.
 `scripts/test-postgres-release.sh` owns a disposable PostgreSQL cluster and runs two
 actual server processes, alternating domain HTTP requests between them, racing one
-operation ID, racing device retirements against revokes and logouts, measuring a bounded
-concurrent write sample, stopping one replica and restoring an export into a second database
-(the operation ledger must survive the restore). Set `ATLAS_PYTHON` to a Python environment
+operation ID, racing device retirements against revokes and logouts, racing activation-grant
+redemption against a retirement of the same device and against a concurrent cancellation of
+the same grant, measuring a bounded concurrent write sample, stopping one replica and
+restoring an export into a second database (the operation ledger must survive the restore,
+and restore preparation must leave no activation grant behind). Set `ATLAS_PYTHON` to a Python environment
 with `scripts/requirements-contract.txt` installed. Worker generation and retry fencing
 are also tested through independent database pools in the calendar reconciliation cases.
 

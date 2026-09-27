@@ -1,7 +1,8 @@
-use crate::support::http::session_request as call;
+use crate::support::http::{request, session_request as call};
 use atlas_core::{Command, Store, households::ManagementCommand};
 use atlas_server::{App, hash_password, now, operator_invitation};
 use axum::http::StatusCode;
+use openidconnect::PkceCodeChallenge;
 use serde_json::{Value, json};
 use uuid::Uuid;
 fn registration(token: &str, username: &str) -> Value {
@@ -313,4 +314,84 @@ async fn scenario(store: Store) -> anyhow::Result<()> {
 async fn invited_registration() -> anyhow::Result<()> {
     let (_dir, url) = crate::support::database::database_url().await?;
     scenario(Store::connect(&url).await?).await
+}
+
+/// (h) `browser_register` consumes the invitation and issues a grant atomically, not a session:
+/// the account is usable natively even if the grant round trip is lost, and no cookie is set.
+#[tokio::test]
+async fn browser_registration_issues_a_grant_not_a_session() -> anyhow::Result<()> {
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let store = Store::connect(&url).await?;
+    store.migrate().await?;
+    let invitation = operator_invitation(&store).await?;
+    let app = App::new(store.clone())
+        .await?
+        .public_origin("https://atlas.example")?
+        .router();
+    let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
+    let body = json!({
+        "token": invitation.token,
+        "username": "browser-onboarded",
+        "password": "onboarding-password-123",
+        "device_id": "phone",
+        "attempt_challenge": challenge.as_str(),
+    });
+    let (status, headers, granted) = request(
+        &app,
+        "POST",
+        "browser-registration",
+        &[("origin", "https://atlas.example")],
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{granted}");
+    assert!(!headers.contains_key("set-cookie"), "check (h): no cookie");
+    assert!(granted.get("access_token").is_none());
+    let grant = granted["grant"].as_str().unwrap().to_owned();
+
+    // A lost grant response still leaves an account the user can log into: the invitation
+    // redemption and the account insert committed atomically regardless of what happens next.
+    let (status, native) = call(
+        &app,
+        "POST",
+        "sessions",
+        None,
+        json!({"username":"browser-onboarded","password":"onboarding-password-123","device_id":"native-probe"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{native}");
+    assert_eq!(native["account_id"], granted["account_id"]);
+
+    // The invitation is consumed exactly once.
+    assert_eq!(
+        request(
+            &app,
+            "POST",
+            "browser-registration",
+            &[("origin", "https://atlas.example")],
+            json!({
+                "token": invitation.token,
+                "username": "browser-onboarded-again",
+                "password": "onboarding-password-123",
+                "device_id": "phone",
+                "attempt_challenge": challenge.as_str(),
+            }),
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // The grant itself still redeems into a real session.
+    let (status, _, activated) = request(
+        &app,
+        "POST",
+        "browser-sessions/activate",
+        &[("origin", "https://atlas.example")],
+        json!({"grant":grant,"verifier":verifier.secret()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{activated}");
+    assert_eq!(activated["account_id"], granted["account_id"]);
+    Ok(())
 }

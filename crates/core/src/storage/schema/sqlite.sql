@@ -35,6 +35,21 @@ CREATE TABLE operation_outcomes (
  CHECK (outcome <> 'rejected_stale' OR kind = 'retire_device')
 );
 
+-- Bearer-shaped browser sign-in grant issued by login/registration/OIDC-callback in place of a
+-- cookie (BE-Q19); approved-device-state component 4. `grant_hash`/`grant` mirror
+-- `sessions.token_hash`/its bearer token exactly; `grant_id` is the separate, non-secret identity
+-- that appears in the device-state token. `challenge_hash` is the caller's S256(verifier).
+CREATE TABLE activation_grants (
+ grant_hash TEXT PRIMARY KEY, grant_id TEXT NOT NULL,
+ account_id TEXT NOT NULL REFERENCES accounts(id), device_id TEXT NOT NULL,
+ auth_kind TEXT NOT NULL CHECK (auth_kind IN ('local','oidc')),
+ challenge_hash TEXT NOT NULL UNIQUE,
+ state TEXT NOT NULL CHECK (state IN ('issued','redeemed','cancelled')),
+ session_id TEXT, failed_verifiers BIGINT NOT NULL DEFAULT 0,
+ created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL,
+ redeemed_at BIGINT, cancelled_at BIGINT
+);
+
 CREATE TABLE sync_batches (
  account_id TEXT NOT NULL REFERENCES accounts(id), revision BIGINT NOT NULL,
  payload TEXT NOT NULL, created_at BIGINT NOT NULL DEFAULT 0, PRIMARY KEY(account_id,revision)
@@ -127,7 +142,7 @@ CREATE TABLE oidc_flows (
     device_id TEXT NOT NULL,
     link_session_hash TEXT,
     expires_at BIGINT NOT NULL
-, native_redirect TEXT, native_challenge TEXT, native_state TEXT);
+, native_redirect TEXT, native_challenge TEXT, native_state TEXT, attempt_id TEXT, attempt_challenge TEXT);
 
 CREATE TABLE account_invitations (
     id TEXT PRIMARY KEY,
@@ -409,6 +424,12 @@ CREATE INDEX people_requests_recipient ON people_requests(recipient_id,state,id)
 
 CREATE INDEX people_requests_expiry ON people_requests(expires_at,id);
 
+CREATE UNIQUE INDEX activation_grant_identity ON activation_grants(grant_id);
+
+CREATE INDEX activation_grants_expiry ON activation_grants(expires_at);
+
+CREATE INDEX activation_grants_account_device ON activation_grants(account_id,device_id,state);
+
 CREATE TRIGGER resource_parent_insert BEFORE INSERT ON resources WHEN NEW.parent_id IS NOT NULL
 BEGIN
  SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM resources p WHERE p.id=NEW.parent_id AND
@@ -438,4 +459,4 @@ BEGIN
  SELECT NEW.id,ancestor_id,depth+1 FROM resource_ancestors WHERE resource_id=NEW.parent_id;
 END;
 INSERT INTO sync_clock(id,revision,resource_count) VALUES(1,0,0);
-INSERT INTO atlas_schema(version) VALUES(1001);
+INSERT INTO atlas_schema(version) VALUES(1002);

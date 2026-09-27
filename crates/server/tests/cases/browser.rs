@@ -5,6 +5,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
+use openidconnect::PkceCodeChallenge;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -59,8 +60,8 @@ async fn cookies_require_csrf_and_revocation_survives_reload() -> anyhow::Result
         .await?
         .public_origin("https://atlas.example")?
         .router();
-    let input =
-        json!({"username":"alice", "password":"browser-password-123", "device_id":"browser"});
+    let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
+    let input = json!({"username":"alice", "password":"browser-password-123", "device_id":"browser", "attempt_challenge":challenge.as_str()});
     for headers in [
         vec![],
         vec![("origin", "https://attacker.example")],
@@ -73,7 +74,8 @@ async fn cookies_require_csrf_and_revocation_survives_reload() -> anyhow::Result
             StatusCode::FORBIDDEN
         );
     }
-    let (status, headers, session) = call(
+    // BE-Q19: login issues a grant, not a cookie. Only `POST .../activate` sets one.
+    let (status, headers, grant) = call(
         &app,
         "POST",
         "browser-sessions",
@@ -81,9 +83,25 @@ async fn cookies_require_csrf_and_revocation_survives_reload() -> anyhow::Result
         input,
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{grant}");
+    assert_eq!(grant["account_id"], account);
+    assert!(grant.get("access_token").is_none());
+    assert!(!headers.contains_key("set-cookie"));
+    let grant_value = grant["grant"].as_str().unwrap();
+    assert_eq!(grant_value.len(), 64);
+    assert!(grant_value.bytes().all(|b| b.is_ascii_hexdigit()));
+
+    let (status, headers, session) = call(
+        &app,
+        "POST",
+        "browser-sessions/activate",
+        &[("origin", "https://atlas.example")],
+        json!({"grant":grant_value,"verifier":verifier.secret()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{session}");
     assert_eq!(session["account_id"], account);
-    assert!(session.get("access_token").is_none());
+    assert!(session["session_id"].is_string());
     let set_cookie = headers["set-cookie"].to_str()?;
     for flag in [
         "__Host-atlas_session=",
@@ -101,6 +119,30 @@ async fn cookies_require_csrf_and_revocation_survives_reload() -> anyhow::Result
         .fetch_one(&store.pool)
         .await?;
     assert_ne!(stored, cookie.split_once('=').unwrap().1);
+    // A right-length-but-wrong CSRF token is a credential mismatch, distinct from an absent or
+    // malformed one.
+    let (status, _, mismatch) = call(
+        &app,
+        "GET",
+        "sync",
+        &[("cookie", cookie), ("x-csrf-token", &"0".repeat(64))],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(mismatch["code"], "credential_mismatch");
+    assert_eq!(
+        call(
+            &app,
+            "GET",
+            "sync",
+            &[("cookie", cookie), ("x-csrf-token", "too-short")],
+            Value::Null
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
     assert_eq!(
         call(&app, "GET", "sync", &[("cookie", cookie)], Value::Null)
             .await

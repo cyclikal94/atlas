@@ -1,16 +1,16 @@
 //! Check (ae): the real `begin_serial()` writers of an approved-state member, each run against a
-//! paused retirement in both orders, on both engines: session issue (native login and the browser
-//! OIDC callback), native-handoff creation (the native OIDC callback) and consumption (the native
-//! exchange), and password change. Subscription set is a core function and is in
-//! `atlas-core`'s `retirement_coordination`.
+//! paused retirement in both orders, on both engines: session issue (native login), native-handoff
+//! creation (the native OIDC callback) and consumption (the native exchange), password change, and
+//! BE-Q19's activation-grant issue/redeem/cancel (`POST /browser-sessions`, `.../activate` and
+//! `.../activate/cancel`). Subscription set is a core function and is in `atlas-core`'s
+//! `retirement_coordination`.
 //!
 //! Every case asserts (i) the ledger row, (ii) the writer's own HTTP result and (iii) the rows that
 //! remain. A writer can commit first only at `retire.before_begin` (on both engines a
 //! `begin_serial()` writer blocks on `sync_clock` or the write lock from the retirement's first
 //! statement); "retirement first" holds the retirement after its locking reads and observes the
 //! writer waiting. On PostgreSQL the same cases are run again with the retirement raised to
-//! REPEATABLE READ (check ai). Activation-grant writers (issue, redeem, cancel) are not here: the
-//! table they write is BE-Q19's and is not in this task's base.
+//! REPEATABLE READ (check ai).
 use anyhow::Result;
 use axum::http::StatusCode;
 use serde_json::{Value, json};
@@ -18,10 +18,10 @@ use tokio::task::JoinHandle;
 
 use crate::support::http::request;
 use crate::support::retirement::{
-    BEFORE_BEGIN, PASSWORD, RETIREMENT_FIRST, Reply, Scene, World, assert_blocked,
-    assert_isolation, bearer, browser_start, handoff_code, id, ledger, native_handoff,
-    native_start, postgres, spawn_native_callback, spawn_native_exchange, spawn_request_with,
-    world_with_oidc,
+    BEFORE_BEGIN, ORIGIN, PASSWORD, RETIREMENT_FIRST, Reply, Scene, World, activate,
+    assert_blocked, assert_isolation, attempt, bearer, handoff_code, id, issue_grant, ledger,
+    native_handoff, native_start, postgres, spawn_native_callback, spawn_native_exchange,
+    spawn_request_with, world_with_oidc,
 };
 use atlas_core::calendars::ReminderCommand;
 
@@ -211,30 +211,37 @@ async fn session_issue(order: Order, raise: bool) -> Result<()> {
     Ok(())
 }
 
-/// The browser OIDC callback (`GET /oidc/callback`) issues a session for the device through the
-/// same `sessions::issue`, from its own route. Same outcomes as the native login.
-async fn browser_callback_issue(order: Order, raise: bool) -> Result<()> {
+// ------------------------------------------------------------------------------ grant issue
+
+/// `POST /browser-sessions` issues a grant for the device: approved-device-state component 4
+/// (BE-Q19). Writer first: a new member the retirement never saw, so `rejected_stale`, and
+/// nothing is retired — the grant redeems successfully afterwards. Retirement first: the
+/// retirement clears the phone's only member first, and the grant that follows belongs to the
+/// device's new incarnation.
+async fn grant_issue(order: Order, raise: bool) -> Result<()> {
     let s = scene(raise).await?;
     let op = id();
-    let (path, cookie) = browser_start(&s.w, "phone").await;
+    let (verifier, challenge) = attempt();
+    let body = json!({"username":"device-alice","password":PASSWORD,"device_id":"phone","attempt_challenge":challenge});
     let raced = race(&s, order, &op, |s| {
         spawn_request_with(
             &s.w.app,
-            "GET",
-            path,
-            vec![("cookie".into(), cookie)],
-            Value::Null,
+            "POST",
+            "browser-sessions".into(),
+            vec![("origin".into(), ORIGIN.into())],
+            body,
         )
     })
     .await?;
-    let context = format!("browser callback, {order:?}");
+    let context = format!("grant issue, {order:?}");
     assert_eq!(
         raced.writer.0,
-        StatusCode::SEE_OTHER,
+        StatusCode::OK,
         "{context}: {}",
         raced.writer.2
     );
-    let phone = rows(&s.w).await?;
+    assert!(!raced.writer.1.contains_key("set-cookie"), "{context}");
+    let grant = raced.writer.2["grant"].as_str().unwrap().to_owned();
     match order {
         Order::WriterFirst => {
             assert_retirement(
@@ -244,8 +251,6 @@ async fn browser_callback_issue(order: Order, raise: bool) -> Result<()> {
                 &context,
             );
             ledger_is(&s.w, &op, "rejected_stale", &context).await?;
-            assert_eq!(phone.sessions.len(), 2, "{context}");
-            assert!(phone.sessions.contains(&s.phone_session));
         }
         Order::RetirementFirst => {
             assert_retirement(
@@ -255,8 +260,137 @@ async fn browser_callback_issue(order: Order, raise: bool) -> Result<()> {
                 &context,
             );
             ledger_is(&s.w, &op, "confirmed_applied", &context).await?;
-            assert_eq!(phone.sessions.len(), 1, "{context}");
-            assert!(!phone.sessions.contains(&s.phone_session));
+        }
+    }
+    // Either way the grant belongs to whichever incarnation exists now and redeems cleanly.
+    let (status, _, activated) = activate(&s.w.app, &grant, &verifier).await;
+    assert_eq!(status, StatusCode::OK, "{context}: {activated}");
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------- grant redeem
+
+/// `POST /browser-sessions/activate` redeems an already-issued grant: components 1 and 4 both
+/// change (a session is added, the grant leaves). Writer first: the retirement never saw the
+/// redemption, so `rejected_stale`, and the new session survives untouched. Retirement first:
+/// the retirement cancels the still-`issued` grant as one of its own effects, so the redemption
+/// that follows finds it no longer `issued`: `401`, no session created.
+async fn grant_redeem(order: Order, raise: bool) -> Result<()> {
+    let mut s = scene(raise).await?;
+    let (status, _, granted) = issue_grant(&s.w.app, "device-alice", "phone").await;
+    assert_eq!(status, StatusCode::OK, "{granted}");
+    let grant = granted["grant"].as_str().unwrap().to_owned();
+    let verifier = granted["verifier"].as_str().unwrap().to_owned();
+    s.refresh().await;
+    let op = id();
+    let raced = race(&s, order, &op, |s| {
+        spawn_request_with(
+            &s.w.app,
+            "POST",
+            "browser-sessions/activate".into(),
+            vec![("origin".into(), ORIGIN.into())],
+            json!({"grant":grant,"verifier":verifier}),
+        )
+    })
+    .await?;
+    let context = format!("grant redeem, {order:?}");
+    let phone = rows(&s.w).await?;
+    match order {
+        Order::WriterFirst => {
+            assert_eq!(
+                raced.writer.0,
+                StatusCode::OK,
+                "{context}: {}",
+                raced.writer.2
+            );
+            assert_retirement(
+                &raced.retirement,
+                StatusCode::CONFLICT,
+                "rejected_stale",
+                &context,
+            );
+            ledger_is(&s.w, &op, "rejected_stale", &context).await?;
+            assert_eq!(
+                phone.sessions.len(),
+                2,
+                "{context}: neither session deleted"
+            );
+            assert!(phone.sessions.contains(&s.phone_session));
+        }
+        Order::RetirementFirst => {
+            assert_eq!(
+                (raced.writer.0, raced.writer.2["code"].as_str()),
+                (StatusCode::UNAUTHORIZED, Some("unauthenticated")),
+                "{context}: {}",
+                raced.writer.2
+            );
+            assert_retirement(
+                &raced.retirement,
+                StatusCode::OK,
+                "confirmed_applied",
+                &context,
+            );
+            ledger_is(&s.w, &op, "confirmed_applied", &context).await?;
+            assert!(
+                phone.sessions.is_empty(),
+                "{context}: no session was created"
+            );
+        }
+    }
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------- grant cancel
+
+/// `POST /browser-sessions/activate/cancel` cancels a still-`issued` grant. Writer first:
+/// cancelling changes component 4 before the retirement's locking read, so `rejected_stale`.
+/// Retirement first: the retirement's own effects already cancelled the grant, so the cancel
+/// that follows finds it already `cancelled` and reports the same `not_activated` result either
+/// way — only what the retirement recorded differs.
+async fn grant_cancel(order: Order, raise: bool) -> Result<()> {
+    let mut s = scene(raise).await?;
+    let (status, _, granted) = issue_grant(&s.w.app, "device-alice", "phone").await;
+    assert_eq!(status, StatusCode::OK, "{granted}");
+    let verifier = granted["verifier"].as_str().unwrap().to_owned();
+    s.refresh().await;
+    let op = id();
+    let raced = race(&s, order, &op, |s| {
+        spawn_request_with(
+            &s.w.app,
+            "POST",
+            "browser-sessions/activate/cancel".into(),
+            vec![("origin".into(), ORIGIN.into())],
+            json!({"verifier":verifier}),
+        )
+    })
+    .await?;
+    let context = format!("grant cancel, {order:?}");
+    assert_eq!(
+        raced.writer.0,
+        StatusCode::OK,
+        "{context}: {}",
+        raced.writer.2
+    );
+    assert_eq!(raced.writer.2["result"], "not_activated", "{context}");
+    assert!(!raced.writer.1.contains_key("set-cookie"), "{context}");
+    match order {
+        Order::WriterFirst => {
+            assert_retirement(
+                &raced.retirement,
+                StatusCode::CONFLICT,
+                "rejected_stale",
+                &context,
+            );
+            ledger_is(&s.w, &op, "rejected_stale", &context).await?;
+        }
+        Order::RetirementFirst => {
+            assert_retirement(
+                &raced.retirement,
+                StatusCode::OK,
+                "confirmed_applied",
+                &context,
+            );
+            ledger_is(&s.w, &op, "confirmed_applied", &context).await?;
         }
     }
     Ok(())
@@ -553,9 +687,19 @@ both_orders!(
     session_issue
 );
 both_orders!(
-    a_browser_callback_first_makes_the_retirement_stale,
-    a_browser_callback_after_the_retirement_creates_a_new_incarnation,
-    browser_callback_issue
+    a_grant_issue_first_makes_the_retirement_stale,
+    a_grant_issue_after_the_retirement_creates_a_new_incarnation,
+    grant_issue
+);
+both_orders!(
+    a_grant_redeem_first_makes_the_retirement_stale,
+    a_grant_redeem_after_the_retirement_finds_nothing,
+    grant_redeem
+);
+both_orders!(
+    a_grant_cancel_first_makes_the_retirement_stale,
+    a_grant_cancel_after_the_retirement_reports_the_same_result,
+    grant_cancel
 );
 both_orders!(
     a_handoff_created_first_makes_the_retirement_stale,
@@ -592,7 +736,9 @@ async fn every_real_writer_also_passes_at_repeatable_read() -> Result<()> {
     }
     for order in ORDERS {
         session_issue(order, true).await?;
-        browser_callback_issue(order, true).await?;
+        grant_issue(order, true).await?;
+        grant_redeem(order, true).await?;
+        grant_cancel(order, true).await?;
         handoff_create(order, true).await?;
         handoff_consume(order, true).await?;
         for (caller, beside) in [

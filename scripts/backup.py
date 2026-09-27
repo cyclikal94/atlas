@@ -13,9 +13,9 @@ import sys
 import urllib.parse
 
 FORMAT = 1
-# Schema versions a bundle may hold. 1000 is the previous baseline: it is what a "back up before
-# upgrading" bundle contains, and the server upgrades it in place when restore prepares it.
-SUPPORTED_SCHEMAS = (1000, 1001)
+# Schema versions a bundle may hold. 1000 and 1001 are previous baselines: each is what a "back
+# up before upgrading" bundle contains, and the server upgrades it in place when restore prepares it.
+SUPPORTED_SCHEMAS = (1000, 1001, 1002)
 
 
 def run(command, env=None):

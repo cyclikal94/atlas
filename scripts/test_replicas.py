@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Two actual server processes against a fresh, harness-owned PostgreSQL database."""
+import base64
 import collections
 import concurrent.futures
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -41,6 +43,26 @@ def psql(sql):
     result = subprocess.run([shutil.which('psql'), os.environ['ATLAS_DATABASE_URL'], '-XAt',
                              '-v', 'ON_ERROR_STOP=1', '-c', sql], capture_output=True, check=True)
     return result.stdout.decode().strip()
+
+
+def raw_json(base, method, path, body, headers=None):
+    """As raw(), for an unauthenticated request with a JSON body (BE-Q19's activation-grant
+    endpoints, which carry their own bearer-shaped credential in the body, not Authorization)."""
+    request = urllib.request.Request(base + path, method=method, data=json.dumps(body).encode(),
+        headers={'Content-Type': 'application/json', **(headers or {})})
+    try:
+        response = urllib.request.urlopen(request, timeout=30)
+    except urllib.error.HTTPError as error:
+        response = error
+    with response:
+        body = response.read()
+        return response.status, (json.loads(body) if body else None), dict(response.headers)
+
+
+def _pkce_pair():
+    verifier = uuid.uuid4().hex + uuid.uuid4().hex
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b'=').decode()
+    return verifier, challenge
 
 
 def race_retirements(clients, document, tokens, secrets, rounds):
@@ -137,6 +159,109 @@ def race_retirements(clients, document, tokens, secrets, rounds):
             'orders_observed': {f'{k[0]}/{k[1]}/writer_{k[2]}': v for k, v in sorted(seen.items())}}
 
 
+def race_activations(clients, document, tokens, secrets, rounds):
+    """Real cross-process races on PostgreSQL involving BE-Q19 activation grants: exactly one
+    winner and a consistent post-state every round, exercised between real processes, sockets
+    and connection pools rather than only in-process task scheduling (checks (b)/(n)/(r)).
+
+    Each round issues a fresh grant (a real `POST /browser-sessions`, not a fixture) for a new
+    device and races either:
+
+    * `activate` against a retirement of that same device, both started from the device's
+      approved-state token read just before the race. If activation wins, the grant redeems into
+      a session and the retirement — still holding the pre-race token — is `rejected_stale`,
+      because the device's membership changed under it (the grant left, a session arrived). If
+      the retirement wins, it cancels the still-`issued` grant and reports `confirmed_applied`,
+      and `activate` afterwards is `401` with no session created.
+    * `activate` against `activate/cancel` of the same grant. Whichever commits first decides the
+      outcome the other reports (`not_activated` before any session exists, or `session_revoked`
+      after one does), but no live session ever survives the round: `cancel` revokes it if
+      `activate` won first.
+    """
+    alice = tokens['alice']
+    password = secrets[0]
+    seen = collections.Counter()
+    started = time.monotonic()
+    origin = {'Origin': 'https://atlas.example'}
+    for index in range(rounds):
+        round_started = time.monotonic()
+        acting, other = clients[index % 2], clients[(index + 1) % 2]
+        device = f'grant-race-{index}'
+        verifier, challenge = _pkce_pair()
+        granted = acting('POST', V1 + '/browser-sessions', body={
+            'username': 'alice', 'password': password, 'device_id': device,
+            'attempt_challenge': challenge}, extra_headers=origin)
+        grant_hash = hashlib.sha256(granted['grant'].encode()).hexdigest()
+        state = next(d['state_token'] for d in acting('GET', V1 + '/devices', alice)['devices']
+                     if d['id'] == device)
+        mode = 'retire' if index % 2 == 0 else 'cancel'
+        operation = str(uuid.uuid4())
+        barrier = threading.Barrier(2)
+
+        def activate():
+            barrier.wait()
+            time.sleep(random.uniform(0, 0.004))
+            return raw_json(acting.base, 'POST', V1 + '/browser-sessions/activate',
+                            {'grant': granted['grant'], 'verifier': verifier}, origin)
+
+        if mode == 'retire':
+            def counterpart():
+                barrier.wait()
+                time.sleep(random.uniform(0, 0.004))
+                return raw(other.base, 'DELETE', f'{V1}/devices/{device}', alice,
+                           {'Idempotency-Key': operation, 'Atlas-Device-State': state})
+        else:
+            def counterpart():
+                barrier.wait()
+                time.sleep(random.uniform(0, 0.004))
+                return raw_json(other.base, 'POST', V1 + '/browser-sessions/activate/cancel',
+                                {'verifier': verifier}, origin)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            (a_status, a_body, a_headers), (o_status, o_body, o_headers) = [
+                f.result() for f in [pool.submit(activate), pool.submit(counterpart)]]
+        assert 'set-cookie' not in {k.lower() for k in o_headers}
+        assert a_status in (200, 401), (mode, a_status, a_body)
+        won_activate = a_status == 200
+        if won_activate:
+            assert 'set-cookie' in {k.lower() for k in a_headers}
+            session_id = a_body['session_id']
+        else:
+            assert 'set-cookie' not in {k.lower() for k in a_headers}
+        if mode == 'retire':
+            # rejected_stale is a committed answer carried on 409, not a plain failure; confirmed
+            # outcomes (applied or superseded) are 200. See docs/api.md's operation_response note.
+            if won_activate:
+                assert o_status == 409 and o_body['outcome'] == 'rejected_stale', (mode, a_status, o_status, o_body)
+                assert psql(f"SELECT count(*) FROM sessions WHERE session_id='{session_id}'") == '1'
+                # A rejected_stale retirement leaves this session alive by design (that is the
+                # point of this branch); clean it up so a long run doesn't exhaust alice's
+                # 32-session device capacity across hundreds of rounds.
+                psql(f"DELETE FROM sessions WHERE session_id='{session_id}'")
+            else:
+                assert o_status == 200 and o_body['outcome'] == 'confirmed_applied', (mode, a_status, o_status, o_body)
+                assert psql(f"SELECT state FROM activation_grants WHERE grant_hash='{grant_hash}'") == 'cancelled'
+                assert psql(f"SELECT count(*) FROM sessions WHERE device_id='{device}'") == '0'
+        else:
+            assert o_status == 200, (mode, o_status, o_body)
+            if won_activate:
+                assert o_body['result'] == 'session_revoked', (mode, a_status, o_body)
+                assert psql(f"SELECT count(*) FROM sessions WHERE session_id='{session_id}'") == '0'
+            else:
+                assert o_body['result'] == 'not_activated', (mode, a_status, o_body)
+            assert psql(f"SELECT count(*) FROM sessions WHERE device_id='{device}'") == '0'
+        seen[(mode, won_activate)] += 1
+        # Each round makes up to three source_attempt()-throttled calls (issue, activate,
+        # cancel), split across two processes that swap roles every round — up to triple
+        # race_retirements' one-call-per-round rate. That budget allows 120 attempts per
+        # ~60s per source; pace at 1.5s/round (worst case ~2/s per process) to stay clear
+        # of it over long runs instead of tripping a legitimate throttle near the end.
+        time.sleep(max(0.0, 1.5 - (time.monotonic() - round_started)))
+    return {'rounds': rounds, 'elapsed_seconds': round(time.monotonic() - started, 1),
+            'orders_observed': {f'{k[0]}/activate_{"won" if k[1] else "lost"}': v
+                                 for k, v in sorted(seen.items())}}
+
+
 def main():
     env = {**os.environ, 'ATLAS_BIND': '127.0.0.1:0', 'ATLAS_PUBLIC_ORIGIN': 'https://atlas.example'}
     assert env['ATLAS_DATABASE_URL'].startswith(('postgres://', 'postgresql://'))
@@ -202,6 +327,12 @@ def main():
                     psql("INSERT INTO native_handoffs(code_hash,account_id,device_id,challenge,"
                          "configuration_hash,redirect_uri,expires_at) VALUES "
                          f"('{uuid.uuid4()}','{account}','{device}','c','h','r',{expires})")
+                elif kind == 'grant':
+                    psql("INSERT INTO activation_grants(grant_hash,grant_id,account_id,device_id,"
+                         "auth_kind,challenge_hash,state,failed_verifiers,created_at,expires_at) "
+                         "VALUES "
+                         f"('{uuid.uuid4()}','{uuid.uuid4()}','{account}','{device}','local',"
+                         f"'{uuid.uuid4()}','issued',0,{int(time.time())},{expires})")
                 else:
                     psql("INSERT INTO notification_subscriptions(id,account_id,device_id,transport,"
                          "secret,version,active) VALUES "
@@ -227,6 +358,7 @@ def main():
             rounds = int(os.environ.get('ATLAS_RACE_ROUNDS', '200'))
             if rounds:
                 print(json.dumps({'scenario': 'device-retirement-races', **race_retirements(clients, document, tokens, secrets, rounds)}))
+                print(json.dumps({'scenario': 'activation-grant-races', **race_activations(clients, document, tokens, secrets, rounds)}))
             # A surviving replica must serve committed state and the same session.
             processes[0].terminate()
             processes[0].wait(timeout=15)

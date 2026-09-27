@@ -3,8 +3,8 @@ use anyhow::Result;
 use atlas_core::{devices::valid_state_token, operations::Outcome};
 
 use crate::support::devices::{
-    FAR, add_handoff, add_registration, add_session, add_subscription, expected_token, id,
-    ledger_rows, populate, snapshot,
+    FAR, add_grant, add_handoff, add_registration, add_session, add_subscription, expected_token,
+    id, ledger_rows, populate, snapshot,
 };
 use crate::support::resource_commands::{account, create, fixture};
 
@@ -114,6 +114,44 @@ async fn token_tracks_each_component_and_ignores_churn() -> Result<()> {
     let t3b = listed_token(&s, &a, "phone").await?;
     assert_ne!(t3b, t3);
 
+    // Component 4 (BE-Q19): an activation grant, then its redemption or cancellation — both
+    // simulated with raw SQL, since no server writer for either exists in this crate.
+    let grant = add_grant(&s, &a, "phone").await?;
+    let t3c = listed_token(&s, &a, "phone").await?;
+    assert_ne!(t3c, t3b);
+    sqlx::query("UPDATE activation_grants SET state='redeemed' WHERE grant_id=$1")
+        .bind(&grant)
+        .execute(&s.pool)
+        .await?;
+    assert_eq!(
+        listed_token(&s, &a, "phone").await?,
+        t3b,
+        "a redeemed grant leaves component 4"
+    );
+    let grant = add_grant(&s, &a, "phone").await?;
+    assert_ne!(
+        listed_token(&s, &a, "phone").await?,
+        t3b,
+        "a fresh grant is a member again"
+    );
+    sqlx::query("UPDATE activation_grants SET state='cancelled' WHERE grant_id=$1")
+        .bind(&grant)
+        .execute(&s.pool)
+        .await?;
+    assert_eq!(
+        listed_token(&s, &a, "phone").await?,
+        t3b,
+        "a cancelled grant also leaves component 4"
+    );
+    // An expired-but-still-`issued` grant is churn, not state.
+    add_grant(&s, &a, "phone").await?;
+    sqlx::query("UPDATE activation_grants SET expires_at=$1 WHERE account_id=$2 AND device_id='phone' AND state='issued'")
+        .bind(NOW)
+        .bind(&a)
+        .execute(&s.pool)
+        .await?;
+    assert_eq!(listed_token(&s, &a, "phone").await?, t3b);
+
     // Component 5: the registration, and a re-created registration with a new key.
     add_registration(&s, &a, "phone").await?;
     let t4 = listed_token(&s, &a, "phone").await?;
@@ -210,6 +248,7 @@ async fn any_live_member_alone_lists_the_device_with_its_token() -> Result<()> {
     add_subscription(&s, &a, "subscription-only").await?;
     add_registration(&s, &a, "registration-only").await?;
     add_session(&s, &a, "session-only", FAR).await?;
+    add_grant(&s, &a, "grant-only").await?;
     add_handoff(&s, &a, "expired-handoff", NOW).await?;
     add_session(&s, &a, "expired-session", NOW).await?;
     let inactive = add_subscription(&s, &a, "inactive-subscription").await?;
@@ -217,11 +256,23 @@ async fn any_live_member_alone_lists_the_device_with_its_token() -> Result<()> {
         .bind(inactive)
         .execute(&s.pool)
         .await?;
+    let expired_grant = add_grant(&s, &a, "expired-grant").await?;
+    sqlx::query("UPDATE activation_grants SET expires_at=$1 WHERE grant_id=$2")
+        .bind(NOW)
+        .bind(expired_grant)
+        .execute(&s.pool)
+        .await?;
+    let cancelled_grant = add_grant(&s, &a, "cancelled-grant").await?;
+    sqlx::query("UPDATE activation_grants SET state='cancelled' WHERE grant_id=$1")
+        .bind(cancelled_grant)
+        .execute(&s.pool)
+        .await?;
 
     let listed = s.devices(&a, NOW).await?;
     assert_eq!(
         listed.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
         [
+            "grant-only",
             "handoff-only",
             "registration-only",
             "session-only",
@@ -240,20 +291,24 @@ async fn any_live_member_alone_lists_the_device_with_its_token() -> Result<()> {
             summary.sessions,
             summary.native_handoffs,
             summary.notification_subscriptions,
+            summary.pending_sign_ins,
             summary.sync_registered,
         );
         let expected = match device.id.as_str() {
-            "handoff-only" => (0, 1, 0, false),
-            "registration-only" => (0, 0, 0, true),
-            "session-only" => (1, 0, 0, false),
-            "subscription-only" => (0, 0, 1, false),
+            "grant-only" => (0, 0, 0, 1, false),
+            "handoff-only" => (0, 1, 0, 0, false),
+            "registration-only" => (0, 0, 0, 0, true),
+            "session-only" => (1, 0, 0, 0, false),
+            "subscription-only" => (0, 0, 1, 0, false),
             other => panic!("unexpected device {other}"),
         };
         assert_eq!(counts, expected, "{}", device.id);
         assert_eq!(device.active_sessions, summary.sessions);
     }
-    assert_eq!(listed[0].last_synced_at, None);
-    assert_eq!(listed[1].last_synced_at, Some(1));
+    let by = |name: &str| listed.iter().find(|d| d.id == name).unwrap();
+    assert_eq!(by("grant-only").last_synced_at, None);
+    assert_eq!(by("handoff-only").last_synced_at, None);
+    assert_eq!(by("registration-only").last_synced_at, Some(1));
     Ok(())
 }
 

@@ -3,7 +3,7 @@ use anyhow::{Result, anyhow, ensure};
 use sqlx::{Acquire, Any, Connection, Transaction, any::AnyPoolOptions};
 
 /// Version recorded by a freshly initialised database; the last step of `UPGRADES`.
-const SCHEMA_VERSION: i64 = 1001;
+const SCHEMA_VERSION: i64 = 1002;
 
 /// One additive, in-place step. Steps run inside `migrate()`'s serialising transaction, in
 /// order, and each must move the recorded version forward by exactly its `to`.
@@ -13,12 +13,20 @@ struct Upgrade {
     sqlite: &'static str,
     postgres: &'static str,
 }
-const UPGRADES: &[Upgrade] = &[Upgrade {
-    from: 1000,
-    to: 1001,
-    sqlite: include_str!("schema/upgrade_1001_sqlite.sql"),
-    postgres: include_str!("schema/upgrade_1001_postgres.sql"),
-}];
+const UPGRADES: &[Upgrade] = &[
+    Upgrade {
+        from: 1000,
+        to: 1001,
+        sqlite: include_str!("schema/upgrade_1001_sqlite.sql"),
+        postgres: include_str!("schema/upgrade_1001_postgres.sql"),
+    },
+    Upgrade {
+        from: 1001,
+        to: 1002,
+        sqlite: include_str!("schema/upgrade_1002_sqlite.sql"),
+        postgres: include_str!("schema/upgrade_1002_postgres.sql"),
+    },
+];
 
 impl Store {
     /// Reset delivery and login state on a restored copy, with all servers stopped.
@@ -32,6 +40,7 @@ impl Store {
             "DELETE FROM sessions",
             "DELETE FROM oidc_flows",
             "DELETE FROM native_handoffs",
+            "DELETE FROM activation_grants",
         ] {
             sqlx::query(statement).execute(&mut *tx).await?;
         }

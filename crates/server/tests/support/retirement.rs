@@ -134,17 +134,66 @@ pub(crate) async fn login(app: &Router, user: &str, device: &str) -> String {
     body["access_token"].as_str().unwrap().to_owned()
 }
 
-/// A browser login: the cookie pair to send, and the CSRF token that goes with it.
-pub(crate) async fn cookie_login(app: &Router, device: &str) -> (String, String) {
-    let (status, headers, body) = request(
+/// A fresh RFC 7636 verifier/S256-challenge pair for a BE-Q19 activation-grant attempt.
+pub(crate) fn attempt() -> (String, String) {
+    let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
+    (verifier.secret().to_owned(), challenge.as_str().to_owned())
+}
+
+/// `POST /browser-sessions`: issues a grant for `user`/`device`, no cookie. Returns the grant and
+/// the verifier that redeems it.
+pub(crate) async fn issue_grant(app: &Router, user: &str, device: &str) -> Reply {
+    let (verifier, challenge) = attempt();
+    let (status, headers, mut body) = request(
         app,
         "POST",
         "browser-sessions",
         &[("origin", ORIGIN)],
-        json!({"username":"device-alice","password":PASSWORD,"device_id":device}),
+        json!({"username":user,"password":PASSWORD,"device_id":device,"attempt_challenge":challenge}),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    if let Value::Object(map) = &mut body {
+        map.insert("verifier".into(), Value::String(verifier));
+    }
+    (status, headers, body)
+}
+
+/// `POST /browser-sessions/activate`.
+pub(crate) async fn activate(app: &Router, grant: &str, verifier: &str) -> Reply {
+    request(
+        app,
+        "POST",
+        "browser-sessions/activate",
+        &[("origin", ORIGIN)],
+        json!({"grant":grant,"verifier":verifier}),
+    )
+    .await
+}
+
+/// `POST /browser-sessions/activate/cancel`.
+pub(crate) async fn activate_cancel(app: &Router, verifier: &str) -> Reply {
+    request(
+        app,
+        "POST",
+        "browser-sessions/activate/cancel",
+        &[("origin", ORIGIN)],
+        json!({"verifier":verifier}),
+    )
+    .await
+}
+
+/// A browser login carried all the way through `activate`: the cookie pair to send, and the CSRF
+/// token that goes with it.
+pub(crate) async fn cookie_login(app: &Router, device: &str) -> (String, String) {
+    let (status, _, granted) = issue_grant(app, "device-alice", device).await;
+    assert_eq!(status, StatusCode::OK, "{granted}");
+    let (status, headers, body) = activate(
+        app,
+        granted["grant"].as_str().unwrap(),
+        granted["verifier"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     let cookie = headers["set-cookie"]
         .to_str()
         .unwrap()
@@ -350,38 +399,6 @@ pub(crate) fn spawn_native_exchange(w: &World, code: &str, verifier: &str) -> Jo
     let app = w.app.clone();
     let body = json!({"code":code,"code_verifier":verifier});
     tokio::spawn(async move { request(&app, "POST", "oidc/native/exchange", &[], body).await })
-}
-
-/// A browser OIDC flow started and approved: the callback path and the binding cookie to send.
-pub(crate) async fn browser_start(w: &World, device: &str) -> (String, String) {
-    let (status, headers, body) = request(
-        &w.app,
-        "POST",
-        "oidc/start",
-        &[("origin", ORIGIN)],
-        json!({"device_id":device,"link":false}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let url = body["authorization_url"].as_str().unwrap();
-    let code = w.provider.as_ref().unwrap().approve(url, "valid");
-    let state = url::Url::parse(url)
-        .unwrap()
-        .query_pairs()
-        .find(|(k, _)| k == "state")
-        .unwrap()
-        .1
-        .into_owned();
-    (
-        format!("oidc/callback?state={state}&code={code}"),
-        headers["set-cookie"]
-            .to_str()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
-            .to_owned(),
-    )
 }
 
 // ------------------------------------------------------------------------------- held requests

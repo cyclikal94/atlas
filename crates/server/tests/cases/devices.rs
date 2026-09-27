@@ -9,10 +9,10 @@ use serde_json::{Value, json};
 
 use crate::support::http::request;
 use crate::support::retirement::{
-    PASSWORD, RETIREMENT_FIRST, Route, assert_blocked, assert_error, assert_isolation, bearer,
-    cookie_login, device_state, id, ledger, listed, login, native_handoff, postgres, retire,
-    retirement_headers, revoke, scene, session_of, spawn_native_exchange, spawn_request, world,
-    world_with_oidc, writer_first_point,
+    PASSWORD, RETIREMENT_FIRST, Route, activate, assert_blocked, assert_error, assert_isolation,
+    bearer, cookie_login, device_state, id, issue_grant, ledger, listed, login, native_handoff,
+    postgres, retire, retirement_headers, revoke, scene, session_of, spawn_native_exchange,
+    spawn_request, world, world_with_oidc, writer_first_point,
 };
 
 /// A header-validation case: name, request headers, expected status and error code.
@@ -437,6 +437,50 @@ async fn a_device_left_with_only_a_handoff_or_subscription_stays_listed_and_reti
 
 /// (g), (i), (j), (k), (m) A keyed revocation replays after a lost response, by another session,
 /// after the target is gone, and never reports a stale outcome or a cookie.
+/// Component 4 over HTTP (BE-Q19). A device with no session, handoff or subscription — only a
+/// pending activation grant — still appears in `GET /devices`, and `forget_device` cancels it:
+/// the grant no longer activates, but the row survives as evidence for `activate/cancel`.
+#[tokio::test]
+async fn a_grant_only_device_stays_listed_and_forget_device_cancels_its_grant() -> Result<()> {
+    let w = world(true).await?;
+    let laptop = login(&w.app, "device-alice", "laptop").await;
+    let (status, _, granted) = issue_grant(&w.app, "device-alice", "phone").await;
+    assert_eq!(status, StatusCode::OK, "{granted}");
+    let grant = granted["grant"].as_str().unwrap().to_owned();
+    let verifier = granted["verifier"].as_str().unwrap().to_owned();
+
+    let entry = listed(&w.app, &laptop, "phone")
+        .await
+        .expect("a grant-only device is listed");
+    assert_eq!(entry["active_sessions"], 0);
+    assert_eq!(
+        entry["summary"],
+        json!({"sessions":0,"native_handoffs":0,"notification_subscriptions":0,"pending_sign_ins":1,"sync_registered":false})
+    );
+    let token = entry["state_token"].as_str().unwrap().to_owned();
+
+    let op = id();
+    let done = retire(&w.app, &laptop, "phone", &op, &token).await;
+    assert_eq!(
+        (done.0, &done.2["outcome"]),
+        (StatusCode::OK, &json!("confirmed_applied"))
+    );
+    assert!(!done.1.contains_key("set-cookie"));
+    assert!(listed(&w.app, &laptop, "phone").await.is_none());
+
+    let (status, _, activated) = activate(&w.app, &grant, &verifier).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{activated}");
+    let (state, cancelled_at): (String, Option<i64>) = sqlx::query_as(
+        "SELECT state,cancelled_at FROM activation_grants WHERE account_id=$1 AND device_id='phone'",
+    )
+    .bind(&w.alice)
+    .fetch_one(&w.store.pool)
+    .await?;
+    assert_eq!(state, "cancelled");
+    assert!(cancelled_at.is_some());
+    Ok(())
+}
+
 #[tokio::test]
 async fn keyed_revocation_is_recoverable_and_never_stale() -> Result<()> {
     let w = world(false).await?;

@@ -17,7 +17,6 @@ pub struct DeviceSummary {
     pub sessions: i64,
     pub native_handoffs: i64,
     pub notification_subscriptions: i64,
-    /// Always 0 until activation grants exist (BE-Q19).
     pub pending_sign_ins: i64,
     pub sync_registered: bool,
 }
@@ -51,8 +50,9 @@ struct State {
     handoffs: Vec<String>,
     /// Component 3: active `(id, version)` pairs.
     subscriptions: Vec<(String, i64)>,
-    /// Component 5: the registration's `cursor_key`, when a registration exists. Component 4
-    /// (activation grants) joins here when BE-Q19 lands.
+    /// Component 4: live `grant_id`s (BE-Q19).
+    grants: Vec<String>,
+    /// Component 5: the registration's `cursor_key`, when a registration exists.
     registration: Option<String>,
 }
 
@@ -61,6 +61,7 @@ impl State {
         self.sessions.is_empty()
             && self.handoffs.is_empty()
             && self.subscriptions.is_empty()
+            && self.grants.is_empty()
             && self.registration.is_none()
     }
 
@@ -77,6 +78,7 @@ impl State {
                 .iter()
                 .map(|(id, version)| (3, format!("{id}@{version}"))),
         );
+        lines.extend(self.grants.iter().map(|id| (4, id.clone())));
         if let Some(key) = &self.registration {
             lines.push((5, hex(&Sha256::digest(key.as_bytes()))));
         }
@@ -96,7 +98,7 @@ impl State {
             sessions: self.sessions.len() as i64,
             native_handoffs: self.handoffs.len() as i64,
             notification_subscriptions: self.subscriptions.len() as i64,
-            pending_sign_ins: 0,
+            pending_sign_ins: self.grants.len() as i64,
             sync_registered: self.registration.is_some(),
         }
     }
@@ -110,8 +112,9 @@ impl Store {
     /// The account's devices with the approved state of each, all read from one snapshot so what
     /// a confirmation dialog shows is exactly what its token covers. A device is listed when any
     /// member of its approved state exists (a sync registration, a live session, a live native
-    /// handoff or an active subscription), so every device a retirement could act on offers a
-    /// token, including one whose last session has gone.
+    /// handoff, an active subscription or a pending activation grant), so every device a
+    /// retirement could act on offers a token, including one whose only remaining state is a
+    /// pending grant.
     pub async fn devices(&self, actor: &str, now: i64) -> Result<Vec<Device>> {
         // PostgreSQL: a repeatable-read, read-only snapshot. SQLite: a deferred BEGIN whose first
         // read fixes the WAL snapshot; readers never block the writers.
@@ -121,9 +124,9 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
         }
-        // The listing set is the union of the same four member predicates the components below
-        // read (component 4 joins when BE-Q19 lands), so it can never disagree with a token.
-        let listed = sqlx::query("SELECT d.device_id,s.last_seen FROM (SELECT device_id FROM sync_devices WHERE account_id=$1 UNION SELECT device_id FROM sessions WHERE account_id=$1 AND expires_at>$2 UNION SELECT device_id FROM native_handoffs WHERE account_id=$1 AND expires_at>$2 UNION SELECT device_id FROM notification_subscriptions WHERE account_id=$1 AND active=1) d LEFT JOIN sync_devices s ON s.account_id=$1 AND s.device_id=d.device_id ORDER BY d.device_id")
+        // The listing set is the union of the same five member predicates the components below
+        // read, so it can never disagree with a token.
+        let listed = sqlx::query("SELECT d.device_id,s.last_seen FROM (SELECT device_id FROM sync_devices WHERE account_id=$1 UNION SELECT device_id FROM sessions WHERE account_id=$1 AND expires_at>$2 UNION SELECT device_id FROM native_handoffs WHERE account_id=$1 AND expires_at>$2 UNION SELECT device_id FROM notification_subscriptions WHERE account_id=$1 AND active=1 UNION SELECT device_id FROM activation_grants WHERE account_id=$1 AND state='issued' AND expires_at>$2) d LEFT JOIN sync_devices s ON s.account_id=$1 AND s.device_id=d.device_id ORDER BY d.device_id")
             .bind(actor)
             .bind(now)
             .fetch_all(&mut *tx)
@@ -168,6 +171,16 @@ impl Store {
                 .or_default()
                 .subscriptions
                 .push((row.get(1), row.get(2)));
+        }
+        for row in sqlx::query(
+            "SELECT device_id,grant_id FROM activation_grants WHERE account_id=$1 AND state='issued' AND expires_at>$2",
+        )
+        .bind(actor)
+        .bind(now)
+        .fetch_all(&mut *tx)
+        .await?
+        {
+            states.entry(row.get(0)).or_default().grants.push(row.get(1));
         }
         for row in sqlx::query("SELECT device_id,cursor_key FROM sync_devices WHERE account_id=$1")
             .bind(actor)
@@ -259,7 +272,7 @@ impl Store {
         };
         hook!(self, "retire.before_effects", &mut tx);
         if outcome == Outcome::ConfirmedApplied {
-            Self::retire_members(&mut tx, actor, device, &state).await?;
+            Self::retire_members(&mut tx, actor, device, &state, now).await?;
         }
         hook!(self, "retire.before_commit", &mut tx);
         Self::ledger_write(
@@ -301,6 +314,8 @@ impl Store {
             .iter()
             .map(|row| (row.get(0), row.get(1)))
             .collect();
+        let grants = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT grant_id FROM activation_grants WHERE account_id=$1 AND device_id=$2 AND state='issued' AND expires_at>$3 ORDER BY grant_id{lock}")))
+            .bind(actor).bind(device).bind(now).fetch_all(&mut **tx).await?;
         let registration = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT cursor_key FROM sync_devices WHERE account_id=$1 AND device_id=$2{lock}"
         )))
@@ -312,6 +327,7 @@ impl Store {
             sessions,
             handoffs,
             subscriptions,
+            grants,
             registration,
         })
     }
@@ -324,6 +340,7 @@ impl Store {
         actor: &str,
         device: &str,
         state: &State,
+        now: i64,
     ) -> Result<()> {
         Self::delete_identities(tx, "sessions", "session_id", actor, &state.sessions).await?;
         Self::delete_identities(tx, "native_handoffs", "code_hash", actor, &state.handoffs).await?;
@@ -332,6 +349,7 @@ impl Store {
                 .bind(id).bind(actor).bind(version).execute(&mut **tx).await?;
             ensure!(changed.rows_affected() == 1, ErrorCode::InternalError);
         }
+        Self::cancel_grants(tx, actor, device, &state.grants, now).await?;
         if let Some(key) = &state.registration {
             let removed = sqlx::query(
                 "DELETE FROM sync_devices WHERE account_id=$1 AND device_id=$2 AND cursor_key=$3",
@@ -375,6 +393,37 @@ impl Store {
             removed += delete.execute(&mut **tx).await?.rows_affected() as usize;
         }
         ensure!(removed == identities.len(), ErrorCode::InternalError);
+        Ok(())
+    }
+
+    /// Cancel exactly the locked `issued` grants. An `UPDATE`, not a `DELETE`, like
+    /// `delete_identities`: the row stays as evidence for a later `activate`/`activate/cancel`.
+    async fn cancel_grants(
+        tx: &mut Transaction<'_, Any>,
+        actor: &str,
+        device: &str,
+        grants: &[String],
+        now: i64,
+    ) -> Result<()> {
+        let mut cancelled = 0;
+        for chunk in grants.chunks(500) {
+            let placeholders = (0..chunk.len())
+                .map(|i| format!("${}", i + 4))
+                .collect::<Vec<_>>()
+                .join(",");
+            let statement = format!(
+                "UPDATE activation_grants SET state='cancelled',cancelled_at=$3 WHERE account_id=$1 AND device_id=$2 AND state='issued' AND grant_id IN ({placeholders})"
+            );
+            let mut update = sqlx::query(sqlx::AssertSqlSafe(statement))
+                .bind(actor)
+                .bind(device)
+                .bind(now);
+            for grant in chunk {
+                update = update.bind(grant);
+            }
+            cancelled += update.execute(&mut **tx).await?.rows_affected() as usize;
+        }
+        ensure!(cancelled == grants.len(), ErrorCode::InternalError);
         Ok(())
     }
 

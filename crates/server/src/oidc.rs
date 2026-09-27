@@ -168,6 +168,8 @@ pub(super) struct Start {
     device_id: String,
     #[serde(default)]
     link: bool,
+    attempt_id: String,
+    attempt_challenge: String,
 }
 
 pub(super) async fn start(
@@ -184,7 +186,11 @@ pub(super) async fn start(
     source_attempt(&app, peer, &headers)?;
     let Json(input) = body.map_err(|_| anyhow!(ErrorCode::MalformedRequest))?;
     ensure_api(
-        !input.device_id.is_empty() && input.device_id.len() <= 100,
+        !input.device_id.is_empty()
+            && input.device_id.len() <= 100
+            && !input.attempt_id.is_empty()
+            && input.attempt_id.len() <= 64
+            && activation::valid_challenge(&input.attempt_challenge),
         ErrorCode::InvalidValue,
     )?;
     let link_hash = if input.link {
@@ -202,7 +208,14 @@ pub(super) async fn start(
     } else {
         None
     };
-    let (jar, url) = create_flow(&app, &input.device_id, link_hash, None).await?;
+    let (jar, url) = create_flow(
+        &app,
+        &input.device_id,
+        link_hash,
+        None,
+        Some((&input.attempt_id, &input.attempt_challenge)),
+    )
+    .await?;
     Ok((jar, Json(json!({"authorization_url":url.as_str()}))).into_response())
 }
 async fn create_flow(
@@ -210,6 +223,7 @@ async fn create_flow(
     device: &str,
     link_hash: Option<String>,
     native: Option<&NativeStart>,
+    attempt: Option<(&str, &str)>,
 ) -> Result<(CookieJar, url::Url), ApiError> {
     let config = app
         .oidc
@@ -247,8 +261,8 @@ async fn create_flow(
         .fetch_one(&mut *tx)
         .await?;
     ensure_api(count < 1000, ErrorCode::RateLimited)?;
-    sqlx::query("INSERT INTO oidc_flows(state_hash,binding_hash,nonce,verifier,device_id,link_session_hash,expires_at,configuration_hash,native_redirect,native_challenge,native_state) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)")
-        .bind(digest(state.secret())).bind(digest(binding.secret())).bind(nonce.secret()).bind(verifier.secret()).bind(device).bind(link_hash).bind(now()+600).bind(config.fingerprint()).bind(native.map(|n| &n.redirect_uri)).bind(native.map(|n| &n.code_challenge)).bind(native.map(|n| &n.state)).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO oidc_flows(state_hash,binding_hash,nonce,verifier,device_id,link_session_hash,expires_at,configuration_hash,native_redirect,native_challenge,native_state,attempt_id,attempt_challenge) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)")
+        .bind(digest(state.secret())).bind(digest(binding.secret())).bind(nonce.secret()).bind(verifier.secret()).bind(device).bind(link_hash).bind(now()+600).bind(config.fingerprint()).bind(native.map(|n| &n.redirect_uri)).bind(native.map(|n| &n.code_challenge)).bind(native.map(|n| &n.state)).bind(attempt.map(|(id,_)| id)).bind(attempt.map(|(_,challenge)| challenge)).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok((
         CookieJar::new().add(binding_cookie(browser, binding.secret().clone())),
@@ -293,7 +307,7 @@ pub(super) async fn callback(
         .map_err(|_| anyhow!(ErrorCode::RateLimited))?;
     // Consuming a browser-bound state precedes network I/O; concurrent callbacks
     // cannot exchange the same code twice, including across server replicas.
-    let row = sqlx::query("DELETE FROM oidc_flows WHERE state_hash=$1 AND binding_hash=$2 AND expires_at>$3 AND configuration_hash=$4 RETURNING nonce,verifier,device_id,link_session_hash,native_redirect,native_challenge,native_state")
+    let row = sqlx::query("DELETE FROM oidc_flows WHERE state_hash=$1 AND binding_hash=$2 AND expires_at>$3 AND configuration_hash=$4 RETURNING nonce,verifier,device_id,link_session_hash,native_redirect,native_challenge,native_state,attempt_id,attempt_challenge")
         .bind(digest(&input.state)).bind(digest(binding.value())).bind(now()).bind(config.fingerprint()).fetch_optional(&app.store.pool).await?.ok_or_else(|| anyhow!(ErrorCode::Unauthenticated))?;
     ensure_api(input.error.is_none(), ErrorCode::Unauthenticated)?;
     let native: Option<String> = row.get(4);
@@ -413,17 +427,38 @@ pub(super) async fn callback(
         )
             .into_response());
     }
-    let session = sessions::issue(&mut tx, &account, &row.get::<String, _>(2), "oidc").await?;
+    // A browser callback issues a grant, not a session (BE-Q19): `attempt_challenge` is `Some`
+    // for every flow that reaches this branch, since only `native_start` ever leaves it `None`,
+    // and that flow never falls through past the `if let Some(uri) = native` return above.
+    let attempt_challenge: Option<String> = row.get(8);
+    let attempt_challenge = attempt_challenge.ok_or_else(|| anyhow!(ErrorCode::InternalError))?;
+    let attempt_id: String = row.get(7);
+    let grant = activation::issue_grant(
+        &mut tx,
+        &account,
+        &row.get::<String, _>(2),
+        "oidc",
+        &attempt_challenge,
+        now(),
+    )
+    .await?;
     tx.commit().await?;
     let mut remove = binding_cookie(browser, String::new());
     remove.make_removal();
-    // Fixed same-origin destination; no caller-selected open redirect. The API
-    // client obtains its CSRF token through the protected reload endpoint.
+    // Fixed same-origin destination; the grant/attempt/account travel in a fragment, which the
+    // server never sees and which is stripped before the SPA reads it. No caller-selected open
+    // redirect. The client obtains its CSRF token by redeeming the grant at `.../activate`.
+    // `attempt_id` is caller-supplied and only length-checked (`oidc.rs` start handler), so it may
+    // contain `&`, `=`, `+` or `%`; every value is `application/x-www-form-urlencoded` so the
+    // accepted attempt ID round-trips exactly rather than being reparsed as extra fragment keys.
+    let mut fragment = url::form_urlencoded::Serializer::new(String::new());
+    fragment
+        .append_pair("atlas_grant", &grant.grant)
+        .append_pair("atlas_attempt", &attempt_id)
+        .append_pair("atlas_account", &account);
     Ok((
-        CookieJar::new()
-            .add(browser.cookie(session.access_token))
-            .add(remove),
-        Redirect::to(&browser.origin),
+        CookieJar::new().add(remove),
+        Redirect::to(&format!("{}/#{}", browser.origin, fragment.finish())),
     )
         .into_response())
 }
@@ -470,7 +505,7 @@ pub(super) async fn native_start(
         ErrorCode::InvalidValue,
     )?;
     source_attempt(&app, peer, &headers)?;
-    let (jar, url) = create_flow(&app, &input.device_id, None, Some(&input)).await?;
+    let (jar, url) = create_flow(&app, &input.device_id, None, Some(&input), None).await?;
     Ok((jar, Redirect::to(url.as_str())).into_response())
 }
 #[derive(Deserialize)]
@@ -509,7 +544,7 @@ pub(super) async fn native_exchange(
         app.native_redirects.contains(&row.get::<String, _>(2)),
         ErrorCode::Forbidden,
     )?;
-    let session = sessions::issue(
+    let (session, _) = sessions::issue(
         &mut tx,
         &row.get::<String, _>(0),
         &row.get::<String, _>(1),

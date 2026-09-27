@@ -107,31 +107,66 @@ pub(super) fn credential(app: &App, headers: &HeaderMap) -> Result<String, ApiEr
         .unwrap_or_default();
     ensure_api(supplied.len() == 64, ErrorCode::Forbidden)?;
     // The dependency's timing-resistant-secret-traits feature uses constant-time equality.
+    // A wrong-but-well-formed token is a credential mismatch, distinct from an absent or
+    // malformed one (BE-Q19); the split lets a client tell "your cookie is stale" apart from
+    // "you sent nothing usable".
     ensure_api(
         openidconnect::CsrfToken::new(csrf(&token))
             == openidconnect::CsrfToken::new(supplied.to_owned()),
-        ErrorCode::Forbidden,
+        ErrorCode::CredentialMismatch,
     )?;
     Ok(token)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct BrowserLogin {
+    username: String,
+    password: String,
+    device_id: String,
+    attempt_challenge: String,
+}
+
+/// No session is created here (BE-Q19): a successful password check issues a grant instead, and
+/// the caller redeems it with `POST /browser-sessions/activate`, the only route that sets a
+/// cookie.
 pub(super) async fn login(
     State(app): State<App>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
-    body: Result<Json<Login>, JsonRejection>,
-) -> Result<Response, ApiError> {
+    body: Result<Json<BrowserLogin>, JsonRejection>,
+) -> Result<Json<activation::BrowserGrant>, ApiError> {
     let config = app
         .browser
         .as_ref()
         .ok_or_else(|| anyhow!(ErrorCode::NotFound))?;
     config.origin(&headers, true)?;
-    let Json(session) = super::login(State(app.clone()), peer, headers, body).await?;
-    Ok(establish(config, session))
+    let Json(input) = body.map_err(|_| anyhow!(ErrorCode::MalformedRequest))?;
+    ensure_api(
+        !input.device_id.is_empty()
+            && input.device_id.len() <= 100
+            && activation::valid_challenge(&input.attempt_challenge),
+        ErrorCode::InvalidValue,
+    )?;
+    let (mut tx, account_id) =
+        authenticate_local(&app, peer, &headers, input.username, input.password).await?;
+    let grant = activation::issue_grant(
+        &mut tx,
+        &account_id,
+        &input.device_id,
+        "local",
+        &input.attempt_challenge,
+        now(),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(grant))
 }
 
-pub(super) fn establish(config: &Config, session: SessionResponse) -> Response {
-    (CookieJar::new().add(config.cookie(session.access_token.clone())), Json(json!({"account_id":session.account_id,"expires_at":session.expires_at,"csrf_token":csrf(&session.access_token)}))).into_response()
+/// Sets the session cookie. After BE-Q19 the only caller is `activation::activate`: every other
+/// route that used to issue a browser session now issues a grant instead.
+pub(super) fn establish(config: &Config, session: SessionResponse, session_id: &str) -> Response {
+    (CookieJar::new().add(config.cookie(session.access_token.clone())), Json(json!({"account_id":session.account_id,"expires_at":session.expires_at,"csrf_token":csrf(&session.access_token),"session_id":session_id}))).into_response()
 }
 
 pub(super) async fn current(
@@ -151,7 +186,7 @@ pub(super) async fn current(
     )?;
     let token = config.token(&headers)?;
     let row = sqlx::query(
-        "SELECT account_id,expires_at FROM sessions WHERE token_hash=$1 AND expires_at>$2",
+        "SELECT account_id,expires_at,session_id FROM sessions WHERE token_hash=$1 AND expires_at>$2",
     )
     .bind(digest(&token))
     .bind(now())
@@ -160,7 +195,7 @@ pub(super) async fn current(
     .ok_or_else(|| anyhow!(ErrorCode::Unauthenticated))?;
     let expires_at: i64 = row.get(1);
     Ok(Json(
-        json!({"account_id": row.get::<String,_>(0), "expires_at": chrono::DateTime::from_timestamp(expires_at,0).ok_or_else(|| anyhow!(ErrorCode::InternalError))?.to_rfc3339_opts(chrono::SecondsFormat::Secs,true), "csrf_token": csrf(&token)}),
+        json!({"account_id": row.get::<String,_>(0), "expires_at": chrono::DateTime::from_timestamp(expires_at,0).ok_or_else(|| anyhow!(ErrorCode::InternalError))?.to_rfc3339_opts(chrono::SecondsFormat::Secs,true), "csrf_token": csrf(&token), "session_id": row.get::<String,_>(2)}),
     ))
 }
 

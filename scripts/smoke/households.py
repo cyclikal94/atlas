@@ -1,8 +1,16 @@
+import base64
 import datetime
+import hashlib
 import json
 import time
 import uuid
 from jsonschema import Draft202012Validator, FormatChecker
+
+def _verifier():
+    """A fresh RFC 7636 verifier and its S256 challenge (BE-Q19 activation grants)."""
+    verifier = uuid.uuid4().hex + uuid.uuid4().hex
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b'=').decode()
+    return verifier, challenge
 
 def run(call, accounts, tokens, secrets, person, field):
     household = str(uuid.uuid4())
@@ -59,8 +67,15 @@ def run(call, accounts, tokens, secrets, person, field):
     preview = call('POST', '/api/experimental/v1/registration/preview', body={'token':signup['token']})
     if preview['household']['id'] != household:
         raise RuntimeError('Signup preview named the wrong household')
-    registered = call('POST', '/api/experimental/v1/browser-registration', body={
-        'token':signup['token'],'username':'charlie','password':secrets[0],'device_id':'browser'},
+    verifier, challenge = _verifier()
+    granted = call('POST', '/api/experimental/v1/browser-registration', body={
+        'token':signup['token'],'username':'charlie','password':secrets[0],'device_id':'browser',
+        'attempt_challenge':challenge},
+        extra_headers={'Origin':'https://atlas.example'})
+    if 'set-cookie' in call.last_headers:
+        raise RuntimeError('browser-registration set a cookie')
+    registered = call('POST', '/api/experimental/v1/browser-sessions/activate', body={
+        'grant':granted['grant'],'verifier':verifier},
         extra_headers={'Origin':'https://atlas.example'})
     secrets.append(registered['csrf_token'])
     secrets.append(call.last_headers['set-cookie'].split(';')[0].split('=',1)[1])
@@ -69,8 +84,15 @@ def run(call, accounts, tokens, secrets, person, field):
     unused = call('POST', '/api/experimental/v1/account-invitations', tokens['alice'], {'household_id':household})
     secrets.append(unused['token'])
     call('DELETE', '/api/experimental/v1/account-invitations/'+unused['id'], tokens['alice'], expected=204)
-    browser = call('POST', '/api/experimental/v1/browser-sessions', body={
-        'username':'alice','password':secrets[0],'device_id':'browser'},
+    verifier, challenge = _verifier()
+    grant = call('POST', '/api/experimental/v1/browser-sessions', body={
+        'username':'alice','password':secrets[0],'device_id':'browser',
+        'attempt_challenge':challenge},
+        extra_headers={'Origin':'https://atlas.example'})
+    if 'set-cookie' in call.last_headers:
+        raise RuntimeError('browser-sessions login set a cookie')
+    browser = call('POST', '/api/experimental/v1/browser-sessions/activate', body={
+        'grant':grant['grant'],'verifier':verifier},
         extra_headers={'Origin':'https://atlas.example'})
     cookie = call.last_headers['set-cookie'].split(';')[0]
     secrets.extend([cookie.split('=',1)[1], browser['csrf_token']])

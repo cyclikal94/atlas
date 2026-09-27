@@ -2,12 +2,15 @@ use super::*;
 use atlas_core::error::ErrorCode;
 use sqlx::{Any, Transaction};
 
+/// Returns the issued session and its `session_id` (BE-Q19): every caller but
+/// `activation::activate` discards the ID, which exists so `activate` can report it without a
+/// second read.
 pub(super) async fn issue(
     tx: &mut Transaction<'_, Any>,
     account: &str,
     device: &str,
     kind: &str,
-) -> Result<SessionResponse, ApiError> {
+) -> Result<(SessionResponse, String), ApiError> {
     let created = now();
     sqlx::query("DELETE FROM sessions WHERE account_id=$1 AND expires_at<=$2")
         .bind(account)
@@ -20,14 +23,18 @@ pub(super) async fn issue(
         .await?;
     ensure_api(count < 32, ErrorCode::DeviceCapacity)?;
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let session_id = Uuid::new_v4().to_string();
     let expires_at = created + 86400;
     sqlx::query("INSERT INTO sessions(token_hash,account_id,device_id,expires_at,session_id,created_at,auth_kind) VALUES ($1,$2,$3,$4,$5,$6,$7)")
-        .bind(digest(&token)).bind(account).bind(device).bind(expires_at).bind(Uuid::new_v4().to_string()).bind(created).bind(kind).execute(&mut **tx).await?;
-    Ok(SessionResponse {
-        access_token: token,
-        account_id: account.to_owned(),
-        expires_at: timestamp(expires_at)?,
-    })
+        .bind(digest(&token)).bind(account).bind(device).bind(expires_at).bind(&session_id).bind(created).bind(kind).execute(&mut **tx).await?;
+    Ok((
+        SessionResponse {
+            access_token: token,
+            account_id: account.to_owned(),
+            expires_at: timestamp(expires_at)?,
+        },
+        session_id,
+    ))
 }
 fn timestamp(seconds: i64) -> Result<String, ApiError> {
     Ok(chrono::DateTime::from_timestamp(seconds, 0)
@@ -181,9 +188,18 @@ pub(super) async fn change_password(
         .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM sessions WHERE account_id=$1")
-        .bind(account)
+        .bind(&account)
         .execute(&mut *tx)
         .await?;
+    // A grant minted with a password that has since changed must not still be activatable
+    // (BE-Q19 item 7); `redeemed` rows are left alone as evidence for `activate/cancel`.
+    sqlx::query(
+        "UPDATE activation_grants SET state='cancelled',cancelled_at=$1 WHERE account_id=$2 AND state='issued'",
+    )
+    .bind(now())
+    .bind(&account)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -203,9 +219,16 @@ pub async fn reset_password(store: &Store, username: &str, password_hash: &str) 
         .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM sessions WHERE account_id=$1")
-        .bind(account)
+        .bind(&account)
         .execute(&mut *tx)
         .await?;
+    sqlx::query(
+        "UPDATE activation_grants SET state='cancelled',cancelled_at=$1 WHERE account_id=$2 AND state='issued'",
+    )
+    .bind(now())
+    .bind(&account)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -264,6 +287,13 @@ pub(super) async fn unlink_oidc(
         .bind(&account)
         .execute(&mut *tx)
         .await?;
+    sqlx::query(
+        "UPDATE activation_grants SET state='cancelled',cancelled_at=$1 WHERE account_id=$2 AND state='issued'",
+    )
+    .bind(now())
+    .bind(&account)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }

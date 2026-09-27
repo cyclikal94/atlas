@@ -72,6 +72,17 @@ pub(crate) async fn expected_token(
     {
         lines.push((3, format!("{subscription}@{version}")));
     }
+    for grant in sqlx::query_scalar::<_, String>(
+        "SELECT grant_id FROM activation_grants WHERE account_id=$1 AND device_id=$2 AND state='issued' AND expires_at>$3",
+    )
+    .bind(actor)
+    .bind(device)
+    .bind(now)
+    .fetch_all(&store.pool)
+    .await?
+    {
+        lines.push((4, grant));
+    }
     if let Some(key) = sqlx::query_scalar::<_, String>(
         "SELECT cursor_key FROM sync_devices WHERE account_id=$1 AND device_id=$2",
     )
@@ -143,6 +154,22 @@ pub(crate) async fn add_subscription(store: &Store, actor: &str, device: &str) -
     Ok(subscription)
 }
 
+/// A raw, `issued`, unexpired activation grant (BE-Q19 component 4). No server writer exists in
+/// this crate, so tests simulate one directly, exactly as they already do for the other members.
+pub(crate) async fn add_grant(store: &Store, actor: &str, device: &str) -> Result<String> {
+    let grant_id = id();
+    sqlx::query("INSERT INTO activation_grants(grant_hash,grant_id,account_id,device_id,auth_kind,challenge_hash,state,failed_verifiers,created_at,expires_at) VALUES ($1,$2,$3,$4,'local',$5,'issued',0,1,$6)")
+        .bind(id())
+        .bind(&grant_id)
+        .bind(actor)
+        .bind(device)
+        .bind(id())
+        .bind(FAR)
+        .execute(&store.pool)
+        .await?;
+    Ok(grant_id)
+}
+
 pub(crate) async fn add_registration(store: &Store, actor: &str, device: &str) -> Result<String> {
     let key = id();
     sqlx::query(
@@ -164,6 +191,9 @@ pub(crate) struct Snapshot {
     pub(crate) subscriptions: Vec<(String, i64, i64, String)>,
     pub(crate) registrations: Vec<String>,
     pub(crate) cursors: i64,
+    /// Every grant row's `(grant_id, state)`, regardless of liveness (BE-Q19): terminal rows are
+    /// evidence, not churn, so an equality check must see them too.
+    pub(crate) grants: Vec<(String, String)>,
 }
 
 pub(crate) async fn snapshot(store: &Store, actor: &str, device: &str) -> Result<Snapshot> {
@@ -185,6 +215,8 @@ pub(crate) async fn snapshot(store: &Store, actor: &str, device: &str) -> Result
         registrations: list("SELECT cursor_key FROM sync_devices WHERE account_id=$1 AND device_id=$2").await?,
         cursors: sqlx::query_scalar("SELECT COUNT(*) FROM sync_cursors WHERE account_id=$1 AND device_id=$2")
             .bind(actor).bind(device).fetch_one(&store.pool).await?,
+        grants: sqlx::query_as::<_, (String, String)>("SELECT grant_id,state FROM activation_grants WHERE account_id=$1 AND device_id=$2 ORDER BY grant_id")
+            .bind(actor).bind(device).fetch_all(&store.pool).await?,
     })
 }
 
@@ -228,6 +260,7 @@ pub(crate) async fn clear(store: &Store, actor: &str, device: &str) -> Result<()
         "DELETE FROM sessions WHERE account_id=$1 AND device_id=$2",
         "DELETE FROM native_handoffs WHERE account_id=$1 AND device_id=$2",
         "DELETE FROM notification_subscriptions WHERE account_id=$1 AND device_id=$2",
+        "DELETE FROM activation_grants WHERE account_id=$1 AND device_id=$2",
         "DELETE FROM sync_cursors WHERE account_id=$1 AND device_id=$2",
         "DELETE FROM sync_devices WHERE account_id=$1 AND device_id=$2",
     ] {

@@ -44,23 +44,32 @@ async fn call(
         },
     )
 }
+/// `(callback_path, binding_cookie, attempt_id, verifier)`: `attempt_id`/`verifier` are the
+/// caller's own BE-Q19 activation-grant attempt, threaded through so a test can redeem the grant
+/// the callback eventually issues. `attempt_id` is a fresh UUID unless the caller supplies one
+/// (to exercise the accepted-but-unusual-character shape, e.g. reserved fragment bytes).
 async fn begin(
     app: &Router,
     provider: &Provider,
     mode: &str,
     link: Option<&str>,
-) -> (String, String) {
+    attempt_id: Option<&str>,
+) -> (String, String, String, String) {
     let mut headers = vec![("origin", "https://atlas.example")];
     let auth = link.map(|t| format!("Bearer {t}"));
     if let Some(auth) = &auth {
         headers.push(("authorization", auth));
     }
+    let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
+    let attempt_id = attempt_id
+        .map(str::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let (status, headers, body) = call(
         app,
         "POST",
         "oidc/start",
         &headers,
-        json!({"device_id":"browser","link":link.is_some()}),
+        json!({"device_id":"browser","link":link.is_some(),"attempt_id":attempt_id,"attempt_challenge":challenge.as_str()}),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -88,7 +97,20 @@ async fn begin(
             .next()
             .unwrap()
             .to_owned(),
+        attempt_id,
+        verifier.secret().to_owned(),
     )
+}
+
+/// The `#key=value&...` pairs of a redirect's fragment (BE-Q19's grant/attempt/account carrier),
+/// decoded as `application/x-www-form-urlencoded` to match how the server writes it.
+fn fragment(location: &str) -> HashMap<String, String> {
+    let (_, frag) = location
+        .split_once('#')
+        .unwrap_or_else(|| panic!("no fragment in {location}"));
+    url::form_urlencoded::parse(frag.as_bytes())
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect()
 }
 
 async fn scenario() -> anyhow::Result<()> {
@@ -127,7 +149,7 @@ async fn scenario() -> anyhow::Result<()> {
         "signature",
         "access_hash",
     ] {
-        let (path, cookie) = begin(&app, &provider, mode, Some(bearer)).await;
+        let (path, cookie, _, _) = begin(&app, &provider, mode, Some(bearer), None).await;
         assert_eq!(
             call(&app, "GET", &path, &[("cookie", &cookie)], Value::Null)
                 .await
@@ -136,7 +158,7 @@ async fn scenario() -> anyhow::Result<()> {
             "{mode}"
         );
     }
-    let (path, cookie) = begin(&app, &provider, "valid", None).await;
+    let (path, cookie, _, _) = begin(&app, &provider, "valid", None, None).await;
     assert_eq!(
         call(&app, "GET", &path, &[("cookie", &cookie)], Value::Null)
             .await
@@ -144,32 +166,54 @@ async fn scenario() -> anyhow::Result<()> {
         StatusCode::FORBIDDEN,
         "unknown subjects must not auto-link"
     );
-    let (path, cookie) = begin(&app, &provider, "valid", Some(bearer)).await;
+    let (path, cookie, attempt_id, verifier) =
+        begin(&app, &provider, "valid", Some(bearer), None).await;
     assert_eq!(
         call(&app, "GET", &path, &[], Value::Null).await.0,
         StatusCode::UNAUTHORIZED
     );
     let (status, headers, _) = call(&app, "GET", &path, &[("cookie", &cookie)], Value::Null).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    assert_eq!(headers["location"], "https://atlas.example");
+    // BE-Q19: a browser callback issues a grant and sets no session cookie; only the OIDC
+    // binding cookie is cleared (matching the native flow's own removal-only assertion below).
+    assert!(!headers["set-cookie"].to_str()?.contains("atlas_session"));
+    let redirect = headers["location"].to_str()?.to_owned();
+    assert!(redirect.starts_with("https://atlas.example/#"));
+    let sent = fragment(&redirect);
+    assert_eq!(
+        sent["atlas_account"], account,
+        "check (g): the linked account"
+    );
+    assert_eq!(sent["atlas_attempt"], attempt_id);
+    let (status, _, activated) = call(
+        &app,
+        "POST",
+        "browser-sessions/activate",
+        &[("origin", "https://atlas.example")],
+        json!({"grant":sent["atlas_grant"],"verifier":verifier}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{activated}");
+    assert_eq!(activated["account_id"], account);
     assert_eq!(
         call(&app, "GET", &path, &[("cookie", &cookie)], Value::Null)
             .await
             .0,
-        StatusCode::UNAUTHORIZED
+        StatusCode::UNAUTHORIZED,
+        "the flow row is consumed exactly once"
     );
     let mapped: String = sqlx::query_scalar("SELECT account_id FROM external_identities")
         .fetch_one(&store.pool)
         .await?;
     assert_eq!(mapped, account);
-    let (path, cookie) = begin(&app, &provider, "valid", None).await;
+    let (path, cookie, _, _) = begin(&app, &provider, "valid", None, None).await;
     assert_eq!(
         call(&app, "GET", &path, &[("cookie", &cookie)], Value::Null)
             .await
             .0,
         StatusCode::SEE_OTHER
     );
-    let (path, cookie) = begin(&app, &provider, "valid", Some(bearer)).await;
+    let (path, cookie, _, _) = begin(&app, &provider, "valid", Some(bearer), None).await;
     call(
         &app,
         "DELETE",
@@ -276,14 +320,25 @@ async fn scenario() -> anyhow::Result<()> {
         .public_origin("https://atlas.example")?
         .oidc(&provider.issuer, "atlas-test", None, true)?
         .router();
-    let (path, cookie) = begin(&auto, &provider, "new_subject", None).await;
+    let (path, cookie, attempt_id, verifier) =
+        begin(&auto, &provider, "new_subject", None, None).await;
     let (status, headers, _) = call(&auto, "GET", &path, &[("cookie", &cookie)], Value::Null).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
-    let session_cookie = headers
-        .get_all("set-cookie")
-        .iter()
-        .map(|v| v.to_str().unwrap())
-        .find(|v| v.starts_with("__Host-atlas_session="))
+    assert!(!headers["set-cookie"].to_str()?.contains("atlas_session"));
+    let sent = fragment(headers["location"].to_str()?);
+    assert_eq!(sent["atlas_attempt"], attempt_id);
+    let (status, headers, activated) = call(
+        &auto,
+        "POST",
+        "browser-sessions/activate",
+        &[("origin", "https://atlas.example")],
+        json!({"grant":sent["atlas_grant"],"verifier":verifier}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{activated}");
+    assert_eq!(activated["account_id"], sent["atlas_account"]);
+    let session_cookie = headers["set-cookie"]
+        .to_str()
         .unwrap()
         .split(';')
         .next()
@@ -325,6 +380,18 @@ async fn scenario() -> anyhow::Result<()> {
     )
     .await;
     let bearer = format!("Bearer {}", fresh["access_token"].as_str().unwrap());
+    // An `issued` grant for the account is cancelled by unlink, same as any other account-wide
+    // session revocation (BE-Q19 item 7).
+    let (challenge, _) = PkceCodeChallenge::new_random_sha256();
+    let (status, _, granted) = call(
+        &app,
+        "POST",
+        "browser-sessions",
+        &[("origin", "https://atlas.example")],
+        json!({"username":"alice","password":"oidc-link-password","device_id":"unlink-grant","attempt_challenge":challenge.as_str()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{granted}");
     let (status, headers, _) = call(
         &app,
         "DELETE",
@@ -336,6 +403,13 @@ async fn scenario() -> anyhow::Result<()> {
     assert_eq!(status, StatusCode::NO_CONTENT);
     // A self-revoking response never pushes a cookie decision made from state read earlier.
     assert!(!headers.contains_key("set-cookie"));
+    let state: String = sqlx::query_scalar(
+        "SELECT state FROM activation_grants WHERE account_id=$1 AND device_id='unlink-grant'",
+    )
+    .bind(&account)
+    .fetch_one(&store.pool)
+    .await?;
+    assert_eq!(state, "cancelled", "unlink_oidc cancels an issued grant");
     assert_eq!(
         call(
             &app,
@@ -362,4 +436,46 @@ async fn scenario() -> anyhow::Result<()> {
 #[tokio::test]
 async fn oidc_validates_tokens_binding_replay_and_explicit_linking() -> anyhow::Result<()> {
     scenario().await
+}
+
+/// `attempt_id` is caller-supplied and only length-checked (non-empty, <=64 bytes), so it may
+/// contain reserved `application/x-www-form-urlencoded` bytes. Round-trip through the real start
+/// and callback routes, not just a unit check on the encoder, for reserved characters and the
+/// documented upper limit.
+#[tokio::test]
+async fn oidc_attempt_id_round_trips_reserved_characters() -> anyhow::Result<()> {
+    let (provider, server) = crate::support::oidc::serve().await?;
+    let (_dir, database) = crate::support::database::database_url().await?;
+    let store = Store::connect(&database).await?;
+    store.migrate().await?;
+    let app = App::new(store.clone())
+        .await?
+        .public_origin("https://atlas.example")?
+        .oidc(&provider.issuer, "atlas-test", None, true)?
+        .router();
+    for attempt_id in [
+        "alpha&extra=beta+gamma",
+        "100% done",
+        "x".repeat(64).as_str(),
+    ] {
+        let (path, cookie, _, verifier) =
+            begin(&app, &provider, "new_subject", None, Some(attempt_id)).await;
+        let (status, headers, _) =
+            call(&app, "GET", &path, &[("cookie", &cookie)], Value::Null).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        let sent = fragment(headers["location"].to_str()?);
+        assert_eq!(sent["atlas_attempt"], attempt_id, "{attempt_id:?}");
+        let (status, _, activated) = call(
+            &app,
+            "POST",
+            "browser-sessions/activate",
+            &[("origin", "https://atlas.example")],
+            json!({"grant":sent["atlas_grant"],"verifier":verifier}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{attempt_id:?}: {activated}");
+    }
+    server.abort();
+    let _ = server.await;
+    Ok(())
 }

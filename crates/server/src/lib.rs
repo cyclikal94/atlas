@@ -22,6 +22,7 @@ use resource_routes::{access_commands, commands, sync};
 mod app;
 mod error;
 pub use error::ApiError;
+mod activation;
 mod browser;
 mod sessions;
 pub use sessions::reset_password;
@@ -54,7 +55,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use sqlx::Row;
+use sqlx::{Any, Row, Transaction};
 use std::{
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
@@ -180,17 +181,38 @@ async fn login(
 ) -> Result<Json<SessionResponse>, ApiError> {
     let Json(input) = body.map_err(|_| anyhow!(ErrorCode::MalformedRequest))?;
     ensure_api(
-        !input.device_id.is_empty()
-            && input.device_id.len() <= 100
-            && input.username.len() <= 100
-            && input.password.len() <= 1024,
+        !input.device_id.is_empty() && input.device_id.len() <= 100,
         ErrorCode::InvalidValue,
     )?;
-    source_attempt(&app, peer, &headers)?;
+    let (mut tx, account_id) =
+        authenticate_local(&app, peer, &headers, input.username, input.password).await?;
+    let (session, _) = sessions::issue(&mut tx, &account_id, &input.device_id, "local").await?;
+    tx.commit().await?;
+    Ok(Json(session))
+}
+
+/// The password-authentication sequence shared by native and browser login (BE-Q19): source
+/// throttling, the indexed lookup, the principal budget, the blocking Argon2 verify against a
+/// dummy hash for an unknown username, and the in-transaction "password still unchanged" recheck.
+/// Returns the transaction already open inside `begin_serial()`, ready for the caller to issue
+/// either a native session or a browser grant and commit; neither the device ID nor the
+/// authentication kind is this sequence's concern.
+async fn authenticate_local(
+    app: &App,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: &HeaderMap,
+    username: String,
+    password: String,
+) -> Result<(Transaction<'static, Any>, String), ApiError> {
+    ensure_api(
+        username.len() <= 100 && password.len() <= 1024,
+        ErrorCode::InvalidValue,
+    )?;
+    source_attempt(app, peer, headers)?;
     // Source admission precedes this indexed lookup. Unknown names never occupy
     // the registered-account budget, nor evict an existing account's attempts.
     let row = sqlx::query("SELECT id,password_hash FROM accounts WHERE username=$1")
-        .bind(&input.username)
+        .bind(&username)
         .fetch_optional(&app.store.pool)
         .await?;
     let seconds = app.started.elapsed().as_secs();
@@ -201,7 +223,7 @@ async fn login(
         // names without making their cardinality a registered-user lockout vector.
         (
             &app.unknown_principal_budget,
-            digest(&input.username)[..3].to_owned(),
+            digest(&username)[..3].to_owned(),
         )
     };
     ensure_api(
@@ -221,7 +243,7 @@ async fn login(
         let _permit = permit;
         PasswordHash::new(&hash).is_ok_and(|h| {
             Argon2::default()
-                .verify_password(input.password.as_bytes(), &h)
+                .verify_password(password.as_bytes(), &h)
                 .is_ok()
         })
     })
@@ -241,9 +263,7 @@ async fn login(
             .fetch_one(&mut *tx)
             .await?;
     ensure_api(unchanged == 1, ErrorCode::Unauthenticated)?;
-    let session = sessions::issue(&mut tx, &account_id, &input.device_id, "local").await?;
-    tx.commit().await?;
-    Ok(Json(session))
+    Ok((tx, account_id))
 }
 
 fn ensure_api(condition: bool, code: ErrorCode) -> Result<(), ApiError> {

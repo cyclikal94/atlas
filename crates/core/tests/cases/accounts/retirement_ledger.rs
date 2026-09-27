@@ -8,8 +8,8 @@ use atlas_core::{
 };
 
 use crate::support::devices::{
-    FAR, add_handoff, add_registration, add_session, add_subscription, clear, expected_token, id,
-    ledger_rows, populate, snapshot,
+    FAR, add_grant, add_handoff, add_registration, add_session, add_subscription, clear,
+    expected_token, id, ledger_rows, populate, snapshot,
 };
 use crate::support::resource_commands::{account, fixture};
 use crate::support::schedule::{assert_isolation, postgres};
@@ -231,6 +231,9 @@ async fn an_empty_device_is_superseded_not_stale() -> Result<()> {
     let (_d, s) = fixture().await?;
     let a = account(&s).await?;
     populate(&s, &a, PHONE).await?;
+    // BE-Q19: the empty-state rule holds the same way when a grant is one of the members two
+    // distinct retirement IDs act on.
+    add_grant(&s, &a, PHONE).await?;
     let token = expected_token(&s, &a, PHONE, NOW).await?;
     let first = id();
     assert_eq!(
@@ -299,6 +302,26 @@ async fn any_component_change_is_stale_and_changes_nothing() -> Result<()> {
                 Ok(())
             })
         }),
+        ("grant issued (BE-Q19)", |s, a| {
+            Box::pin(async move {
+                add_grant(s, a, PHONE).await?;
+                Ok(())
+            })
+        }),
+        (
+            "grant redeemed and a session added (BE-Q19, check r)",
+            |s, a| {
+                Box::pin(async move {
+                    let grant = add_grant(s, a, PHONE).await?;
+                    add_session(s, a, PHONE, FAR).await?;
+                    sqlx::query("UPDATE activation_grants SET state='redeemed' WHERE grant_id=$1")
+                        .bind(grant)
+                        .execute(&s.pool)
+                        .await?;
+                    Ok(())
+                })
+            },
+        ),
         ("registration replaced", |s, a| {
             Box::pin(async move {
                 sqlx::query("UPDATE sync_devices SET cursor_key='replacement' WHERE account_id=$1 AND device_id='phone'")
@@ -405,6 +428,84 @@ async fn partial_removal_is_stale_and_total_removal_is_superseded() -> Result<()
         retire_with(&s, &a, &id(), &token).await?.outcome,
         Outcome::Superseded
     );
+    Ok(())
+}
+
+/// (u), extended to grants (BE-Q19): a device left with only a pending grant, after everything
+/// else is removed, is `rejected_stale` against the full-state token, not `superseded` — the
+/// grant alone is still a member. Cancelling it too finally empties the state.
+#[tokio::test]
+async fn a_grant_left_behind_is_stale_not_superseded() -> Result<()> {
+    let (_d, s) = fixture().await?;
+    let a = account(&s).await?;
+    populate(&s, &a, PHONE).await?;
+    add_grant(&s, &a, PHONE).await?;
+    let token = expected_token(&s, &a, PHONE, NOW).await?;
+    for sql in [
+        "DELETE FROM sessions WHERE account_id=$1 AND device_id=$2",
+        "DELETE FROM native_handoffs WHERE account_id=$1 AND device_id=$2",
+        "DELETE FROM notification_subscriptions WHERE account_id=$1 AND device_id=$2",
+        "DELETE FROM sync_devices WHERE account_id=$1 AND device_id=$2",
+    ] {
+        sqlx::query(sql)
+            .bind(&a)
+            .bind(PHONE)
+            .execute(&s.pool)
+            .await?;
+    }
+    assert_eq!(
+        retire_with(&s, &a, &id(), &token).await?.outcome,
+        Outcome::RejectedStale,
+        "the grant alone is still a member"
+    );
+    sqlx::query(
+        "UPDATE activation_grants SET state='cancelled' WHERE account_id=$1 AND device_id=$2",
+    )
+    .bind(&a)
+    .bind(PHONE)
+    .execute(&s.pool)
+    .await?;
+    assert_eq!(
+        retire_with(&s, &a, &id(), &token).await?.outcome,
+        Outcome::Superseded
+    );
+    Ok(())
+}
+
+/// (o), extended to grants (BE-Q19): retirement cancels exactly the device's `issued` grants and
+/// leaves `redeemed`/`cancelled` rows untouched — evidence for a later `activate`/`activate/cancel`.
+#[tokio::test]
+async fn forget_device_cancels_issued_grants_and_leaves_terminal_ones() -> Result<()> {
+    let (_d, s) = fixture().await?;
+    let a = account(&s).await?;
+    add_session(&s, &a, PHONE, FAR).await?;
+    let issued = add_grant(&s, &a, PHONE).await?;
+    let redeemed = add_grant(&s, &a, PHONE).await?;
+    sqlx::query("UPDATE activation_grants SET state='redeemed' WHERE grant_id=$1")
+        .bind(&redeemed)
+        .execute(&s.pool)
+        .await?;
+    let already_cancelled = add_grant(&s, &a, PHONE).await?;
+    sqlx::query("UPDATE activation_grants SET state='cancelled' WHERE grant_id=$1")
+        .bind(&already_cancelled)
+        .execute(&s.pool)
+        .await?;
+    let token = expected_token(&s, &a, PHONE, NOW).await?;
+    assert_eq!(
+        retire_with(&s, &a, &id(), &token).await?.outcome,
+        Outcome::ConfirmedApplied
+    );
+    let states: Vec<(String, String)> = sqlx::query_as(
+        "SELECT grant_id,state FROM activation_grants WHERE account_id=$1 AND device_id=$2 ORDER BY grant_id",
+    )
+    .bind(&a)
+    .bind(PHONE)
+    .fetch_all(&s.pool)
+    .await?;
+    let state_of = |id: &str| states.iter().find(|(g, _)| g == id).unwrap().1.clone();
+    assert_eq!(state_of(&issued), "cancelled");
+    assert_eq!(state_of(&redeemed), "redeemed");
+    assert_eq!(state_of(&already_cancelled), "cancelled");
     Ok(())
 }
 
