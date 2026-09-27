@@ -167,7 +167,7 @@ fn inventory() -> Vec<Entry> {
             "retire_members",
             "UPDATE",
             "notification_subscriptions",
-            1,
+            2,
             Serial,
             None,
         ),

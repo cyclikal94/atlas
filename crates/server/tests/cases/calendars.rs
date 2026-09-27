@@ -96,3 +96,144 @@ async fn http_calendar_import_replay_and_privacy() -> Result<()> {
     assert_eq!(caps.1["native_local"], true);
     Ok(())
 }
+/// BE-Q22: `configure_source` against the real router, a real store and real encryption —
+/// omitting `connection` preserves the sealed value, `disconnect: true` clears it, an
+/// explicit `connection` still replaces it, and sending both is rejected. The allow-listed
+/// loopback origin resolves via DNS with no listener needed: `configure_source` never calls
+/// `fetch()`, only `refresh_link`/`import_text` do.
+#[tokio::test]
+async fn http_calendar_configure_source_connection_semantics() -> Result<()> {
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let store = Store::connect(&url).await?;
+    store.migrate().await?;
+    let actor = id();
+    store
+        .add_account(
+            &actor,
+            "calendar-configure-user",
+            &hash_password("calendar-configure-password-123".into()).await?,
+        )
+        .await?;
+    let key = "04".repeat(32);
+    let origin = "http://127.0.0.1:59999".to_string();
+    let app = App::new(store.clone())
+        .await?
+        .integration_config(IntegrationConfig::new(
+            Some(&key),
+            vec![origin.clone()],
+            None,
+            None,
+        )?)
+        .router();
+    let (status, login) = call(
+        &app,
+        "sessions",
+        None,
+        None,
+        Some(
+            json!({"username":"calendar-configure-user","password":"calendar-configure-password-123","device_id":"phone"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let token = login["access_token"].as_str().unwrap();
+    let bearer_secret = "super-secret-bearer-token";
+
+    let source = id();
+    let create = json!({"command":{"kind":"create_source","id":source,"label":"Calendar","timezone":"UTC",
+        "connection":{"url":format!("{origin}/feed"),"bearer":bearer_secret}}});
+    let created = call(
+        &app,
+        "calendar-commands",
+        Some(token),
+        Some(&id()),
+        Some(create),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::OK, "{:?}", created.1);
+    assert!(!created.1.to_string().contains(bearer_secret));
+
+    let stored_after_create: Option<String> =
+        sqlx::query_scalar("SELECT connection FROM calendar_sources WHERE id=$1")
+            .bind(&source)
+            .fetch_one(&store.pool)
+            .await?;
+    let sealed = stored_after_create.expect("connection sealed at creation");
+
+    // Omitting `connection` on a credential-free edit (timezone-only) preserves it exactly.
+    let omitted = json!({"command":{"kind":"configure_source","id":source,"expected_version":2,
+        "timezone":"Europe/London","enabled":true}});
+    let omitted_reply = call(
+        &app,
+        "calendar-commands",
+        Some(token),
+        Some(&id()),
+        Some(omitted),
+    )
+    .await;
+    assert_eq!(omitted_reply.0, StatusCode::OK, "{:?}", omitted_reply.1);
+    assert!(!omitted_reply.1.to_string().contains(bearer_secret));
+    let stored_after_omit: Option<String> =
+        sqlx::query_scalar("SELECT connection FROM calendar_sources WHERE id=$1")
+            .bind(&source)
+            .fetch_one(&store.pool)
+            .await?;
+    assert_eq!(
+        stored_after_omit,
+        Some(sealed.clone()),
+        "omission must preserve the sealed connection unchanged"
+    );
+
+    // Sending both `connection` and `disconnect: true` is rejected, with no state change.
+    let contradiction = json!({"command":{"kind":"configure_source","id":source,"expected_version":3,
+        "timezone":"UTC","connection":{"url":format!("{origin}/feed"),"bearer":"other-secret"},
+        "disconnect":true,"enabled":true}});
+    let contradiction_reply = call(
+        &app,
+        "calendar-commands",
+        Some(token),
+        Some(&id()),
+        Some(contradiction),
+    )
+    .await;
+    assert_eq!(
+        contradiction_reply.0,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{:?}",
+        contradiction_reply.1
+    );
+    assert_eq!(contradiction_reply.1["code"], "invalid_value");
+    assert!(!contradiction_reply.1.to_string().contains("other-secret"));
+    let stored_after_contradiction: Option<String> =
+        sqlx::query_scalar("SELECT connection FROM calendar_sources WHERE id=$1")
+            .bind(&source)
+            .fetch_one(&store.pool)
+            .await?;
+    assert_eq!(stored_after_contradiction, Some(sealed));
+
+    // Explicit `disconnect: true` clears the stored connection.
+    let disconnect = json!({"command":{"kind":"configure_source","id":source,"expected_version":3,
+        "timezone":"UTC","disconnect":true,"enabled":true}});
+    let disconnect_reply = call(
+        &app,
+        "calendar-commands",
+        Some(token),
+        Some(&id()),
+        Some(disconnect),
+    )
+    .await;
+    assert_eq!(
+        disconnect_reply.0,
+        StatusCode::OK,
+        "{:?}",
+        disconnect_reply.1
+    );
+    let stored_after_disconnect: Option<String> =
+        sqlx::query_scalar("SELECT connection FROM calendar_sources WHERE id=$1")
+            .bind(&source)
+            .fetch_one(&store.pool)
+            .await?;
+    assert_eq!(stored_after_disconnect, None);
+
+    Ok(())
+}

@@ -154,6 +154,21 @@ pub(crate) async fn add_subscription(store: &Store, actor: &str, device: &str) -
     Ok(subscription)
 }
 
+/// An inactive subscription that still holds a secret: the CH2 shape, reachable via
+/// `SetSubscription{enabled:false, secret:...}`, which is not itself changed by this fix.
+pub(crate) async fn add_inactive_subscription_with_secret(
+    store: &Store,
+    actor: &str,
+    device: &str,
+    secret: &str,
+) -> Result<String> {
+    let subscription = id();
+    sqlx::query("INSERT INTO notification_subscriptions(id,account_id,device_id,transport,secret,version,active) VALUES ($1,$2,$3,'webpush',$4,1,0)")
+        .bind(&subscription).bind(actor).bind(device).bind(secret)
+        .execute(&store.pool).await?;
+    Ok(subscription)
+}
+
 /// A raw, `issued`, unexpired activation grant (BE-Q19 component 4). No server writer exists in
 /// this crate, so tests simulate one directly, exactly as they already do for the other members.
 pub(crate) async fn add_grant(store: &Store, actor: &str, device: &str) -> Result<String> {

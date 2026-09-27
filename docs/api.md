@@ -27,7 +27,20 @@ and OIDC-callback responses with an activation grant, adds `POST
 `forbidden`. `0.16.0` makes no wire-format change: it extends the recorded compatibility
 baseline (below) to also probe grant-only browser login, `credential_mismatch`,
 activation and cancellation, which `0.15.0` introduced but the baseline had not yet
-recorded — the probes are a floor, and this closes a gap in it.
+recorded — the probes are a floor, and this closes a gap in it. `0.17.0` changes
+`configure_source`'s `connection` field: omitting it (or sending `null`) now preserves
+the source's stored connection instead of clearing it, and a new `disconnect` boolean
+is the explicit way to clear it; sending both `connection` and `disconnect: true` is
+rejected with `invalid_value`. A client built against the old "omission clears"
+semantics will now unexpectedly preserve rather than clear a connection when it
+intentionally omitted the field to disconnect — such a client must send
+`disconnect: true` instead. `0.18.0` makes no further behavioural change: it documents
+the `0.17.0` `connection`/`disconnect` semantics directly on those two properties in the
+request schema. `0.19.0` integrates those calendar semantics with retirement cleanup for
+already-inactive subscriptions: successful device retirement also erases their stored
+secrets and advances their versions. The version advance is visible through
+`GET /notification-subscriptions` and affects `expected_version` acceptance; the
+compatibility baseline covers both the calendar and retirement behaviour together.
 
 Mutations require an account-scoped UUID `Idempotency-Key` and explicit version
 preconditions where defined. Commands that replace existing authored text also carry the
@@ -59,7 +72,7 @@ statuses and [sync](sync.md) for client recovery.
 `GET /health` returns the version of the API contract the running server was built with:
 
 ```json
-{"status": "ok", "api_version": "0.16.0"}
+{"status": "ok", "api_version": "0.19.0"}
 ```
 
 `api_version` is exactly `info.version` in [the contract](../api/openapi.json), read from

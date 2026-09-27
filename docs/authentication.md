@@ -263,8 +263,11 @@ notification subscriptions (by ID and version), pending activation grants (by ID
 sync registration (by a digest of its cursor key). A device whose only remaining member is
 a pending grant — for example, a browser tab that obtained a grant but never redeemed it —
 is still listed, with `summary.pending_sign_ins` counting it. Expired rows, inactive
-subscriptions, `last_seen` and cursor churn are not state. A device that is retired and
-recreated always has a different token. A user must confirm again, and the client must send a
+subscriptions, `last_seen` and cursor churn are not state, though a `confirmed_applied`
+retirement also erases the secret on every subscription tied to the device, active or not,
+as uncounted cleanup — the same treatment cursor churn already gets. A device that is
+retired and recreated always has a different token. A user must confirm again, and the
+client must send a
 **new** operation ID, after a `rejected_stale` outcome: it is never retried against the
 changed state.
 

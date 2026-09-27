@@ -287,6 +287,21 @@ async fn content_and_retirement() -> Result<Value> {
         results.insert(name.into(), observed(&reply));
     }
 
+    // R1: a subscription that was already inactive before the retirement is not itself part of
+    // the approved state, but `retire_members`'s cleanup statement still erases its secret and
+    // advances its version. That version is externally visible through
+    // `GET /notification-subscriptions` and gates `expected_version` acceptance on the row, so it
+    // belongs in this floor, not only in a core-level test.
+    let leaked_subscription = id();
+    sqlx::query(
+        "INSERT INTO notification_subscriptions(id,account_id,device_id,transport,secret,version,active) VALUES ($1,$2,$3,'webpush','leaked',1,0)",
+    )
+    .bind(&leaked_subscription)
+    .bind(&w.alice)
+    .bind("phone")
+    .execute(&w.store.pool)
+    .await?;
+
     let stale = device_state(&w.app, &phone, "phone").await;
     let _second = login(&w.app, "device-alice", "phone").await;
     let rejected = retire(&w.app, &backup, "phone", &id(), &stale).await;
@@ -308,6 +323,60 @@ async fn content_and_retirement() -> Result<Value> {
     );
     results.insert("self_retirement".into(), observed(&applied));
     results.insert("retirement_replay".into(), observed(&replay));
+
+    // R1 continued: confirm the erasure and version advance are observable through the real
+    // router, not only by direct query, and that the new version now gates command acceptance.
+    // `phone`'s own session was just revoked by its self-retirement, so read as `backup`, still
+    // live on the same account.
+    let backup_auth = bearer(&backup);
+    let leaked_after = request(
+        &w.app,
+        "GET",
+        "notification-subscriptions",
+        &[("authorization", &backup_auth)],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(leaked_after.0, StatusCode::OK);
+    let leaked_row = leaked_after.2["subscriptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == leaked_subscription)
+        .expect("the already-inactive, secret-bearing subscription must still be listed")
+        .clone();
+    assert_eq!(leaked_row["enabled"], false);
+    assert_eq!(
+        leaked_row["version"], 2,
+        "R1: retirement must advance the version of an already-inactive subscription whose \
+         secret it erases"
+    );
+    results.insert(
+        "inactive_subscription_retirement".into(),
+        json!({
+            "version_before": 1,
+            "version_after": leaked_row["version"].clone(),
+            "enabled": leaked_row["enabled"].clone(),
+        }),
+    );
+
+    let stale_subscription_command = request(
+        &w.app,
+        "POST",
+        "reminder-commands",
+        &[("authorization", &backup_auth), ("idempotency-key", &id())],
+        json!({"command":{"kind":"remove_subscription","id":leaked_subscription,"expected_version":1}}),
+    )
+    .await;
+    assert_eq!(stale_subscription_command.0, StatusCode::CONFLICT);
+    assert_eq!(stale_subscription_command.2["code"], "conflict");
+    results.insert(
+        "inactive_subscription_stale_command".into(),
+        json!({
+            "status": stale_subscription_command.0.as_u16(),
+            "code": stale_subscription_command.2["code"],
+        }),
+    );
 
     let after_retirement = request(
         &w.app,
@@ -417,11 +486,172 @@ async fn activation_probes() -> Result<Value> {
     Ok(Value::Object(results))
 }
 
-/// The probe transcript (v3, BE-Q19 revision: adds `activation`). `/health` omits `api_version`,
-/// which is asserted separately.
+/// BE-Q22 probes: `configure_source`'s `connection` field distinguishes omission (preserve),
+/// `Some(value)` (replace) and `disconnect: true` (clear) (`docs/api.md` `0.17.0` entry).
+/// Uses a real, allow-listed loopback origin and a real integration key so the stored
+/// `connection` column holds a genuinely sealed value, not a placeholder string — the DNS
+/// lookup on `127.0.0.1` resolves with no live listener required, since `configure_source`
+/// never calls `fetch()`. Only status/code are recorded; the sealed ciphertext is randomised
+/// per call and would make the transcript non-deterministic.
+async fn calendar_configure_probes() -> Result<Value> {
+    use crate::support::http::request;
+    use atlas_server::{hash_password, integrations::IntegrationConfig};
+
+    fn shape(reply: &(StatusCode, axum::http::HeaderMap, Value)) -> Value {
+        json!({"status": reply.0.as_u16(), "code": reply.2.get("code")})
+    }
+
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let store = Store::connect(&url).await?;
+    store.migrate().await?;
+    let actor = Uuid::new_v4().to_string();
+    store
+        .add_account(
+            &actor,
+            "calendar-configure-probe",
+            &hash_password("calendar-configure-probe-123".into()).await?,
+        )
+        .await?;
+    let origin = "http://127.0.0.1:59998".to_string();
+    let app = App::new(store.clone())
+        .await?
+        .integration_config(IntegrationConfig::new(
+            Some(&"05".repeat(32)),
+            vec![origin.clone()],
+            None,
+            None,
+        )?)
+        .router();
+    let login = request(
+        &app,
+        "POST",
+        "sessions",
+        &[],
+        json!({"username":"calendar-configure-probe","password":"calendar-configure-probe-123","device_id":"probe"}),
+    )
+    .await;
+    assert_eq!(login.0, StatusCode::OK, "{}", login.2);
+    let token = login.2["access_token"].as_str().unwrap().to_owned();
+    let auth = format!("Bearer {token}");
+
+    let mut results = serde_json::Map::new();
+    let source = Uuid::new_v4().to_string();
+    let created = request(
+        &app,
+        "POST",
+        "calendar-commands",
+        &[
+            ("authorization", &auth),
+            ("idempotency-key", &Uuid::new_v4().to_string()),
+        ],
+        json!({"command":{"kind":"create_source","id":source,"label":"Calendar","timezone":"UTC",
+            "connection":{"url":format!("{origin}/feed"),"bearer":"probe-secret-token"}}}),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::OK, "{}", created.2);
+    results.insert("create_with_connection".into(), shape(&created));
+
+    let sealed: Option<String> =
+        sqlx::query_scalar("SELECT connection FROM calendar_sources WHERE id=$1")
+            .bind(&source)
+            .fetch_one(&store.pool)
+            .await?;
+    let sealed = sealed.expect("connection sealed at creation");
+
+    let omitted = request(
+        &app,
+        "POST",
+        "calendar-commands",
+        &[
+            ("authorization", &auth),
+            ("idempotency-key", &Uuid::new_v4().to_string()),
+        ],
+        json!({"command":{"kind":"configure_source","id":source,"expected_version":2,
+            "timezone":"Europe/London","enabled":true}}),
+    )
+    .await;
+    assert_eq!(omitted.0, StatusCode::OK, "{}", omitted.2);
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT connection FROM calendar_sources WHERE id=$1")
+            .bind(&source)
+            .fetch_one(&store.pool)
+            .await?;
+    assert_eq!(
+        stored,
+        Some(sealed.clone()),
+        "omission preserves the stored connection"
+    );
+    results.insert("omitted_preserves".into(), shape(&omitted));
+
+    let contradiction = request(
+        &app,
+        "POST",
+        "calendar-commands",
+        &[
+            ("authorization", &auth),
+            ("idempotency-key", &Uuid::new_v4().to_string()),
+        ],
+        json!({"command":{"kind":"configure_source","id":source,"expected_version":3,
+            "timezone":"UTC","connection":{"url":format!("{origin}/feed"),"bearer":"other-secret"},
+            "disconnect":true,"enabled":true}}),
+    )
+    .await;
+    assert_eq!(
+        contradiction.0,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        contradiction.2
+    );
+    assert_eq!(contradiction.2["code"], "invalid_value");
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT connection FROM calendar_sources WHERE id=$1")
+            .bind(&source)
+            .fetch_one(&store.pool)
+            .await?;
+    assert_eq!(
+        stored,
+        Some(sealed),
+        "rejected combination leaves state untouched"
+    );
+    results.insert(
+        "connection_and_disconnect_rejected".into(),
+        shape(&contradiction),
+    );
+
+    let disconnected = request(
+        &app,
+        "POST",
+        "calendar-commands",
+        &[
+            ("authorization", &auth),
+            ("idempotency-key", &Uuid::new_v4().to_string()),
+        ],
+        json!({"command":{"kind":"configure_source","id":source,"expected_version":3,
+            "timezone":"UTC","disconnect":true,"enabled":true}}),
+    )
+    .await;
+    assert_eq!(disconnected.0, StatusCode::OK, "{}", disconnected.2);
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT connection FROM calendar_sources WHERE id=$1")
+            .bind(&source)
+            .fetch_one(&store.pool)
+            .await?;
+    assert_eq!(
+        stored, None,
+        "explicit disconnect clears the stored connection"
+    );
+    results.insert("disconnect_clears".into(), shape(&disconnected));
+
+    Ok(Value::Object(results))
+}
+
+/// The combined probe transcript includes activation, calendar connection preservation and
+/// disconnection, and inactive-subscription retirement/version changes. `/health` omits
+/// `api_version`, which is asserted separately.
 async fn observe(app: &Router) -> Value {
     json!({
         "activation": activation_probes().await.expect("activation-grant protocol probes"),
+        "calendar_configure": calendar_configure_probes().await.expect("BE-Q22 connection preserve/disconnect probes"),
         "error_mapping": error_mapping().await,
         "content_and_retirement": content_and_retirement().await.expect("combined protocol probes"),
         "health": probe(app, "/health", &["api_version"]).await,

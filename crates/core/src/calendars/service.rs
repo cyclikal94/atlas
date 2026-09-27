@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Any, Row, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
+fn is_false(value: &bool) -> bool {
+    !*value
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CalendarCommand {
@@ -21,6 +24,10 @@ pub enum CalendarCommand {
         expected_version: i64,
         timezone: String,
         connection: Option<String>,
+        // Omitted when false so a default/false receipt hash matches one computed before this
+        // field existed; a pre-change receipt must still replay against its stored revision.
+        #[serde(default, skip_serializing_if = "is_false")]
+        disconnect: bool,
         enabled: bool,
     },
     SetAnchor {
@@ -167,6 +174,7 @@ impl Store {
                 expected_version,
                 timezone,
                 connection,
+                disconnect,
                 enabled,
             } => {
                 let p = Self::task_resource(&mut tx, actor, id, "calendar_source", true).await?;
@@ -185,7 +193,12 @@ impl Store {
                     connection.as_ref().is_none_or(|v| v.len() <= 8192),
                     ErrorCode::InvalidValue
                 );
-                sqlx::query("UPDATE calendar_sources SET connection=$1,timezone=$2,generation=generation+1,lease_until=0,next_refresh=0,health='pending',etag=NULL,modified=NULL WHERE id=$3").bind(connection).bind(timezone).bind(id).execute(&mut *tx).await?;
+                // Replace-and-clear in the same call is contradictory, not a real request shape.
+                ensure!(
+                    !(connection.is_some() && *disconnect),
+                    ErrorCode::InvalidValue
+                );
+                sqlx::query("UPDATE calendar_sources SET connection=CASE WHEN $1=1 THEN NULL ELSE COALESCE($2,connection) END,timezone=$3,generation=generation+1,lease_until=0,next_refresh=0,health='pending',etag=NULL,modified=NULL WHERE id=$4").bind(i64::from(*disconnect)).bind(connection).bind(timezone).bind(id).execute(&mut *tx).await?;
                 sqlx::query("UPDATE resources SET archived=$1 WHERE id=$2")
                     .bind(i64::from(!enabled))
                     .bind(id)

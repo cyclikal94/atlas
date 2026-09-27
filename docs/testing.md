@@ -34,7 +34,7 @@ a subprocess helper invoked by the sync lifecycle test; do not run it directly.
 | Atomic receipts/publication, read/write contention and real process crash recovery | `sync`, `storage/contention` | SQLite and PostgreSQL execution |
 | Clean startup/reopen, concurrent initialisation, incompatible-schema rejection | `storage/initialisation` | Both database engines |
 | Foreign keys and failed-initialisation rollback | `resources/hierarchy`, `storage/initialisation` | SQLite connection pool; transactional DDL on both engines |
-| ICS exceptions/cancellation, event reconciliation, private anchors, leap birthdays | `calendars` | Calendar HTTP routes and integration worker |
+| ICS exceptions/cancellation, event reconciliation, private anchors, leap birthdays, connection preserve/replace/disconnect on partial `configure_source` updates | `calendars` | Calendar HTTP routes and integration worker |
 | Authentication, CSRF, session revocation, OIDC signatures and replay | — | Server `browser`, `sessions`, `onboarding`, `oidc` |
 | API version signal, contract hash and probed behaviour baseline | — | Server `compatibility`, `scripts/validate_contract.py` |
 | Fetch address rules, secret scope and real encrypted push payloads | — | Server `integrations` |

@@ -349,6 +349,16 @@ impl Store {
                 .bind(id).bind(actor).bind(version).execute(&mut **tx).await?;
             ensure!(changed.rows_affected() == 1, ErrorCode::InternalError);
         }
+        // Already-inactive subscriptions are not members (`locked_state` never reads them), so
+        // this is uncounted cleanup, exactly like the `sync_cursors` deletion below: it closes
+        // CH2 — a subscription `SetSubscription` deactivated for an unrelated reason could still
+        // be holding a secret indefinitely — so every subscription row tied to this device ends
+        // up secret-erased, matching docs/notifications.md's existing claim.
+        sqlx::query("UPDATE notification_subscriptions SET secret='',version=version+1 WHERE account_id=$1 AND device_id=$2 AND active=0 AND secret<>''")
+            .bind(actor)
+            .bind(device)
+            .execute(&mut **tx)
+            .await?;
         Self::cancel_grants(tx, actor, device, &state.grants, now).await?;
         if let Some(key) = &state.registration {
             let removed = sqlx::query(

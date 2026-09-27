@@ -2,7 +2,7 @@
   "openapi": "3.1.1",
   "info": {
     "title": "Atlas API",
-    "version": "0.16.0",
+    "version": "0.19.0",
     "description": "Pre-release API. Breaking changes and explicit database resets are permitted until a supported release."
   },
   "servers": [
@@ -19183,6 +19183,7 @@
                 "type": "string"
               },
               "connection": {
+                "description": "Replaces the stored connection when provided (online only). Omitted or null preserves the existing stored connection unchanged. Rejected as invalid_value if disconnect is also true.",
                 "anyOf": [
                   {
                     "$ref": "#/components/schemas/CalendarConnection"
@@ -19191,6 +19192,10 @@
                     "type": "null"
                   }
                 ]
+              },
+              "disconnect": {
+                "description": "When true, clears the stored connection instead of preserving it. Defaults to false. Rejected as invalid_value together with a non-null connection.",
+                "type": "boolean"
               },
               "enabled": {
                 "type": "boolean"

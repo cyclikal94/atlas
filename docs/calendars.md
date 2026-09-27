@@ -10,6 +10,9 @@ secrets. Sources are private unless an initial policy explicitly shares them. Ev
 copy that policy when created and remain subject to the source's access gate. Use the
 existing policy API to change access. Connection URLs, bearer tokens and HTTP validators
 never enter resource projections or sync; connection configuration is owner-only.
+`configure_source` preserves the stored connection when the field is omitted or `null`;
+send `disconnect: true` to clear it explicitly. A provided `connection` always replaces
+the stored value, online only.
 
 <!-- experimental-schema: CalendarCommandInput -->
 ```json

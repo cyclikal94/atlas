@@ -1,6 +1,6 @@
 {
-  "api_version": "0.16.0",
-  "contract_sha256": "94e4de57045b9c4b758fff47f257414e7d5e0c6b65785066b0ff2f9e7d8b5ef9",
+  "api_version": "0.19.0",
+  "contract_sha256": "b8f69ba930e1f5919b7033937c6e3ef99646a9968845b4971c1fb900d27941e1",
   "behaviour": {
     "activation": {
       "activate": {
@@ -44,6 +44,24 @@
         "status": 200
       }
     },
+    "calendar_configure": {
+      "connection_and_disconnect_rejected": {
+        "code": "invalid_value",
+        "status": 422
+      },
+      "create_with_connection": {
+        "code": null,
+        "status": 200
+      },
+      "disconnect_clears": {
+        "code": null,
+        "status": 200
+      },
+      "omitted_preserves": {
+        "code": null,
+        "status": 200
+      }
+    },
     "content_and_retirement": {
       "current_policy": {
         "cache_control": "private, no-store",
@@ -51,6 +69,15 @@
         "outcome": null,
         "set_cookie": false,
         "status": 200
+      },
+      "inactive_subscription_retirement": {
+        "enabled": false,
+        "version_after": 2,
+        "version_before": 1
+      },
+      "inactive_subscription_stale_command": {
+        "code": "conflict",
+        "status": 409
       },
       "omitted_policy": {
         "cache_control": "private, no-store",
