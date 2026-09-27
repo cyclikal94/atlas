@@ -41,6 +41,13 @@ already-inactive subscriptions: successful device retirement also erases their s
 secrets and advances their versions. The version advance is visible through
 `GET /notification-subscriptions` and affects `expected_version` acceptance; the
 compatibility baseline covers both the calendar and retirement behaviour together.
+`0.21.0` combines two contract corrections. `ContentCommands`, `AccessCommands`
+and `ManagementCommands` declare a maximum of 20 commands, matching the existing
+implementation limit; clients may use that documented maximum rather than split
+batches at eight. The explicit `ErrorCode::TemporarilyUnavailable` application error
+now maps to `503 temporarily_unavailable`, as already documented for the affected
+operations, instead of falling through to `500 internal_error`. The compatibility
+baseline covers both corrections and preserves the earlier protocol probes.
 
 Mutations require an account-scoped UUID `Idempotency-Key` and explicit version
 preconditions where defined. Commands that replace existing authored text also carry the
@@ -72,7 +79,7 @@ statuses and [sync](sync.md) for client recovery.
 `GET /health` returns the version of the API contract the running server was built with:
 
 ```json
-{"status": "ok", "api_version": "0.19.0"}
+{"status": "ok", "api_version": "0.21.0"}
 ```
 
 `api_version` is exactly `info.version` in [the contract](../api/openapi.json), read from

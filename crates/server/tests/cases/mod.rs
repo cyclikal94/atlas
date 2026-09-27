@@ -1,6 +1,7 @@
 mod activation;
 mod browser;
 mod calendars;
+mod commands;
 mod compatibility;
 mod devices;
 mod integrations;

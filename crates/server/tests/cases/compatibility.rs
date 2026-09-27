@@ -645,13 +645,98 @@ async fn calendar_configure_probes() -> Result<Value> {
     Ok(Value::Object(results))
 }
 
+/// BE-CH1 command-batch probes (plan.md, "Command batch schema and implementation
+/// agreement"): the reconciled `/commands` ceiling accepts exactly the schema's `maxItems`
+/// commands and rejects one over it. One endpoint (content) is the baseline floor;
+/// `commands.rs` is the exhaustive, non-probe coverage across all three batch endpoints.
+/// Records only the deterministic status/code shape; the created person IDs are randomised
+/// and would make the transcript non-deterministic.
+async fn command_batch_probes() -> Result<Value> {
+    use crate::support::http::request;
+    use atlas_server::hash_password;
+
+    fn shape(reply: &(StatusCode, axum::http::HeaderMap, Value)) -> Value {
+        json!({"status": reply.0.as_u16(), "code": reply.2.get("code")})
+    }
+
+    fn batch(count: usize) -> Value {
+        json!({
+            "commands": (0..count)
+                .map(|_| json!({"kind":"create_person","id":Uuid::new_v4().to_string(),"name":"Probe"}))
+                .collect::<Vec<_>>()
+        })
+    }
+
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let store = Store::connect(&url).await?;
+    store.migrate().await?;
+    let actor = Uuid::new_v4().to_string();
+    store
+        .add_account(
+            &actor,
+            "command-batch-probe",
+            &hash_password("command-batch-probe-123".into()).await?,
+        )
+        .await?;
+    let app = App::new(store.clone()).await?.router();
+    let login = request(
+        &app,
+        "POST",
+        "sessions",
+        &[],
+        json!({"username":"command-batch-probe","password":"command-batch-probe-123","device_id":"probe"}),
+    )
+    .await;
+    assert_eq!(login.0, StatusCode::OK, "{}", login.2);
+    let token = login.2["access_token"].as_str().unwrap().to_owned();
+    let auth = format!("Bearer {token}");
+
+    let mut results = serde_json::Map::new();
+    let accepted = request(
+        &app,
+        "POST",
+        "commands",
+        &[
+            ("authorization", &auth),
+            ("idempotency-key", &Uuid::new_v4().to_string()),
+        ],
+        batch(20),
+    )
+    .await;
+    assert_eq!(accepted.0, StatusCode::OK, "{}", accepted.2);
+    results.insert("maximum_batch".into(), shape(&accepted));
+
+    let rejected = request(
+        &app,
+        "POST",
+        "commands",
+        &[
+            ("authorization", &auth),
+            ("idempotency-key", &Uuid::new_v4().to_string()),
+        ],
+        batch(21),
+    )
+    .await;
+    assert_eq!(
+        rejected.0,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        rejected.2
+    );
+    assert_eq!(rejected.2["code"], "invalid_value");
+    results.insert("over_limit_batch".into(), shape(&rejected));
+
+    Ok(Value::Object(results))
+}
+
 /// The combined probe transcript includes activation, calendar connection preservation and
-/// disconnection, and inactive-subscription retirement/version changes. `/health` omits
-/// `api_version`, which is asserted separately.
+/// disconnection, inactive-subscription retirement/version changes, and command batch-size
+/// acceptance/rejection. `/health` omits `api_version`, which is asserted separately.
 async fn observe(app: &Router) -> Value {
     json!({
         "activation": activation_probes().await.expect("activation-grant protocol probes"),
         "calendar_configure": calendar_configure_probes().await.expect("BE-Q22 connection preserve/disconnect probes"),
+        "command_batch": command_batch_probes().await.expect("BE-CH1 command batch-size probes"),
         "error_mapping": error_mapping().await,
         "content_and_retirement": content_and_retirement().await.expect("combined protocol probes"),
         "health": probe(app, "/health", &["api_version"]).await,

@@ -1,6 +1,6 @@
 {
-  "api_version": "0.19.0",
-  "contract_sha256": "b8f69ba930e1f5919b7033937c6e3ef99646a9968845b4971c1fb900d27941e1",
+  "api_version": "0.21.0",
+  "contract_sha256": "81f476fb9e71a92bbbf8129f093988b45cc9e5f9e9bc1bfac2dda7e2884f0539",
   "behaviour": {
     "activation": {
       "activate": {
@@ -60,6 +60,16 @@
       "omitted_preserves": {
         "code": null,
         "status": 200
+      }
+    },
+    "command_batch": {
+      "maximum_batch": {
+        "code": null,
+        "status": 200
+      },
+      "over_limit_batch": {
+        "code": "invalid_value",
+        "status": 422
       }
     },
     "content_and_retirement": {
@@ -280,8 +290,8 @@
         "stale_refresh"
       ],
       "temporarily_unavailable": [
-        500,
-        "internal_error"
+        503,
+        "temporarily_unavailable"
       ],
       "unauthenticated": [
         401,

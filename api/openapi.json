@@ -2,7 +2,7 @@
   "openapi": "3.1.1",
   "info": {
     "title": "Atlas API",
-    "version": "0.19.0",
+    "version": "0.21.0",
     "description": "Pre-release API. Breaking changes and explicit database resets are permitted until a supported release."
   },
   "servers": [
@@ -15464,7 +15464,7 @@
           "commands": {
             "type": "array",
             "minItems": 1,
-            "maxItems": 8,
+            "maxItems": 20,
             "items": {
               "oneOf": [
                 {
@@ -15510,7 +15510,7 @@
           "commands": {
             "type": "array",
             "minItems": 1,
-            "maxItems": 8,
+            "maxItems": 20,
             "items": {
               "oneOf": [
                 {
@@ -16448,7 +16448,7 @@
                 }
               ]
             },
-            "maxItems": 8,
+            "maxItems": 20,
             "minItems": 1
           }
         },

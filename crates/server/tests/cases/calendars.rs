@@ -237,3 +237,144 @@ async fn http_calendar_configure_source_connection_semantics() -> Result<()> {
 
     Ok(())
 }
+
+/// BE-CH3: exhausting the two real `calendar_slots` permits (a genuine `Semaphore`, reached
+/// only through real HTTP requests — no test-only accessor is added) via two in-flight
+/// `refresh_link` requests, each blocked awaiting a response from a loopback origin that never
+/// completes, makes a third, concurrent `refresh_link` on the same router return `503
+/// temporarily_unavailable` immediately. This is the fixed `Some(ErrorCode::TemporarilyUnavailable)`
+/// arm, not the unrelated `_ if busy` database-busy guard: this test never induces a database
+/// lock (single writer, no concurrent conflicting transaction), so a 503 here can only have come
+/// from the application-error arm.
+#[tokio::test]
+async fn http_calendar_refresh_capacity_exhaustion_is_service_unavailable() -> Result<()> {
+    use axum::{Router as FeedRouter, routing::get as feed_get};
+    use tokio::sync::mpsc;
+    use tokio::time::{Duration, timeout};
+
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let store = Store::connect(&url).await?;
+    store.migrate().await?;
+    let actor = id();
+    store
+        .add_account(
+            &actor,
+            "calendar-refresh-user",
+            &hash_password("calendar-refresh-password-123".into()).await?,
+        )
+        .await?;
+
+    // A loopback origin that accepts the connection, signals arrival, then never responds —
+    // holding the `reqwest` client (and therefore the `calendar_slots` permit) open until the
+    // test aborts this server.
+    let (arrived_tx, mut arrived_rx) = mpsc::channel::<()>(2);
+    let feed = FeedRouter::new().route(
+        "/feed",
+        feed_get(move || {
+            let arrived_tx = arrived_tx.clone();
+            async move {
+                arrived_tx.send(()).await.ok();
+                std::future::pending::<StatusCode>().await
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let origin = format!("http://{}", listener.local_addr()?);
+    let feed_server = tokio::spawn(async move { axum::serve(listener, feed).await });
+
+    let key = "05".repeat(32);
+    let app = App::new(store.clone())
+        .await?
+        .integration_config(IntegrationConfig::new(
+            Some(&key),
+            vec![origin.clone()],
+            None,
+            None,
+        )?)
+        .router();
+    let (status, login) = call(
+        &app,
+        "sessions",
+        None,
+        None,
+        Some(
+            json!({"username":"calendar-refresh-user","password":"calendar-refresh-password-123","device_id":"phone"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let token = login["access_token"].as_str().unwrap().to_string();
+
+    let mut sources = Vec::new();
+    for label in ["a", "b", "c"] {
+        let source = id();
+        let create = json!({"command":{"kind":"create_source","id":source,"label":label,"timezone":"UTC",
+            "connection":{"url":format!("{origin}/feed"),"bearer":null}}});
+        let created = call(
+            &app,
+            "calendar-commands",
+            Some(&token),
+            Some(&id()),
+            Some(create),
+        )
+        .await;
+        assert_eq!(created.0, StatusCode::OK, "{:?}", created.1);
+        sources.push(source);
+    }
+    let (a, b, c) = (sources[0].clone(), sources[1].clone(), sources[2].clone());
+
+    // Two concurrent, real refresh requests: each must pass `try_acquire_owned()` and then
+    // block inside `fetch()`, holding its permit for as long as the stalled origin holds the
+    // connection open.
+    let blocked: Vec<_> = [a, b]
+        .into_iter()
+        .map(|source| {
+            let app = app.clone();
+            let token = token.clone();
+            tokio::spawn(async move {
+                call(
+                    &app,
+                    &format!("calendar-sources/{source}/refresh"),
+                    Some(&token),
+                    Some(&id()),
+                    Some(json!({})),
+                )
+                .await
+            })
+        })
+        .collect();
+
+    // Bounded, non-sleep synchronisation: only proceed once both spawned requests have reached
+    // the stalled feed, i.e. both permits are genuinely held.
+    for _ in 0..2 {
+        timeout(Duration::from_secs(5), arrived_rx.recv())
+            .await?
+            .expect("feed connection");
+    }
+
+    // The third refresh, on the same real router, must return immediately — bounded so a
+    // regression that reintroduces blocking fails loudly instead of hanging the test.
+    let third = timeout(
+        Duration::from_secs(2),
+        call(
+            &app,
+            &format!("calendar-sources/{c}/refresh"),
+            Some(&token),
+            Some(&id()),
+            Some(json!({})),
+        ),
+    )
+    .await
+    .expect("third refresh must not hang — permits are exhausted, not deadlocked");
+    assert_eq!(third.0, StatusCode::SERVICE_UNAVAILABLE, "{:?}", third.1);
+    assert_eq!(third.1["code"], "temporarily_unavailable");
+
+    // Unblock and clean up: stop the stalled feed so the two spawned refreshes fail (irrelevant
+    // to this test) and finish, then join them with a bounded wait so nothing leaks past return.
+    feed_server.abort();
+    for task in blocked {
+        let _ = timeout(Duration::from_secs(5), task).await;
+    }
+
+    Ok(())
+}

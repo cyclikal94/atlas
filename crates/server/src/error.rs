@@ -90,6 +90,9 @@ impl IntoResponse for ApiError {
             Some(ErrorCode::DeviceCapacity) => (StatusCode::SERVICE_UNAVAILABLE, "device_capacity"),
             Some(ErrorCode::SliceCapacity) => (StatusCode::SERVICE_UNAVAILABLE, "slice_capacity"),
             Some(ErrorCode::NotReady) => (StatusCode::SERVICE_UNAVAILABLE, "not_ready"),
+            Some(ErrorCode::TemporarilyUnavailable) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable")
+            }
             _ if busy => (StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable"),
             _ if unique => (StatusCode::CONFLICT, "conflict"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
