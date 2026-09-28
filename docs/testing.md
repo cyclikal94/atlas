@@ -7,6 +7,10 @@ The script starts a disposable socket-only cluster and removes it on exit. Set
 `ATLAS_TEST_POSTGRES_URL` pointing to a disposable test database: cases create
 unique schemas there, and the caller owns their cleanup. Never use a production
 or personal database for tests.
+The PostgreSQL test role must be allowed to `SET deadlock_timeout` (the disposable
+cluster and CI service use their test superuser). The deadlock schedule uses only
+transaction-local settings to choose which participant detects the constructed
+cycle, while still requiring a real `40P01`, a retry and exactly one ledger row.
 
 Filter by domain, for example `cargo test -p atlas-core --test integration tasks::timers`
 or `scripts/test-postgres.sh tasks::timers`. HTTP cases live in the server's `api`

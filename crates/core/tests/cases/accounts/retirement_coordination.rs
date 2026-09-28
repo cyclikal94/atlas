@@ -378,43 +378,37 @@ async fn retirement_first_makes_the_sweep_a_no_op() -> Result<()> {
     retirement_first_beats_sweep(false).await
 }
 
-/// (ac), (ah) PostgreSQL: a real `40P01`. A test transaction holds the later member while the
-/// retirement locks the earlier one and waits; the test transaction then asks for the earlier
-/// member. PostgreSQL aborts the transaction that has waited longest (the retirement), which is
-/// retried as a unit and writes exactly one ledger row.
+/// (ac), (ah) PostgreSQL: a real `40P01`, retried as a unit with exactly one ledger row.
+/// The holder first waits for the retirement's row lock. Only then does the retirement ask
+/// for the holder's test-only advisory lock, closing the cycle before its detector starts.
+/// Transaction-local detector settings keep the holder from winning the detector race;
+/// arrival order alone does not determine PostgreSQL's deadlock victim.
 async fn retry_after_a_deadlock(raise: bool) -> Result<()> {
     let (_d, s, a) = setup(raise).await?;
-    let [first, second] = expired_pair_with_far(&s, &a).await?;
+    let [first, _second] = expired_pair_with_far(&s, &a).await?;
     let token = expected_token(&s, &a, PHONE, NOW).await?;
     let mut holder = s.pool.begin().await?;
+    sqlx::query("SET LOCAL deadlock_timeout = '60s'")
+        .execute(&mut *holder)
+        .await?;
     let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut *holder)
         .await?;
-    sqlx::query("SELECT session_id FROM sessions WHERE session_id=$1 FOR UPDATE")
-        .bind(&second)
-        .fetch_all(&mut *holder)
+    // The two-key namespace is separate from migrate()'s one-key advisory lock. A live
+    // backend PID also keeps parallel cases' locks distinct. Commit/rollback releases it.
+    sqlx::query("SELECT pg_advisory_xact_lock(7411, $1)")
+        .bind(holder_pid)
+        .execute(&mut *holder)
         .await?;
-    let retirement = {
-        let (s, a, token) = (s.clone(), a.clone(), token.clone());
-        tokio::spawn(async move { s.retire_device(&a, PHONE, &id(), &token, NOW).await })
-    };
-    // The retirement has locked `first` and waits for `second`.
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
-            )
-            .bind(holder_pid)
-            .fetch_one(&s.pool)
-            .await?;
-            if waiting > 0 {
-                return Ok::<_, anyhow::Error>(());
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await??;
-    let closing = tokio::spawn(async move {
+    s.hooks().inject_sql_times(
+        RETIREMENT_FIRST,
+        &format!(
+            "SET LOCAL deadlock_timeout = '100ms'; SELECT pg_advisory_xact_lock(7411, {holder_pid})"
+        ),
+        1,
+    );
+    let paused = pause(&s, &a, PHONE, &id(), &token, NOW, RETIREMENT_FIRST).await;
+    let mut closing = tokio::spawn(async move {
         sqlx::query("SELECT session_id FROM sessions WHERE session_id=$1 FOR UPDATE")
             .bind(first)
             .fetch_all(&mut *holder)
@@ -422,7 +416,10 @@ async fn retry_after_a_deadlock(raise: bool) -> Result<()> {
         holder.commit().await?;
         Ok::<_, anyhow::Error>(())
     });
-    let done = tokio::time::timeout(Duration::from_secs(30), retirement).await???;
+    assert_blocked(&s, paused.point, &mut closing).await?;
+    // Releasing the gate executes the injected lock request, so the retirement's first
+    // deadlock check sees the complete cycle. This bound is below the holder's detector.
+    let done = tokio::time::timeout(Duration::from_secs(30), paused.finish()).await??;
     closing
         .await?
         .context("the test transaction must not be the deadlock victim")?;
