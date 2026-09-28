@@ -31,6 +31,17 @@ pub enum PeopleCommand {
     RespondRequest {
         id: String,
         accept: bool,
+        /// Echoed back from `recipient_merge_preview`'s `token`, read immediately before
+        /// accepting. Required (checked as `Some`) only for a `Proposal::Merge` whose
+        /// preview `requires_approval`; ignored for `Link` acceptance and declines.
+        ///
+        /// `people_command` fingerprints this command's serialisation to detect a reused
+        /// operation ID. Omitting the member when it is absent keeps that serialisation
+        /// byte-identical to the form it had before this field existed, so a receipt
+        /// committed before the upgrade still replays; a supplied token is part of the
+        /// fingerprint and so is bound to the operation it was sent with.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recipient_preview_token: Option<String>,
     },
     Merge {
         source_id: String,
@@ -210,6 +221,7 @@ impl Store {
         match command {
             PeopleCommand::CancelRequest { id } => {
                 sqlx::query("UPDATE people_requests SET state='cancelled' WHERE id=$1 AND sender_id=$2 AND state='pending'").bind(id).bind(actor).execute(&mut *tx).await?;
+                sqlx::query("UPDATE people_request_history SET state='cancelled',updated_at=$3 WHERE id=$1 AND sender_id=$2 AND state='pending'").bind(id).bind(actor).bind(now).execute(&mut *tx).await?;
             }
 
             PeopleCommand::ReferenceAccount {
@@ -368,7 +380,11 @@ impl Store {
                     }
                 }
             }
-            PeopleCommand::RespondRequest { id, accept } => {
+            PeopleCommand::RespondRequest {
+                id,
+                accept,
+                recipient_preview_token,
+            } => {
                 let row=sqlx::query("SELECT sender_id,payload FROM people_requests WHERE id=$1 AND recipient_id=$2 AND state='pending' AND expires_at>$3").bind(id).bind(actor).bind(now).fetch_optional(&mut *tx).await?.ok_or_else(||anyhow!(ErrorCode::NotFound))?;
                 let sender: String = row.get(0);
                 if *accept {
@@ -435,6 +451,19 @@ impl Store {
                                 Self::merge_preview_in(&mut tx, &sender, &source_id, &target_id)
                                     .await?;
                             ensure!(preview.token == preview_token, ErrorCode::Conflict);
+                            if preview.requires_approval {
+                                // Re-checked fresh against the accepting recipient's current
+                                // visibility, not cached from when the request was created —
+                                // the sender-side check above cannot detect a permission
+                                // change on the recipient's own side of the identity graph.
+                                let fresh =
+                                    Self::safe_merge_state(&mut tx, actor, &source_id, &target_id)
+                                        .await?;
+                                ensure!(
+                                    Some(fresh.token) == *recipient_preview_token,
+                                    ErrorCode::Conflict
+                                );
+                            }
                             let owners = BTreeSet::from([
                                 Self::person_owner(&mut tx, &source_id).await?,
                                 Self::person_owner(&mut tx, &target_id).await?,
@@ -459,6 +488,12 @@ impl Store {
                 sqlx::query("UPDATE people_requests SET state=$1 WHERE id=$2")
                     .bind(if *accept { "accepted" } else { "declined" })
                     .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("UPDATE people_request_history SET state=$1,updated_at=$3 WHERE id=$2")
+                    .bind(if *accept { "accepted" } else { "declined" })
+                    .bind(id)
+                    .bind(now)
                     .execute(&mut *tx)
                     .await?;
             }

@@ -233,7 +233,8 @@ async fn linking_scenario(s: &Store) -> Result<()> {
             &c,
             PeopleCommand::RespondRequest {
                 id: request.clone(),
-                accept: true
+                accept: true,
+                recipient_preview_token: None
             }
         )
         .await
@@ -245,6 +246,7 @@ async fn linking_scenario(s: &Store) -> Result<()> {
         PeopleCommand::RespondRequest {
             id: request,
             accept: true,
+            recipient_preview_token: None,
         },
     )
     .await?;
@@ -341,7 +343,8 @@ async fn linking_scenario(s: &Store) -> Result<()> {
             &b,
             PeopleCommand::RespondRequest {
                 id: request,
-                accept: true
+                accept: true,
+                recipient_preview_token: None
             }
         )
         .await?,
@@ -416,12 +419,15 @@ async fn approved_merge_scenario(s: &Store) -> Result<()> {
         },
     )
     .await?;
+    let recipient_preview = s.recipient_merge_preview(&b, &request, NOW).await?;
+    assert!(!recipient_preview.stale);
     command(
         s,
         &b,
         PeopleCommand::RespondRequest {
             id: request,
             accept: true,
+            recipient_preview_token: Some(recipient_preview.token),
         },
     )
     .await?;
@@ -458,12 +464,14 @@ async fn linked_source_merge_scenario(s: &Store) -> Result<()> {
         },
     )
     .await?;
+    let recipient_preview = s.recipient_merge_preview(&subject, &request, NOW).await?;
     command(
         s,
         &subject,
         PeopleCommand::RespondRequest {
             id: request,
             accept: true,
+            recipient_preview_token: Some(recipient_preview.token),
         },
     )
     .await?;
@@ -676,6 +684,7 @@ async fn people_requests_can_expire_decline_or_be_cancelled() -> Result<()> {
                 PeopleCommand::RespondRequest {
                     id: r.clone(),
                     accept: false,
+                    recipient_preview_token: None,
                 },
             )
             .await?;
@@ -688,7 +697,8 @@ async fn people_requests_can_expire_decline_or_be_cancelled() -> Result<()> {
                 &id(),
                 &PeopleCommand::RespondRequest {
                     id: r,
-                    accept: true
+                    accept: true,
+                    recipient_preview_token: None
                 },
                 if state == "expire" { NOW + 604801 } else { NOW }
             )
@@ -904,4 +914,348 @@ async fn an_edit_receipted_before_a_merge_still_replays_afterwards() -> Result<(
         .unwrap_err();
     assert_eq!(other.to_string(), "operation_conflict");
     Ok(())
+}
+
+/// BE-Q16: the recipient of a pending merge request can preview it with one side hidden, sees
+/// `stale: true` once the sender's own visibility changes, and a merge acceptance with a
+/// stale/missing `recipient_preview_token` is rejected without committing.
+async fn recipient_safe_preview_scenario(s: &Store) -> Result<()> {
+    let a = account(s).await?;
+    let b = account(s).await?;
+    // `source` is private to `a`; `target` is owned by `b` and shared only with `a` — the
+    // initiator (`a`) can see both sides, but the recipient (`b`) can never see `source`.
+    let source = person(s, &a, "Morgan", Policy::default()).await?;
+    let target = person(s, &b, "Morgan", share(&a)).await?;
+    let preview = s.merge_preview(&a, &source, &target).await?;
+    assert!(preview.requires_approval);
+    let request = id();
+    command(
+        s,
+        &a,
+        PeopleCommand::RequestMerge {
+            id: request.clone(),
+            source_id: source.clone(),
+            target_id: target.clone(),
+            preview_token: preview.token,
+            name: "Morgan".into(),
+        },
+    )
+    .await?;
+
+    let safe = s.recipient_merge_preview(&b, &request, NOW).await?;
+    assert!(
+        safe.source.is_none(),
+        "b cannot see source, omitted not errored"
+    );
+    assert_eq!(
+        safe.target.as_ref().map(|p| p.id.as_str()),
+        Some(target.as_str())
+    );
+    assert!(!safe.stale);
+    assert!(safe.requires_approval);
+
+    // A stale or missing `recipient_preview_token` at acceptance is rejected; the merge does
+    // not commit.
+    for bad_token in [None, Some("0".repeat(64))] {
+        assert_eq!(
+            s.people_command(
+                &b,
+                &id(),
+                &PeopleCommand::RespondRequest {
+                    id: request.clone(),
+                    accept: true,
+                    recipient_preview_token: bad_token,
+                },
+                NOW,
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "conflict"
+        );
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT owner_id FROM resources WHERE id=$1")
+            .bind(&target)
+            .fetch_one(&s.pool)
+            .await?,
+        b,
+        "not merged yet"
+    );
+
+    // Accepting with the freshly-read recipient token commits.
+    let fresh = s.recipient_merge_preview(&b, &request, NOW).await?;
+    command(
+        s,
+        &b,
+        PeopleCommand::RespondRequest {
+            id: request,
+            accept: true,
+            recipient_preview_token: Some(fresh.token),
+        },
+    )
+    .await?;
+    assert_eq!(s.person_detail(&a, &source).await?.person.id, target);
+
+    // Separate pair: the sender's own visibility changes after proposing (`b` revokes `a`'s
+    // access to `target2`), so `a` can no longer reproduce their original preview — the
+    // recipient read reports `stale: true`, still 200, not an error.
+    let source2 = person(s, &a, "Morgan Two", Policy::default()).await?;
+    let target2 = person(s, &b, "Morgan Two", share(&a)).await?;
+    let preview2 = s.merge_preview(&a, &source2, &target2).await?;
+    let request2 = id();
+    command(
+        s,
+        &a,
+        PeopleCommand::RequestMerge {
+            id: request2.clone(),
+            source_id: source2,
+            target_id: target2.clone(),
+            preview_token: preview2.token,
+            name: "Morgan Two".into(),
+        },
+    )
+    .await?;
+    let target2_version = s.resource_policy(&b, &target2).await?.version;
+    s.management(
+        &b,
+        &id(),
+        &[ManagementCommand::ReplacePolicy {
+            id: target2,
+            expected_version: target2_version,
+            policy: Policy::default(),
+        }],
+        NOW,
+    )
+    .await?;
+    let stale = s.recipient_merge_preview(&b, &request2, NOW).await?;
+    assert!(stale.stale);
+    assert!(stale.source.is_none());
+    Ok(())
+}
+#[tokio::test]
+async fn recipient_safe_merge_preview_and_acceptance_check() -> Result<()> {
+    let (s, _dir) = setup().await?;
+    recipient_safe_preview_scenario(&s).await
+}
+
+/// BE-Q16 edge cases: withdrawn (404, distinct from expired), expired-but-unswept (410), the
+/// wrong proposal kind (422), and ownership shifting away from the recipient after the request
+/// was created (403, re-checked fresh rather than cached from request-creation time).
+async fn recipient_preview_edge_cases_scenario(s: &Store) -> Result<()> {
+    let a = account(s).await?;
+    let b = account(s).await?;
+
+    // Withdrawn: cancelled by the sender before the recipient reads the preview -> 404, not 410.
+    let source = person(s, &a, "Morgan", Policy::default()).await?;
+    let target = person(s, &b, "Morgan", share(&a)).await?;
+    let preview = s.merge_preview(&a, &source, &target).await?;
+    let request = id();
+    command(
+        s,
+        &a,
+        PeopleCommand::RequestMerge {
+            id: request.clone(),
+            source_id: source.clone(),
+            target_id: target.clone(),
+            preview_token: preview.token,
+            name: "Morgan".into(),
+        },
+    )
+    .await?;
+    command(
+        s,
+        &a,
+        PeopleCommand::CancelRequest {
+            id: request.clone(),
+        },
+    )
+    .await?;
+    assert_eq!(
+        s.recipient_merge_preview(&b, &request, NOW)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "not_found"
+    );
+
+    // Expired but not yet swept: distinguishable from "withdrawn".
+    let source2 = person(s, &a, "Morgan Two", Policy::default()).await?;
+    let target2 = person(s, &b, "Morgan Two", share(&a)).await?;
+    let preview2 = s.merge_preview(&a, &source2, &target2).await?;
+    let request2 = id();
+    command(
+        s,
+        &a,
+        PeopleCommand::RequestMerge {
+            id: request2.clone(),
+            source_id: source2.clone(),
+            target_id: target2.clone(),
+            preview_token: preview2.token,
+            name: "Morgan Two".into(),
+        },
+    )
+    .await?;
+    assert_eq!(
+        s.recipient_merge_preview(&b, &request2, NOW + 604801)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "invitation_expired"
+    );
+
+    // A `Link` proposal's request ID is the wrong kind for this endpoint.
+    let link_target = person(s, &a, "Linkable", Policy::default()).await?;
+    let link_request = id();
+    command(
+        s,
+        &a,
+        PeopleCommand::RequestLink {
+            id: link_request.clone(),
+            person_id: link_target,
+            account_id: b.clone(),
+            expected_version: 1,
+        },
+    )
+    .await?;
+    assert_eq!(
+        s.recipient_merge_preview(&b, &link_request, NOW)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "invalid_value"
+    );
+
+    // Ownership shifts away from the recipient after the request was created: a fresh
+    // ownership check at read time, not one cached from request-creation time, applies.
+    let source3 = person(s, &a, "Morgan Three", share(&b)).await?;
+    let target3 = person(s, &b, "Morgan Three", share(&a)).await?;
+    let preview3 = s.merge_preview(&a, &source3, &target3).await?;
+    let request3 = id();
+    command(
+        s,
+        &a,
+        PeopleCommand::RequestMerge {
+            id: request3.clone(),
+            source_id: source3.clone(),
+            target_id: target3.clone(),
+            preview_token: preview3.token,
+            name: "Morgan Three".into(),
+        },
+    )
+    .await?;
+    let c = account(s).await?;
+    let link_id = id();
+    command(
+        s,
+        &b,
+        PeopleCommand::RequestLink {
+            id: link_id.clone(),
+            person_id: target3.clone(),
+            account_id: c.clone(),
+            expected_version: 1,
+        },
+    )
+    .await?;
+    command(
+        s,
+        &c,
+        PeopleCommand::RespondRequest {
+            id: link_id,
+            accept: true,
+            recipient_preview_token: None,
+        },
+    )
+    .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT owner_id FROM resources WHERE id=$1")
+            .bind(&target3)
+            .fetch_one(&s.pool)
+            .await?,
+        c
+    );
+    assert_eq!(
+        s.recipient_merge_preview(&b, &request3, NOW)
+            .await
+            .unwrap_err()
+            .to_string(),
+        "forbidden"
+    );
+    Ok(())
+}
+#[tokio::test]
+async fn recipient_preview_withdrawn_expired_wrong_kind_and_ownership_shift() -> Result<()> {
+    let (s, _dir) = setup().await?;
+    recipient_preview_edge_cases_scenario(&s).await
+}
+
+/// BE-Q16 R1: a receipt committed under the wire format that existed before
+/// `recipient_preview_token` was added must still replay its stored result — rather than
+/// failing with `409 operation_conflict` — now that the struct has gained that field.
+///
+/// This does not run old code. It fixes the pre-existing wire format as a literal: the digest
+/// below is the independently precomputed SHA-256 of
+/// `atlas-command-v1\npeople-command-v1:{"kind":"respond_request","id":"11111111-1111-1111-1111-111111111111","accept":true}`
+/// — the exact two-field JSON a `RespondRequest{id,accept}` without this member serialised to.
+/// Manually seeding a `receipts`/`people_results` row with that literal digest and replaying
+/// today's three-field struct (the third field omitted via `skip_serializing_if`) checks that
+/// today's serialisation reproduces the same digest, which is exactly the guarantee R1 required.
+async fn legacy_receipt_wire_format_replay_scenario(s: &Store) -> Result<()> {
+    let a = account(s).await?;
+    let b = account(s).await?;
+    let p = person(s, &a, "Legacy Wire Format", Policy::default()).await?;
+    let request_id = "11111111-1111-1111-1111-111111111111".to_string();
+    command(
+        s,
+        &a,
+        PeopleCommand::RequestLink {
+            id: request_id.clone(),
+            person_id: p.clone(),
+            account_id: b.clone(),
+            expected_version: 1,
+        },
+    )
+    .await?;
+
+    const LEGACY_DIGEST: &str = "abc0dd75600b2a6c8167f8982857e2cf131ae2a4aba432a73a27f3e556f1ee3d";
+    let legacy_operation = id();
+    sqlx::query(
+        "INSERT INTO receipts(account_id,operation_id,payload,revision) VALUES ($1,$2,$3,$4)",
+    )
+    .bind(&b)
+    .bind(&legacy_operation)
+    .bind(LEGACY_DIGEST)
+    .bind(999_999_i64)
+    .execute(&s.pool)
+    .await?;
+    sqlx::query("INSERT INTO people_results VALUES ($1,$2,$3)")
+        .bind(&b)
+        .bind(&legacy_operation)
+        .bind(&p)
+        .execute(&s.pool)
+        .await?;
+
+    let replay = s
+        .people_command(
+            &b,
+            &legacy_operation,
+            &PeopleCommand::RespondRequest {
+                id: request_id,
+                accept: true,
+                recipient_preview_token: None,
+            },
+            NOW,
+        )
+        .await?;
+    assert_eq!(
+        replay.revision, 999_999,
+        "the seeded legacy receipt was returned, not a fresh commit"
+    );
+    assert_eq!(replay.person_id, p);
+    Ok(())
+}
+#[tokio::test]
+async fn legacy_receipt_wire_format_still_replays() -> Result<()> {
+    let (s, _dir) = setup().await?;
+    legacy_receipt_wire_format_replay_scenario(&s).await
 }

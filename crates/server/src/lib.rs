@@ -16,6 +16,7 @@ macro_rules! hook {
 mod household_routes;
 use household_routes::{
     default_templates, defaults, directory, households, invitations, management, resource_policy,
+    sent_invitations,
 };
 mod resource_routes;
 use resource_routes::{access_commands, commands, sync};

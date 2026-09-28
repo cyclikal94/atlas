@@ -1,6 +1,6 @@
 {
-  "api_version": "0.21.0",
-  "contract_sha256": "81f476fb9e71a92bbbf8129f093988b45cc9e5f9e9bc1bfac2dda7e2884f0539",
+  "api_version": "0.24.0",
+  "contract_sha256": "1c8be785affc9f2c5cee94d7ea4e656b01b96e7044aed18778ed03ab8cd020f2",
   "behaviour": {
     "activation": {
       "activate": {
@@ -60,6 +60,52 @@
       "omitted_preserves": {
         "code": null,
         "status": 200
+      }
+    },
+    "calendar_refresh_errors": {
+      "connection_unavailable": {
+        "code": "connection_unavailable",
+        "reason": null,
+        "status": 422
+      },
+      "integration_unconfigured": {
+        "code": "integration_unconfigured",
+        "reason": null,
+        "status": 503
+      },
+      "lease_refresh_in_progress_expired_held": {
+        "refresh_in_progress": false,
+        "status": 200
+      },
+      "lease_refresh_in_progress_live": {
+        "refresh_in_progress": true,
+        "status": 200
+      },
+      "refresh_in_progress_after": {
+        "refresh_in_progress": false,
+        "status": 200
+      },
+      "refresh_in_progress_before": {
+        "refresh_in_progress": false,
+        "status": 200
+      },
+      "refresh_in_progress_configuration_changed_held": {
+        "refresh_in_progress": false,
+        "status": 200
+      },
+      "refresh_in_progress_during": {
+        "refresh_in_progress": true,
+        "status": 200
+      },
+      "stale_refresh_generation_changed": {
+        "code": "stale_refresh",
+        "reason": "generation_changed",
+        "status": 409
+      },
+      "stale_refresh_lease_expired": {
+        "code": "stale_refresh",
+        "reason": "lease_expired",
+        "status": 409
       }
     },
     "command_batch": {
@@ -148,6 +194,10 @@
       "conflict": [
         409,
         "conflict"
+      ],
+      "connection_unavailable": [
+        422,
+        "connection_unavailable"
       ],
       "credential_mismatch": [
         403,
@@ -331,6 +381,49 @@
       "referrer_policy": "no-referrer",
       "set_cookie": false,
       "status": 401
+    },
+    "merge_preview_and_sent_history": {
+      "merge_accept_missing_recipient_token": {
+        "code": "conflict",
+        "status": 409
+      },
+      "recipient_preview_expired": {
+        "code": "invitation_expired",
+        "status": 410
+      },
+      "recipient_preview_fresh_one_side_hidden": {
+        "source_omitted": true,
+        "stale": false,
+        "status": 200,
+        "target_omitted": false
+      },
+      "recipient_preview_stale_after_sender_visibility_change": {
+        "stale": true,
+        "status": 200
+      },
+      "recipient_preview_withdrawn": {
+        "code": "not_found",
+        "status": 404
+      },
+      "sent_invitations": {
+        "count": 2,
+        "next_after": null,
+        "states": [
+          "expired",
+          "revoked"
+        ],
+        "status": 200
+      },
+      "sent_people_requests": {
+        "count": 3,
+        "next_after": null,
+        "states": [
+          "cancelled",
+          "expired",
+          "pending"
+        ],
+        "status": 200
+      }
     },
     "ready": {
       "body": {

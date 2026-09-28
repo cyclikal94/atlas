@@ -6,6 +6,8 @@ mod requests;
 mod workflows;
 use crate::{Projection, Store};
 use anyhow::{Result, ensure};
+pub use merging::RecipientMergePreview;
+pub use requests::{SentPeopleRequest, SentPeopleRequestPage};
 use serde::Serialize;
 use std::collections::BTreeSet;
 pub use workflows::*;

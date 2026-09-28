@@ -17,6 +17,9 @@ async fn account(s: &Store) -> Result<String> {
 async fn manage(s: &Store, a: &str, c: M) -> Result<i64> {
     s.management(a, &id(), &[c], 1000).await
 }
+async fn manage_at(s: &Store, a: &str, c: M, now: i64) -> Result<i64> {
+    s.management(a, &id(), &[c], now).await
+}
 fn person(id: &str, policy: Option<Policy>) -> Command {
     Command::CreatePerson {
         id: id.into(),
@@ -570,4 +573,327 @@ async fn former_household_defaults(s: &Store) -> Result<()> {
 async fn former_member_cannot_observe_default_activity() -> Result<()> {
     let (_d, s) = fixture().await?;
     former_household_defaults(&s).await
+}
+
+/// BE-Q16: sent-invitation history across accepted/declined/revoked, all reported by
+/// `sent_invitations`, and the "pending && expired" rule only firing on the still-pending one.
+async fn sent_invitation_history_scenario(s: &Store) -> Result<()> {
+    let a = account(s).await?;
+    let accepted_by = account(s).await?;
+    let declined_by = account(s).await?;
+    let revoked_recipient = account(s).await?;
+    let pending_recipient = account(s).await?;
+    let h = id();
+    manage(
+        s,
+        &a,
+        M::CreateHousehold {
+            id: h.clone(),
+            name: "Sent history".into(),
+        },
+    )
+    .await?;
+
+    let accepted = id();
+    let version = s.households(&a).await?[0].version;
+    manage(
+        s,
+        &a,
+        M::InviteToHousehold {
+            id: accepted.clone(),
+            household_id: h.clone(),
+            recipient_id: accepted_by.clone(),
+            expected_version: version,
+        },
+    )
+    .await?;
+    manage(
+        s,
+        &accepted_by,
+        M::RespondToHouseholdInvitation {
+            id: accepted.clone(),
+            expected_version: 1,
+            accept: true,
+        },
+    )
+    .await?;
+
+    let declined = id();
+    let version = s.households(&a).await?[0].version;
+    manage(
+        s,
+        &a,
+        M::InviteToHousehold {
+            id: declined.clone(),
+            household_id: h.clone(),
+            recipient_id: declined_by.clone(),
+            expected_version: version,
+        },
+    )
+    .await?;
+    manage(
+        s,
+        &declined_by,
+        M::RespondToHouseholdInvitation {
+            id: declined.clone(),
+            expected_version: 1,
+            accept: false,
+        },
+    )
+    .await?;
+
+    let revoked = id();
+    let version = s.households(&a).await?[0].version;
+    manage(
+        s,
+        &a,
+        M::InviteToHousehold {
+            id: revoked.clone(),
+            household_id: h.clone(),
+            recipient_id: revoked_recipient.clone(),
+            expected_version: version,
+        },
+    )
+    .await?;
+    manage(
+        s,
+        &a,
+        M::RevokeHouseholdInvitation {
+            id: revoked.clone(),
+            expected_version: 1,
+        },
+    )
+    .await?;
+
+    let pending = id();
+    let version = s.households(&a).await?[0].version;
+    manage(
+        s,
+        &a,
+        M::InviteToHousehold {
+            id: pending.clone(),
+            household_id: h,
+            recipient_id: pending_recipient,
+            expected_version: version,
+        },
+    )
+    .await?;
+
+    let page = s.sent_invitations(&a, None, 200, 1000).await?;
+    let states: std::collections::BTreeMap<String, String> = page
+        .items
+        .iter()
+        .map(|item| (item.id.clone(), item.status.clone()))
+        .collect();
+    assert_eq!(states[&accepted], "accepted");
+    assert_eq!(states[&declined], "declined");
+    assert_eq!(states[&revoked], "revoked");
+    assert_eq!(states[&pending], "pending");
+    assert!(page.next_after.is_none());
+
+    // Past the expiry horizon: only the still-pending invitation computes as "expired"; the
+    // already-terminal ones keep their true state.
+    let later = s
+        .sent_invitations(&a, None, 200, 1000 + 7 * 86400 + 1)
+        .await?;
+    let states: std::collections::BTreeMap<String, String> = later
+        .items
+        .iter()
+        .map(|item| (item.id.clone(), item.status.clone()))
+        .collect();
+    assert_eq!(states[&accepted], "accepted");
+    assert_eq!(states[&declined], "declined");
+    assert_eq!(states[&revoked], "revoked");
+    assert_eq!(states[&pending], "expired");
+
+    assert!(s.sent_invitations(&a, None, 0, 1000).await.is_err());
+    assert!(s.sent_invitations(&a, None, 201, 1000).await.is_err());
+    Ok(())
+}
+#[tokio::test]
+async fn sent_invitations_reports_all_states_including_computed_expiry() -> Result<()> {
+    let (_d, s) = fixture().await?;
+    sent_invitation_history_scenario(&s).await
+}
+
+/// BE-Q16: `RemoveHouseholdMember`'s cascade-revoke of a removed member's other stale pending
+/// invitations to the same household must flip every matching history row, reflected via the
+/// identical `WHERE` predicate rather than an id list.
+async fn cascade_revoke_reflected_in_history_scenario(s: &Store) -> Result<()> {
+    let a = account(s).await?;
+    let b = account(s).await?;
+    let h = id();
+    manage(
+        s,
+        &a,
+        M::CreateHousehold {
+            id: h.clone(),
+            name: "Cascade".into(),
+        },
+    )
+    .await?;
+
+    // An old invitation to `b` that nobody ever responded to and that has since fallen past its
+    // own expiry window — still `status='pending'` in storage (no cleanup job purges it).
+    let stale = id();
+    let version = s.households(&a).await?[0].version;
+    manage_at(
+        s,
+        &a,
+        M::InviteToHousehold {
+            id: stale.clone(),
+            household_id: h.clone(),
+            recipient_id: b.clone(),
+            expected_version: version,
+        },
+        1000,
+    )
+    .await?;
+
+    // Well past `stale`'s expiry, `b` is invited again and joins via this second invitation.
+    let later_now = 1000 + 7 * 86400 + 1;
+    let joined = id();
+    let version = s.households(&a).await?[0].version;
+    manage_at(
+        s,
+        &a,
+        M::InviteToHousehold {
+            id: joined.clone(),
+            household_id: h.clone(),
+            recipient_id: b.clone(),
+            expected_version: version,
+        },
+        later_now,
+    )
+    .await?;
+    manage_at(
+        s,
+        &b,
+        M::RespondToHouseholdInvitation {
+            id: joined.clone(),
+            expected_version: 1,
+            accept: true,
+        },
+        later_now,
+    )
+    .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM household_invitations WHERE id=$1")
+            .bind(&stale)
+            .fetch_one(&s.pool)
+            .await?,
+        "pending",
+        "the stale invitation is still nominally pending in storage"
+    );
+
+    let version = s.households(&a).await?[0].version;
+    manage_at(
+        s,
+        &a,
+        M::RemoveHouseholdMember {
+            household_id: h,
+            account_id: b,
+            expected_version: version,
+        },
+        later_now,
+    )
+    .await?;
+
+    for table in ["household_invitations", "household_invitation_history"] {
+        let stale_status: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT status FROM {table} WHERE id=$1"
+        )))
+        .bind(&stale)
+        .fetch_one(&s.pool)
+        .await?;
+        assert_eq!(
+            stale_status, "revoked",
+            "{table} reflects the cascade for the stale invite"
+        );
+        // The cascade predicate only touches still-`pending` rows: the invitation `b` actually
+        // joined through was already `accepted` and must be untouched by it.
+        let joined_status: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT status FROM {table} WHERE id=$1"
+        )))
+        .bind(&joined)
+        .fetch_one(&s.pool)
+        .await?;
+        assert_eq!(
+            joined_status, "accepted",
+            "{table} leaves the already-accepted invitation alone"
+        );
+    }
+    Ok(())
+}
+#[tokio::test]
+async fn cascade_revoke_on_removal_reflected_in_both_tables() -> Result<()> {
+    let (_d, s) = fixture().await?;
+    cascade_revoke_reflected_in_history_scenario(&s).await
+}
+
+/// Two concurrent `RespondToHouseholdInvitation` calls (accept and decline) against the same
+/// pending invitation: exactly one commits, and the operational and durable history rows end up
+/// consistent with each other.
+async fn concurrent_invitation_responses_scenario(s: &Store) -> Result<()> {
+    let a = account(s).await?;
+    let b = account(s).await?;
+    let h = id();
+    manage(
+        s,
+        &a,
+        M::CreateHousehold {
+            id: h.clone(),
+            name: "Race".into(),
+        },
+    )
+    .await?;
+    let invitation = id();
+    let version = s.households(&a).await?[0].version;
+    manage(
+        s,
+        &a,
+        M::InviteToHousehold {
+            id: invitation.clone(),
+            household_id: h,
+            recipient_id: b.clone(),
+            expected_version: version,
+        },
+    )
+    .await?;
+
+    let accept_op = id();
+    let accept_command = [M::RespondToHouseholdInvitation {
+        id: invitation.clone(),
+        expected_version: 1,
+        accept: true,
+    }];
+    let decline_op = id();
+    let decline_command = [M::RespondToHouseholdInvitation {
+        id: invitation.clone(),
+        expected_version: 1,
+        accept: false,
+    }];
+    let accept = s.management(&b, &accept_op, &accept_command, 1000);
+    let decline = s.management(&b, &decline_op, &decline_command, 1000);
+    let (accept, decline) = tokio::join!(accept, decline);
+    assert_ne!(accept.is_ok(), decline.is_ok());
+
+    let operational: String =
+        sqlx::query_scalar("SELECT status FROM household_invitations WHERE id=$1")
+            .bind(&invitation)
+            .fetch_one(&s.pool)
+            .await?;
+    let historical: String =
+        sqlx::query_scalar("SELECT status FROM household_invitation_history WHERE id=$1")
+            .bind(&invitation)
+            .fetch_one(&s.pool)
+            .await?;
+    assert_eq!(operational, historical);
+    assert!(operational == "accepted" || operational == "declined");
+    Ok(())
+}
+#[tokio::test]
+async fn concurrent_invitation_responses_keep_history_consistent() -> Result<()> {
+    let (_d, s) = fixture().await?;
+    concurrent_invitation_responses_scenario(&s).await
 }

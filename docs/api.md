@@ -48,6 +48,41 @@ batches at eight. The explicit `ErrorCode::TemporarilyUnavailable` application e
 now maps to `503 temporarily_unavailable`, as already documented for the affected
 operations, instead of falling through to `500 internal_error`. The compatibility
 baseline covers both corrections and preserves the earlier protocol probes.
+`0.24.0` adds recipient-safe merge previews, durable sent-request/invitation
+history and distinct calendar-refresh outcomes. These changes share one combined
+contract and compatibility baseline.
+
+A recipient can read `GET /people/requests/{id}/merge-preview` even when one
+identity is hidden from them; the hidden identity and its fields are omitted.
+Accepting a merge requires a fresh `recipient_preview_token`, with `409 conflict`
+for a missing or stale token. Withdrawn/handled and expired requests remain
+separately observable as `404` and `410`. Existing response receipts keep their
+legacy fingerprints when the optional recipient token is absent, so a retry of
+an already completed operation still returns its original receipt.
+
+`GET /people/requests/sent` and `GET /invitations/sent` provide sender-scoped,
+paginated history that survives operational-row cleanup, including authoritative
+accepted, declined, withdrawn/revoked and expired states. Sent entries identify
+their recipients by account ID and username, including when directory browsing
+is disabled. Inbound invitation responses keep their existing shape. Durable
+history is backfilled by database schema migration `1002 → 1003`.
+
+Missing or undecryptable calendar connection details return
+`422 connection_unavailable`; absent server encryption configuration returns
+`503 integration_unconfigured`. Superseded or expired refresh leases return
+`409 stale_refresh` with `reason` equal to `generation_changed` or
+`lease_expired`. Either `refreshCalendar` or the successful-parse finish stage of
+`importCalendar` can return that reason. Archived-source and access/existence
+failures retain their own guarded outcomes. Parser-stage invalid dates and
+oversized event summaries retain `502 fetch_failed`; their failure publication
+updates health, settles the lease and permits a corrected immediate retry.
+
+`GET /calendar-sources` includes a read-time `refresh_in_progress` boolean,
+derived from the valid live lease and never persisted. It becomes false after
+configuration invalidation or lease expiry even while an obsolete provider
+response remains in flight. The compatibility probes assert these observations,
+both stale-refresh reasons, the distinct refresh errors, recipient-preview
+acceptance and sent-history behaviour alongside the existing protocol floor.
 
 Mutations require an account-scoped UUID `Idempotency-Key` and explicit version
 preconditions where defined. Commands that replace existing authored text also carry the
@@ -79,7 +114,7 @@ statuses and [sync](sync.md) for client recovery.
 `GET /health` returns the version of the API contract the running server was built with:
 
 ```json
-{"status": "ok", "api_version": "0.21.0"}
+{"status": "ok", "api_version": "0.24.0"}
 ```
 
 `api_version` is exactly `info.version` in [the contract](../api/openapi.json), read from

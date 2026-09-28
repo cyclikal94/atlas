@@ -2,7 +2,7 @@
   "openapi": "3.1.1",
   "info": {
     "title": "Atlas API",
-    "version": "0.21.0",
+    "version": "0.24.0",
     "description": "Pre-release API. Breaking changes and explicit database resets are permitted until a supported release."
   },
   "servers": [
@@ -11,7 +11,10 @@
       "variables": {
         "scheme": {
           "default": "https",
-          "enum": ["http", "https"]
+          "enum": [
+            "http",
+            "https"
+          ]
         },
         "host": {
           "default": "api.example.com"
@@ -1511,6 +1514,211 @@
           ]
         },
         "description": "Pending unexpired household invitations addressed to this account. Invitations do not enrol an account until accepted."
+      }
+    },
+    "/invitations/sent": {
+      "get": {
+        "operationId": "getSentInvitations",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SentInvitationPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "malformed_request",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "unauthenticated",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "forbidden",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "invalid_value",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "internal_error",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "slice_capacity, temporarily_unavailable",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "x-error-codes": {
+          "400": [
+            "malformed_request"
+          ],
+          "401": [
+            "unauthenticated"
+          ],
+          "403": [
+            "forbidden",
+            "credential_mismatch"
+          ],
+          "404": [
+            "not_found"
+          ],
+          "422": [
+            "invalid_value"
+          ],
+          "500": [
+            "internal_error"
+          ],
+          "503": [
+            "slice_capacity",
+            "temporarily_unavailable"
+          ]
+        },
+        "parameters": [
+          {
+            "in": "query",
+            "name": "after",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          }
+        ],
+        "description": "Durable, all-states (pending/accepted/declined/revoked/expired) sent household-invitation history keyed by sender, backed by a record with no automatic age limit that survives the operational table's cleanup. Each row names its recipient (account ID and username) so a fresh device can label and act on it without any local mapping; this is the sender's own choice of recipient, so it is returned whether or not the account directory is enabled. Paginated; not part of the sync/offline projection model."
       }
     },
     "/defaults": {
@@ -11930,7 +12138,7 @@
             }
           },
           "422": {
-            "description": "invalid_value, invalid_ics, unsupported_calendar_timezone, unsupported_calendar_rule, calendar_limit, invalid_endpoint, outbound_denied, invalid_subscription, reminder_time_required",
+            "description": "invalid_value, invalid_ics, unsupported_calendar_timezone, unsupported_calendar_rule, calendar_limit, invalid_endpoint, outbound_denied, invalid_subscription, reminder_time_required, connection_unavailable",
             "content": {
               "application/json": {
                 "schema": {
@@ -12038,7 +12246,8 @@
             "invalid_endpoint",
             "outbound_denied",
             "invalid_subscription",
-            "reminder_time_required"
+            "reminder_time_required",
+            "connection_unavailable"
           ],
           "503": [
             "slice_capacity",
@@ -14675,6 +14884,481 @@
         "summary": "List incoming people requests"
       }
     },
+    "/people/requests/sent": {
+      "get": {
+        "operationId": "getSentPeopleRequests",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SentPeopleRequestPage"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "malformed_request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "unauthenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "conflict, operation_conflict, defaults_changed, materialisation_required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "invalid_value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "slice_capacity, temporarily_unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "internal_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          }
+        },
+        "x-error-codes": {
+          "400": [
+            "malformed_request"
+          ],
+          "401": [
+            "unauthenticated"
+          ],
+          "403": [
+            "forbidden",
+            "credential_mismatch"
+          ],
+          "404": [
+            "not_found"
+          ],
+          "409": [
+            "conflict",
+            "operation_conflict",
+            "defaults_changed",
+            "materialisation_required"
+          ],
+          "422": [
+            "invalid_value"
+          ],
+          "503": [
+            "slice_capacity",
+            "temporarily_unavailable"
+          ],
+          "500": [
+            "internal_error"
+          ]
+        },
+        "parameters": [
+          {
+            "in": "query",
+            "name": "after",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          }
+        ],
+        "description": "Durable, all-states (pending/accepted/declined/cancelled/expired) sent-request history keyed by sender, backed by a record separate from the operational table's cleanup/expiry so it has no automatic age limit. Each row names its recipient (account ID and username). Paginated; not part of the sync/offline projection model.",
+        "summary": "List sent people requests, all states"
+      }
+    },
+    "/people/requests/{id}/merge-preview": {
+      "get": {
+        "operationId": "getRecipientMergePreview",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecipientMergePreview"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "malformed_request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "unauthenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "conflict, operation_conflict, defaults_changed, materialisation_required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "invitation_expired",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "invalid_value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "slice_capacity, temporarily_unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "internal_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          }
+        },
+        "x-error-codes": {
+          "400": [
+            "malformed_request"
+          ],
+          "401": [
+            "unauthenticated"
+          ],
+          "403": [
+            "forbidden",
+            "credential_mismatch"
+          ],
+          "404": [
+            "not_found"
+          ],
+          "409": [
+            "conflict",
+            "operation_conflict",
+            "defaults_changed",
+            "materialisation_required"
+          ],
+          "410": [
+            "invitation_expired"
+          ],
+          "422": [
+            "invalid_value"
+          ],
+          "503": [
+            "slice_capacity",
+            "temporarily_unavailable"
+          ],
+          "500": [
+            "internal_error"
+          ]
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "description": "Request-authorised preview for the recipient of a pending merge request, filtered to fields the recipient can currently see. The identity the recipient does not own is omitted rather than erroring when it is not visible. `stale: true` means the sender's own view of this merge has changed since the request was made, but the recipient's current-state preview is still returned so they can inspect it. Distinguishes an expired request (410) from one withdrawn or already handled (404).",
+        "summary": "Preview a pending merge request for its recipient"
+      }
+    },
     "/people-commands": {
       "post": {
         "operationId": "executePeopleCommand",
@@ -15249,6 +15933,10 @@
             "type": "array",
             "maxItems": 0,
             "description": "Reserved; this slice returns an empty list."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Present only for 409 stale_refresh from refreshCalendar or importCalendar (both raise it from the same finish-stage check): generation_changed or lease_expired."
           }
         },
         "required": [
@@ -20588,6 +21276,10 @@
           },
           "accept": {
             "type": "boolean"
+          },
+          "recipient_preview_token": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
           }
         },
         "required": [
@@ -20808,6 +21500,221 @@
         },
         "required": [
           "items"
+        ],
+        "additionalProperties": false
+      },
+      "RecipientMergePreview": {
+        "type": "object",
+        "properties": {
+          "token": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Projection"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "target": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Projection"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MergeField"
+            },
+            "maxItems": 200
+          },
+          "requires_approval": {
+            "type": "boolean"
+          },
+          "combines_identity_audiences": {
+            "type": "boolean"
+          },
+          "freezes_field_policies": {
+            "type": "boolean"
+          },
+          "stale": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "token",
+          "source",
+          "target",
+          "fields",
+          "requires_approval",
+          "combines_identity_audiences",
+          "freezes_field_policies",
+          "stale"
+        ],
+        "additionalProperties": false
+      },
+      "SentPeopleRequest": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "recipient_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "recipient_username": {
+            "type": "string"
+          },
+          "expires_at": {
+            "type": "integer"
+          },
+          "state": {
+            "enum": [
+              "pending",
+              "accepted",
+              "declined",
+              "cancelled",
+              "expired"
+            ]
+          },
+          "proposal": {
+            "$ref": "#/components/schemas/PeopleProposal"
+          }
+        },
+        "required": [
+          "id",
+          "recipient_id",
+          "recipient_username",
+          "expires_at",
+          "state",
+          "proposal"
+        ],
+        "additionalProperties": false
+      },
+      "SentPeopleRequestPage": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SentPeopleRequest"
+            },
+            "maxItems": 200
+          },
+          "next_after": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_after"
+        ],
+        "additionalProperties": false
+      },
+      "SentInvitation": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "household_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "household_name": {
+            "type": "string"
+          },
+          "sender_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "recipient_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "recipient_username": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "accepted",
+              "declined",
+              "revoked",
+              "expired"
+            ]
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "id",
+          "household_id",
+          "household_name",
+          "sender_id",
+          "recipient_id",
+          "recipient_username",
+          "status",
+          "expires_at",
+          "version"
+        ],
+        "additionalProperties": false
+      },
+      "SentInvitationPage": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SentInvitation"
+            },
+            "maxItems": 200
+          },
+          "next_after": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_after"
         ],
         "additionalProperties": false
       }

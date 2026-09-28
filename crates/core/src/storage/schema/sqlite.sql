@@ -344,6 +344,20 @@ CREATE TABLE people_results (
 
 CREATE TABLE people_request_ids (id TEXT PRIMARY KEY);
 
+CREATE TABLE people_request_history (
+ id TEXT PRIMARY KEY, sender_id TEXT NOT NULL REFERENCES accounts(id),
+ recipient_id TEXT NOT NULL REFERENCES accounts(id), kind TEXT NOT NULL,
+ payload TEXT NOT NULL, state TEXT NOT NULL, expires_at BIGINT NOT NULL,
+ updated_at BIGINT NOT NULL
+);
+
+CREATE TABLE household_invitation_history (
+ id TEXT PRIMARY KEY, household_id TEXT NOT NULL REFERENCES households(id),
+ sender_id TEXT NOT NULL REFERENCES accounts(id),
+ recipient_id TEXT NOT NULL REFERENCES accounts(id), status TEXT NOT NULL,
+ expires_at BIGINT NOT NULL, version BIGINT NOT NULL, updated_at BIGINT NOT NULL
+);
+
 CREATE INDEX person_alias_target ON person_aliases(canonical_id);
 
 CREATE INDEX grants_account ON resource_grants(account_id,resource_id);
@@ -424,6 +438,10 @@ CREATE INDEX people_requests_recipient ON people_requests(recipient_id,state,id)
 
 CREATE INDEX people_requests_expiry ON people_requests(expires_at,id);
 
+CREATE INDEX people_request_history_sender ON people_request_history(sender_id,id);
+
+CREATE INDEX household_invitation_history_sender ON household_invitation_history(sender_id,id);
+
 CREATE UNIQUE INDEX activation_grant_identity ON activation_grants(grant_id);
 
 CREATE INDEX activation_grants_expiry ON activation_grants(expires_at);
@@ -459,4 +477,4 @@ BEGIN
  SELECT NEW.id,ancestor_id,depth+1 FROM resource_ancestors WHERE resource_id=NEW.parent_id;
 END;
 INSERT INTO sync_clock(id,revision,resource_count) VALUES(1,0,0);
-INSERT INTO atlas_schema(version) VALUES(1002);
+INSERT INTO atlas_schema(version) VALUES(1003);

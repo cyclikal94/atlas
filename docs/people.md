@@ -22,7 +22,7 @@ email addresses and fields are not searched. Account linking is always explicit.
 | --- | --- |
 | `reference_account` | Choose an existing account and a proposed person UUID. Return its canonical identity, creating it if needed. The referenced account owns the basic identity; the caller receives name access. Explicit identity exclusions are honoured. Existing contributions do not become visible merely by referencing the account. |
 | `request_link` | The owner of an unlinked person asks an account holder to accept linking, recording the current content and policy versions. |
-| `respond_request` | The recipient accepts or declines a pending request. |
+| `respond_request` | The recipient accepts or declines a pending request. Accepting a merge request whose preview `requires_approval` must also echo `recipient_preview_token` from a fresh `GET /people/requests/{id}/merge-preview` read; a stale or missing token is a `409 conflict`. Ignored for `Link` requests. A supplied token is part of the operation's replay fingerprint, so retry a lost response with the same operation ID *and the same token*; an operation without a token replays exactly as it did before the token existed. |
 | `cancel_request` | The sender cancels a pending request. |
 | `merge` | Merge two identities owned by the caller using a current preview token. |
 | `request_merge` | Request the other owner's approval where identities have different owners. Both must authorise the merge. |
@@ -45,6 +45,16 @@ identity information, not internal preview tokens or private contribution state.
 `GET /people/{id}` resolves an old merged ID to its current authorised canonical
 identity and reports its account link.
 
+`GET /people/requests/sent` lists this account's own sent requests, paginated and
+across every state (`pending`/`accepted`/`declined`/`cancelled`/`expired`), not just
+pending inbound ones. It is backed by a durable record mirrored alongside
+`people_requests` that has no automatic age limit, so a sent request still appears
+with its correct terminal state — including a computed `expired` — after the
+operational row is later purged by the same seven-day cleanup described above. Each
+row names its recipient (`recipient_id` and `recipient_username`), so a fresh device can
+label it without any local record of what was sent. This is an ordinary authenticated
+online read, not part of the sync/offline projection model.
+
 ## Merge privacy and offline identities
 
 `POST /people/merge-preview` takes `source_id` and `target_id`. The caller must own at
@@ -52,6 +62,21 @@ least one and see both. It returns the two visible identities, visible field IDs
 a token, and whether another owner's approval is needed. It explicitly reports that
 identity audiences combine and field policies freeze. Hidden field changes do not
 alter the public token; their current audiences are preserved at commit time.
+
+`GET /people/requests/{id}/merge-preview` is the equivalent read for the *recipient*
+of a pending merge request they did not initiate: it does not require the caller to
+independently pass `POST /people/merge-preview`'s "own at least one and see both"
+check for the identity they do not own. An identity or field the recipient cannot
+currently see is simply omitted from the response, never a permission error that
+would itself disclose its existence. `stale: true` means the sender's own view of
+the merge has changed since the request was made — recomputed and compared against
+the `preview_token` captured at request-creation time — but the read still succeeds
+with the recipient's current-state preview. The request no longer existing, having
+been withdrawn, or already handled is `404 not_found`; having expired but not yet
+swept is `410 invitation_expired`, distinguishing the two. Accepting the request
+must echo this read's `token` back as `recipient_preview_token` (see the
+`respond_request` table above); this is the acceptance-time check ensuring the
+recipient did not act on a preview computed under now-stale visibility.
 
 A merge keeps field IDs, values, ownership and birthday/task references. Source fields
 move under the target, with a version change for the parent update. The source becomes

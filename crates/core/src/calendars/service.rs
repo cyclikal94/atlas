@@ -1,5 +1,5 @@
 use super::ics::{Event, EventStatus, Feed};
-use crate::error::ErrorCode;
+use crate::error::{ErrorCode, StaleRefreshReason};
 use crate::{Projection, Store, identifier, policy::Policy, receipt_digest};
 use anyhow::{Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
@@ -346,9 +346,10 @@ impl Store {
         .fetch_one(&mut *tx)
         .await?;
         ensure!(
-            row.get::<i64, _>(0) == generation && row.get::<i64, _>(2) > now,
-            ErrorCode::StaleRefresh
+            row.get::<i64, _>(0) == generation,
+            StaleRefreshReason::GenerationChanged
         );
+        ensure!(row.get::<i64, _>(2) > now, StaleRefreshReason::LeaseExpired);
         ensure!(
             failure.is_none_or(|v| matches!(
                 v,
@@ -357,6 +358,8 @@ impl Store {
                     | "unsupported_calendar_rule"
                     | "unsupported_calendar_timezone"
                     | "calendar_limit"
+                    | "connection_unavailable"
+                    | "integration_unconfigured"
             )),
             ErrorCode::InvalidValue
         );
@@ -516,6 +519,7 @@ impl Store {
         parent: Option<&str>,
         after: Option<&str>,
         limit: u16,
+        now: i64,
     ) -> Result<Vec<Projection>> {
         ensure!(
             matches!(kind, "calendar_source" | "event" | "review" | "reminder")
@@ -530,10 +534,36 @@ impl Store {
         }
         Self::epoch(&mut tx, actor).await?;
         let ids:Vec<String>=sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT r.id FROM resources r LEFT JOIN resource_grants g ON g.resource_id=r.id AND g.account_id=$1 WHERE r.kind=$2 AND ($3 IS NULL OR r.parent_id=$3) AND ($4 IS NULL OR r.id>$4) AND {} ORDER BY r.id LIMIT $5",crate::policy::VISIBLE))).bind(actor).bind(kind).bind(parent).bind(after).bind(i64::from(limit)).fetch_all(&mut *tx).await?;
-        let values = Self::subset(&mut tx, actor, &ids.into_iter().collect())
+        let mut values: Vec<Projection> = Self::subset(&mut tx, actor, &ids.into_iter().collect())
             .await?
             .into_values()
             .collect();
+        // Read-time, never-persisted: `source_value` cannot publish this (see B8 brief) since it
+        // is never called from `begin_calendar_refresh`, so a written value would be stale the
+        // instant a lease started or expired. Computed fresh, in the same transaction, instead.
+        if kind == "calendar_source" && !values.is_empty() {
+            let placeholders = (0..values.len())
+                .map(|i| format!("${}", i + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SELECT id,lease_until FROM calendar_sources WHERE id IN ({placeholders})"
+            )));
+            for value in &values {
+                query = query.bind(&value.id);
+            }
+            let leases: BTreeMap<String, i64> = query
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .map(|row| (row.get::<String, _>(0), row.get::<i64, _>(1)))
+                .collect();
+            for value in &mut values {
+                if let Some(&lease_until) = leases.get(&value.id) {
+                    value.value["refresh_in_progress"] = serde_json::json!(lease_until > now);
+                }
+            }
+        }
         tx.commit().await?;
         Ok(values)
     }

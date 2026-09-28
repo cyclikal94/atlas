@@ -33,6 +33,7 @@ const ERROR_CODES: &[ErrorCode] = &[
     ErrorCode::BatchTooLarge,
     ErrorCode::CalendarLimit,
     ErrorCode::Conflict,
+    ErrorCode::ConnectionUnavailable,
     ErrorCode::CredentialMismatch,
     ErrorCode::DefaultsChanged,
     ErrorCode::DeliveryFailed,
@@ -729,6 +730,790 @@ async fn command_batch_probes() -> Result<Value> {
     Ok(Value::Object(results))
 }
 
+/// BE-B8: safe, distinguishable calendar-refresh error codes, reached through the real
+/// `refresh_link` call path, not merely present in the OpenAPI enumeration. Covers
+/// `connection_unavailable` (cause 1, no connection at all), `integration_unconfigured` (cause
+/// 3: a connection sealed while the server had a key, refreshed once the key becomes unset —
+/// two `App` instances sharing one store, matching a real server restart with a changed
+/// `ATLAS_SECRET_KEY`) and `stale_refresh` with both a `generation_changed` reason (cause 4: a
+/// real fetch held in flight by a delayed loopback feed, raced by a concurrent settings edit)
+/// and a `lease_expired` reason (cause 5: the same in-flight fetch, but only the lease itself
+/// is forced past expiry, with no settings edit and no generation change).
+///
+/// Also records the read-time `refresh_in_progress` field on `GET /calendar-sources`, each
+/// observation asserted as well as recorded, at these points:
+/// - cause 4's source: `false` before any refresh; `true` while its fetch is held in flight;
+///   `false` immediately after the configuration edit, *while the superseded provider response is
+///   still held*; and `false` once the rejected attempt has completed;
+/// - cause 5's source: `true` while its fetch is held, then `false` once only `lease_until` has
+///   been forced into the past — again read before the provider response is released, so the
+///   expired read is not inferred from the later `lease_expired` rejection.
+///
+/// Before this coverage none of these read-time transitions was part of the enforced behaviour
+/// floor, so the field's semantics (including which clock the handler compares the lease with)
+/// could change without the version-bump discipline this baseline exists to enforce. Records
+/// only deterministic status/code/reason/`refresh_in_progress` shape, never a sealed ciphertext
+/// or random ID.
+async fn calendar_refresh_errors_probes() -> Result<Value> {
+    use crate::support::http::{delayed_feed, request};
+    use atlas_server::{hash_password, integrations::IntegrationConfig};
+
+    fn shape(reply: &(StatusCode, axum::http::HeaderMap, Value)) -> Value {
+        json!({"status": reply.0.as_u16(), "code": reply.2.get("code"), "reason": reply.2.get("reason")})
+    }
+    /// Reads `refresh_in_progress` for one source off `GET /calendar-sources` and returns its
+    /// recorded shape, asserting the expected value so a wrong observation fails the probe itself
+    /// as well as changing the recorded transcript.
+    async fn progress(app: &Router, auth: &str, id: &str, expected: bool) -> Value {
+        let list = request(
+            app,
+            "GET",
+            "calendar-sources",
+            &[("authorization", auth)],
+            Value::Null,
+        )
+        .await;
+        assert_eq!(list.0, StatusCode::OK, "{}", list.2);
+        let observed = list.2["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["id"] == id)
+            .and_then(|v| v["value"]["refresh_in_progress"].as_bool());
+        assert_eq!(
+            observed,
+            Some(expected),
+            "refresh_in_progress observation for {id}"
+        );
+        json!({"status": list.0.as_u16(), "refresh_in_progress": observed})
+    }
+
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let store = Store::connect(&url).await?;
+    store.migrate().await?;
+    let actor = Uuid::new_v4().to_string();
+    store
+        .add_account(
+            &actor,
+            "calendar-refresh-errors-probe",
+            &hash_password("calendar-refresh-errors-probe-123".into()).await?,
+        )
+        .await?;
+    let origin = "http://127.0.0.1:59997".to_string();
+    let key = "0d".repeat(32);
+    let app = App::new(store.clone())
+        .await?
+        .integration_config(IntegrationConfig::new(
+            Some(&key),
+            vec![origin.clone()],
+            None,
+            None,
+        )?)
+        .router();
+    let login = request(
+        &app,
+        "POST",
+        "sessions",
+        &[],
+        json!({"username":"calendar-refresh-errors-probe","password":"calendar-refresh-errors-probe-123","device_id":"probe"}),
+    )
+    .await;
+    assert_eq!(login.0, StatusCode::OK, "{}", login.2);
+    let token = login.2["access_token"].as_str().unwrap().to_owned();
+    let auth = format!("Bearer {token}");
+
+    let mut results = serde_json::Map::new();
+
+    // Cause 1: no connection at all.
+    let source = Uuid::new_v4().to_string();
+    let created = request(
+        &app,
+        "POST",
+        "calendar-commands",
+        &[
+            ("authorization", &auth),
+            ("idempotency-key", &Uuid::new_v4().to_string()),
+        ],
+        json!({"command":{"kind":"create_source","id":source,"label":"Calendar","timezone":"UTC"}}),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::OK, "{}", created.2);
+    let unavailable = request(
+        &app,
+        "POST",
+        &format!("calendar-sources/{source}/refresh"),
+        &[
+            ("authorization", &auth),
+            ("idempotency-key", &Uuid::new_v4().to_string()),
+        ],
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        unavailable.0,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        unavailable.2
+    );
+    assert_eq!(unavailable.2["code"], "connection_unavailable");
+    results.insert("connection_unavailable".into(), shape(&unavailable));
+
+    // Cause 3: sealed while this server had a key, refreshed through a second `App` sharing
+    // the same store but with no key configured.
+    let unconfigured_source = Uuid::new_v4().to_string();
+    let create_unconfigured = request(
+        &app,
+        "POST",
+        "calendar-commands",
+        &[
+            ("authorization", &auth),
+            ("idempotency-key", &Uuid::new_v4().to_string()),
+        ],
+        json!({"command":{"kind":"create_source","id":unconfigured_source,"label":"Calendar","timezone":"UTC",
+            "connection":{"url":format!("{origin}/feed"),"bearer":"probe-secret"}}}),
+    )
+    .await;
+    assert_eq!(
+        create_unconfigured.0,
+        StatusCode::OK,
+        "{}",
+        create_unconfigured.2
+    );
+    let unkeyed_app = App::new(store.clone())
+        .await?
+        .integration_config(IntegrationConfig::new(
+            None,
+            vec![origin.clone()],
+            None,
+            None,
+        )?)
+        .router();
+    let unconfigured = request(
+        &unkeyed_app,
+        "POST",
+        &format!("calendar-sources/{unconfigured_source}/refresh"),
+        &[
+            ("authorization", &auth),
+            ("idempotency-key", &Uuid::new_v4().to_string()),
+        ],
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        unconfigured.0,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "{}",
+        unconfigured.2
+    );
+    assert_eq!(unconfigured.2["code"], "integration_unconfigured");
+    results.insert("integration_unconfigured".into(), shape(&unconfigured));
+
+    // Cause 4: a real fetch held in flight by a delayed loopback feed, raced by a concurrent
+    // settings edit that bumps `generation` before the response is released.
+    let (feed_origin, mut arrived_rx, release_tx, feed_server) = delayed_feed().await?;
+    let stale_app = App::new(store.clone())
+        .await?
+        .integration_config(IntegrationConfig::new(
+            Some(&key),
+            vec![feed_origin.clone()],
+            None,
+            None,
+        )?)
+        .router();
+    let stale_source = Uuid::new_v4().to_string();
+    let create_stale = request(
+        &stale_app,
+        "POST",
+        "calendar-commands",
+        &[
+            ("authorization", &auth),
+            ("idempotency-key", &Uuid::new_v4().to_string()),
+        ],
+        json!({"command":{"kind":"create_source","id":stale_source,"label":"Calendar","timezone":"UTC",
+            "connection":{"url":format!("{feed_origin}/feed"),"bearer":"probe-secret"}}}),
+    )
+    .await;
+    assert_eq!(create_stale.0, StatusCode::OK, "{}", create_stale.2);
+    results.insert(
+        "refresh_in_progress_before".into(),
+        progress(&stale_app, &auth, &stale_source, false).await,
+    );
+    let refresh_task = {
+        let stale_app = stale_app.clone();
+        let auth = auth.clone();
+        let stale_source = stale_source.clone();
+        tokio::spawn(async move {
+            request(
+                &stale_app,
+                "POST",
+                &format!("calendar-sources/{stale_source}/refresh"),
+                &[
+                    ("authorization", &auth),
+                    ("idempotency-key", &Uuid::new_v4().to_string()),
+                ],
+                json!({}),
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), arrived_rx.recv())
+        .await?
+        .expect("feed connection");
+    results.insert(
+        "refresh_in_progress_during".into(),
+        progress(&stale_app, &auth, &stale_source, true).await,
+    );
+    let version: i64 = sqlx::query_scalar("SELECT version FROM resources WHERE id=$1")
+        .bind(&stale_source)
+        .fetch_one(&store.pool)
+        .await?;
+    let edit = request(
+        &stale_app,
+        "POST",
+        "calendar-commands",
+        &[
+            ("authorization", &auth),
+            ("idempotency-key", &Uuid::new_v4().to_string()),
+        ],
+        json!({"command":{"kind":"configure_source","id":stale_source,"expected_version":version,
+            "timezone":"Europe/London","enabled":true}}),
+    )
+    .await;
+    assert_eq!(edit.0, StatusCode::OK, "{}", edit.2);
+    // The edit cleared the lease, so the flag is already false while the superseded provider
+    // response is still held — read before that response is released.
+    results.insert(
+        "refresh_in_progress_configuration_changed_held".into(),
+        progress(&stale_app, &auth, &stale_source, false).await,
+    );
+    release_tx.send(()).ok();
+    let stale = tokio::time::timeout(std::time::Duration::from_secs(5), refresh_task)
+        .await?
+        .expect("refresh task panicked");
+    assert_eq!(stale.0, StatusCode::CONFLICT, "{}", stale.2);
+    assert_eq!(stale.2["code"], "stale_refresh");
+    assert_eq!(stale.2["reason"], "generation_changed");
+    results.insert("stale_refresh_generation_changed".into(), shape(&stale));
+    results.insert(
+        "refresh_in_progress_after".into(),
+        progress(&stale_app, &auth, &stale_source, false).await,
+    );
+    feed_server.abort();
+
+    // Cause 5: the identical in-flight fetch, but only the lease itself is forced past expiry
+    // (direct SQL, for test speed — a real 60-second wait would prove nothing a controlled
+    // value does not), with no settings edit and no generation change.
+    let (lease_origin, mut lease_arrived_rx, lease_release_tx, lease_feed_server) =
+        delayed_feed().await?;
+    let lease_app = App::new(store.clone())
+        .await?
+        .integration_config(IntegrationConfig::new(
+            Some(&key),
+            vec![lease_origin.clone()],
+            None,
+            None,
+        )?)
+        .router();
+    let lease_source = Uuid::new_v4().to_string();
+    let create_lease = request(
+        &lease_app,
+        "POST",
+        "calendar-commands",
+        &[
+            ("authorization", &auth),
+            ("idempotency-key", &Uuid::new_v4().to_string()),
+        ],
+        json!({"command":{"kind":"create_source","id":lease_source,"label":"Calendar","timezone":"UTC",
+            "connection":{"url":format!("{lease_origin}/feed"),"bearer":"probe-secret"}}}),
+    )
+    .await;
+    assert_eq!(create_lease.0, StatusCode::OK, "{}", create_lease.2);
+    let lease_refresh_task = {
+        let lease_app = lease_app.clone();
+        let auth = auth.clone();
+        let lease_source = lease_source.clone();
+        tokio::spawn(async move {
+            request(
+                &lease_app,
+                "POST",
+                &format!("calendar-sources/{lease_source}/refresh"),
+                &[
+                    ("authorization", &auth),
+                    ("idempotency-key", &Uuid::new_v4().to_string()),
+                ],
+                json!({}),
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), lease_arrived_rx.recv())
+        .await?
+        .expect("feed connection");
+    // Same source, same held fetch: live first, then — once only the lease timestamp has been
+    // forced into the past — not live, both read before the provider response is released. A
+    // read that treated any positive `lease_until` as live, or passed the wrong clock, would
+    // record `true` for the second observation.
+    results.insert(
+        "lease_refresh_in_progress_live".into(),
+        progress(&lease_app, &auth, &lease_source, true).await,
+    );
+    sqlx::query("UPDATE calendar_sources SET lease_until=1 WHERE id=$1")
+        .bind(&lease_source)
+        .execute(&store.pool)
+        .await?;
+    results.insert(
+        "lease_refresh_in_progress_expired_held".into(),
+        progress(&lease_app, &auth, &lease_source, false).await,
+    );
+    lease_release_tx.send(()).ok();
+    let lease_expired = tokio::time::timeout(std::time::Duration::from_secs(5), lease_refresh_task)
+        .await?
+        .expect("refresh task panicked");
+    assert_eq!(lease_expired.0, StatusCode::CONFLICT, "{}", lease_expired.2);
+    assert_eq!(lease_expired.2["code"], "stale_refresh");
+    assert_eq!(lease_expired.2["reason"], "lease_expired");
+    results.insert("stale_refresh_lease_expired".into(), shape(&lease_expired));
+    lease_feed_server.abort();
+
+    Ok(Value::Object(results))
+}
+/// BE-Q16 probes: the recipient-safe merge-preview read (one side hidden, staleness, the
+/// 410/404 distinction between an expired and a withdrawn/handled request), the `409` on a
+/// stale/missing `recipient_preview_token` at merge acceptance, and one page each of the
+/// people-request and household-invitation durable sent-history reads including an `"expired"`
+/// row produced after the operational cleanup/expiry rules would otherwise have hidden it.
+/// Random identities are kept out of the recorded transcript; only status/code/state shapes are.
+async fn merge_preview_and_sent_history_probes() -> Result<Value> {
+    use crate::support::http::request;
+    use atlas_core::{
+        Command, households::ManagementCommand as M, people::PeopleCommand, policy::Policy,
+        policy::PrincipalGrant,
+    };
+    use atlas_server::hash_password;
+
+    fn shape(reply: &(StatusCode, axum::http::HeaderMap, Value)) -> Value {
+        json!({"status": reply.0.as_u16(), "code": reply.2.get("code")})
+    }
+    fn share(id: &str) -> Policy {
+        Policy {
+            grants: vec![PrincipalGrant::Account {
+                id: id.into(),
+                edit: true,
+            }],
+            exclude_accounts: vec![],
+        }
+    }
+
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let store = Store::connect(&url).await?;
+    store.migrate().await?;
+    let app = App::new(store.clone()).await?.router();
+
+    let a = Uuid::new_v4().to_string();
+    let b = Uuid::new_v4().to_string();
+    store
+        .add_account(
+            &a,
+            "q16-sender",
+            &hash_password("q16-sender-pw-123".into()).await?,
+        )
+        .await?;
+    store
+        .add_account(
+            &b,
+            "q16-recipient",
+            &hash_password("q16-recipient-pw-123".into()).await?,
+        )
+        .await?;
+    let login = |username: &'static str, password: &'static str| {
+        let app = app.clone();
+        async move {
+            let reply = request(
+                &app,
+                "POST",
+                "sessions",
+                &[],
+                json!({"username":username,"password":password,"device_id":"probe"}),
+            )
+            .await;
+            assert_eq!(reply.0, StatusCode::OK, "{}", reply.2);
+            format!("Bearer {}", reply.2["access_token"].as_str().unwrap())
+        }
+    };
+    let auth_a = login("q16-sender", "q16-sender-pw-123").await;
+    let auth_b = login("q16-recipient", "q16-recipient-pw-123").await;
+    let now = atlas_server::now();
+
+    let mut results = serde_json::Map::new();
+
+    // Pair 1: a fresh-then-stale-then-withdrawn recipient preview. `source` is private to `a`
+    // (never shared with `b`); `target` is owned by `b` and shared only with `a`, so `a` (the
+    // initiator) can see both sides but `b` (the recipient) can never see `source`.
+    let source1 = Uuid::new_v4().to_string();
+    let target1 = Uuid::new_v4().to_string();
+    store
+        .apply(
+            &a,
+            &Uuid::new_v4().to_string(),
+            &[Command::CreatePerson {
+                id: source1.clone(),
+                name: "Probe Source".into(),
+                initial_policy: Some(Policy::default()),
+            }],
+        )
+        .await?;
+    store
+        .apply(
+            &b,
+            &Uuid::new_v4().to_string(),
+            &[Command::CreatePerson {
+                id: target1.clone(),
+                name: "Probe Target".into(),
+                initial_policy: Some(share(&a)),
+            }],
+        )
+        .await?;
+    let preview1 = store.merge_preview(&a, &source1, &target1).await?;
+    let request1 = Uuid::new_v4().to_string();
+    store
+        .people_command(
+            &a,
+            &Uuid::new_v4().to_string(),
+            &PeopleCommand::RequestMerge {
+                id: request1.clone(),
+                source_id: source1.clone(),
+                target_id: target1.clone(),
+                preview_token: preview1.token,
+                name: "Probe Merged".into(),
+            },
+            now,
+        )
+        .await?;
+    let fresh = request(
+        &app,
+        "GET",
+        &format!("people/requests/{request1}/merge-preview"),
+        &[("authorization", &auth_b)],
+        json!({}),
+    )
+    .await;
+    assert_eq!(fresh.0, StatusCode::OK, "{}", fresh.2);
+    assert!(fresh.2["source"].is_null(), "{}", fresh.2);
+    assert!(!fresh.2["target"].is_null(), "{}", fresh.2);
+    assert_eq!(fresh.2["stale"], json!(false));
+    results.insert(
+        "recipient_preview_fresh_one_side_hidden".into(),
+        json!({"status": fresh.0.as_u16(), "source_omitted": fresh.2["source"].is_null(),
+            "target_omitted": fresh.2["target"].is_null(), "stale": fresh.2["stale"]}),
+    );
+
+    // `b` revokes `a`'s access to `target1`: `a` can no longer reproduce their own original
+    // preview, so the recipient read is now `stale`, but still 200 (not an error).
+    let target1_version = store.resource_policy(&b, &target1).await?.version;
+    store
+        .management(
+            &b,
+            &Uuid::new_v4().to_string(),
+            &[M::ReplacePolicy {
+                id: target1.clone(),
+                expected_version: target1_version,
+                policy: Policy::default(),
+            }],
+            now,
+        )
+        .await?;
+    let stale = request(
+        &app,
+        "GET",
+        &format!("people/requests/{request1}/merge-preview"),
+        &[("authorization", &auth_b)],
+        json!({}),
+    )
+    .await;
+    assert_eq!(stale.0, StatusCode::OK, "{}", stale.2);
+    assert_eq!(stale.2["stale"], json!(true));
+    results.insert(
+        "recipient_preview_stale_after_sender_visibility_change".into(),
+        json!({"status": stale.0.as_u16(), "stale": stale.2["stale"]}),
+    );
+
+    // The sender withdraws the request: the recipient's preview read now reports 404, not 410 —
+    // distinct from the expired case below.
+    let cancelled = request(
+        &app,
+        "POST",
+        "people-commands",
+        &[
+            ("authorization", &auth_a),
+            ("idempotency-key", &Uuid::new_v4().to_string()),
+        ],
+        json!({"command":{"kind":"cancel_request","id":request1}}),
+    )
+    .await;
+    assert_eq!(cancelled.0, StatusCode::OK, "{}", cancelled.2);
+    let withdrawn = request(
+        &app,
+        "GET",
+        &format!("people/requests/{request1}/merge-preview"),
+        &[("authorization", &auth_b)],
+        json!({}),
+    )
+    .await;
+    results.insert("recipient_preview_withdrawn".into(), shape(&withdrawn));
+
+    // Pair 2: an expired-but-unswept request. Distinguishing 410 from 404 is the one case the
+    // brief requires to be told apart from "withdrawn".
+    let source2 = Uuid::new_v4().to_string();
+    let target2 = Uuid::new_v4().to_string();
+    store
+        .apply(
+            &a,
+            &Uuid::new_v4().to_string(),
+            &[Command::CreatePerson {
+                id: source2.clone(),
+                name: "Probe Source Two".into(),
+                initial_policy: Some(Policy::default()),
+            }],
+        )
+        .await?;
+    store
+        .apply(
+            &b,
+            &Uuid::new_v4().to_string(),
+            &[Command::CreatePerson {
+                id: target2.clone(),
+                name: "Probe Target Two".into(),
+                initial_policy: Some(share(&a)),
+            }],
+        )
+        .await?;
+    let preview2 = store.merge_preview(&a, &source2, &target2).await?;
+    let request2 = Uuid::new_v4().to_string();
+    store
+        .people_command(
+            &a,
+            &Uuid::new_v4().to_string(),
+            &PeopleCommand::RequestMerge {
+                id: request2.clone(),
+                source_id: source2.clone(),
+                target_id: target2.clone(),
+                preview_token: preview2.token,
+                name: "Probe Merged Two".into(),
+            },
+            now,
+        )
+        .await?;
+    // Mirrors what real time passing would do to both the operational row and its durable
+    // history mirror — a sent-history read must still show this as "expired" (below).
+    for table in ["people_requests", "people_request_history"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {table} SET expires_at=1 WHERE id=$1"
+        )))
+        .bind(&request2)
+        .execute(&store.pool)
+        .await?;
+    }
+    let expired = request(
+        &app,
+        "GET",
+        &format!("people/requests/{request2}/merge-preview"),
+        &[("authorization", &auth_b)],
+        json!({}),
+    )
+    .await;
+    results.insert("recipient_preview_expired".into(), shape(&expired));
+
+    // Pair 3: `b` accepts with a stale/missing `recipient_preview_token`: `409`, not committed.
+    let source3 = Uuid::new_v4().to_string();
+    let target3 = Uuid::new_v4().to_string();
+    store
+        .apply(
+            &a,
+            &Uuid::new_v4().to_string(),
+            &[Command::CreatePerson {
+                id: source3.clone(),
+                name: "Probe Source Three".into(),
+                initial_policy: Some(Policy::default()),
+            }],
+        )
+        .await?;
+    store
+        .apply(
+            &b,
+            &Uuid::new_v4().to_string(),
+            &[Command::CreatePerson {
+                id: target3.clone(),
+                name: "Probe Target Three".into(),
+                initial_policy: Some(share(&a)),
+            }],
+        )
+        .await?;
+    let preview3 = store.merge_preview(&a, &source3, &target3).await?;
+    let request3 = Uuid::new_v4().to_string();
+    store
+        .people_command(
+            &a,
+            &Uuid::new_v4().to_string(),
+            &PeopleCommand::RequestMerge {
+                id: request3.clone(),
+                source_id: source3.clone(),
+                target_id: target3.clone(),
+                preview_token: preview3.token,
+                name: "Probe Merged Three".into(),
+            },
+            now,
+        )
+        .await?;
+    let missing_token = request(
+        &app,
+        "POST",
+        "people-commands",
+        &[
+            ("authorization", &auth_b),
+            ("idempotency-key", &Uuid::new_v4().to_string()),
+        ],
+        json!({"command":{"kind":"respond_request","id":request3,"accept":true}}),
+    )
+    .await;
+    assert_eq!(missing_token.0, StatusCode::CONFLICT, "{}", missing_token.2);
+    assert_eq!(missing_token.2["code"], "conflict");
+    results.insert(
+        "merge_accept_missing_recipient_token".into(),
+        shape(&missing_token),
+    );
+
+    // Sent-history: `a` sent three people-requests above (withdrawn, expired, still pending).
+    let sent_requests = request(
+        &app,
+        "GET",
+        "people/requests/sent",
+        &[("authorization", &auth_a)],
+        json!({}),
+    )
+    .await;
+    assert_eq!(sent_requests.0, StatusCode::OK, "{}", sent_requests.2);
+    let mut request_states: Vec<String> = sent_requests.2["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["state"].as_str().unwrap().to_owned())
+        .collect();
+    request_states.sort();
+    results.insert(
+        "sent_people_requests".into(),
+        json!({"status": sent_requests.0.as_u16(), "count": request_states.len(),
+            "states": request_states, "next_after": sent_requests.2["next_after"]}),
+    );
+
+    // Sent-history for household invitations: one invitation ages into "expired" the same way,
+    // and one is revoked *before* it would have gone stale by time — its terminal state must
+    // not be overwritten by the "pending && past expiry" rule.
+    let c = Uuid::new_v4().to_string();
+    store
+        .add_account(
+            &c,
+            "q16-third",
+            &hash_password("q16-third-pw-123".into()).await?,
+        )
+        .await?;
+    let household = Uuid::new_v4().to_string();
+    store
+        .management(
+            &a,
+            &Uuid::new_v4().to_string(),
+            &[M::CreateHousehold {
+                id: household.clone(),
+                name: "Probe Household".into(),
+            }],
+            now,
+        )
+        .await?;
+    let expiring_invitation = Uuid::new_v4().to_string();
+    store
+        .management(
+            &a,
+            &Uuid::new_v4().to_string(),
+            &[M::InviteToHousehold {
+                id: expiring_invitation.clone(),
+                household_id: household.clone(),
+                recipient_id: b.clone(),
+                expected_version: store.households(&a).await?[0].version,
+            }],
+            now,
+        )
+        .await?;
+    for table in ["household_invitations", "household_invitation_history"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {table} SET expires_at=1 WHERE id=$1"
+        )))
+        .bind(&expiring_invitation)
+        .execute(&store.pool)
+        .await?;
+    }
+    let revoked_invitation = Uuid::new_v4().to_string();
+    store
+        .management(
+            &a,
+            &Uuid::new_v4().to_string(),
+            &[M::InviteToHousehold {
+                id: revoked_invitation.clone(),
+                household_id: household.clone(),
+                recipient_id: c.clone(),
+                expected_version: store.households(&a).await?[0].version,
+            }],
+            now,
+        )
+        .await?;
+    store
+        .management(
+            &a,
+            &Uuid::new_v4().to_string(),
+            &[M::RevokeHouseholdInvitation {
+                id: revoked_invitation.clone(),
+                expected_version: 1,
+            }],
+            now,
+        )
+        .await?;
+    for table in ["household_invitations", "household_invitation_history"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {table} SET expires_at=1 WHERE id=$1"
+        )))
+        .bind(&revoked_invitation)
+        .execute(&store.pool)
+        .await?;
+    }
+    let sent_invitations = request(
+        &app,
+        "GET",
+        "invitations/sent",
+        &[("authorization", &auth_a)],
+        json!({}),
+    )
+    .await;
+    assert_eq!(sent_invitations.0, StatusCode::OK, "{}", sent_invitations.2);
+    let mut invitation_states: Vec<String> = sent_invitations.2["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["status"].as_str().unwrap().to_owned())
+        .collect();
+    invitation_states.sort();
+    assert_eq!(
+        invitation_states,
+        vec!["expired".to_owned(), "revoked".to_owned()],
+        "{}",
+        sent_invitations.2
+    );
+    results.insert(
+        "sent_invitations".into(),
+        json!({"status": sent_invitations.0.as_u16(), "count": invitation_states.len(),
+            "states": invitation_states, "next_after": sent_invitations.2["next_after"]}),
+    );
+
+    Ok(Value::Object(results))
+}
+
 /// The combined probe transcript includes activation, calendar connection preservation and
 /// disconnection, inactive-subscription retirement/version changes, and command batch-size
 /// acceptance/rejection. `/health` omits `api_version`, which is asserted separately.
@@ -736,7 +1521,11 @@ async fn observe(app: &Router) -> Value {
     json!({
         "activation": activation_probes().await.expect("activation-grant protocol probes"),
         "calendar_configure": calendar_configure_probes().await.expect("BE-Q22 connection preserve/disconnect probes"),
+        "calendar_refresh_errors": calendar_refresh_errors_probes().await.expect("BE-B8 safe calendar-refresh error-code probes"),
         "command_batch": command_batch_probes().await.expect("BE-CH1 command batch-size probes"),
+        "merge_preview_and_sent_history": merge_preview_and_sent_history_probes()
+            .await
+            .expect("BE-Q16 recipient-safe preview and sent-history probes"),
         "error_mapping": error_mapping().await,
         "content_and_retirement": content_and_retirement().await.expect("combined protocol probes"),
         "health": probe(app, "/health", &["api_version"]).await,

@@ -26,6 +26,10 @@ impl From<sqlx::Error> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let application = self.0.downcast_ref::<ErrorCode>().copied();
+        let stale_reason = self
+            .0
+            .downcast_ref::<atlas_core::error::StaleRefreshReason>()
+            .copied();
         let unique = self
             .0
             .downcast_ref::<sqlx::Error>()
@@ -71,9 +75,13 @@ impl IntoResponse for ApiError {
             }
             Some(ErrorCode::RefreshInProgress) => (StatusCode::CONFLICT, "refresh_in_progress"),
             Some(ErrorCode::StaleRefresh) => (StatusCode::CONFLICT, "stale_refresh"),
+            _ if stale_reason.is_some() => (StatusCode::CONFLICT, "stale_refresh"),
             Some(ErrorCode::StaleDelivery) => (StatusCode::CONFLICT, "stale_delivery"),
             Some(ErrorCode::IntegrationUnconfigured) => {
                 (StatusCode::SERVICE_UNAVAILABLE, "integration_unconfigured")
+            }
+            Some(ErrorCode::ConnectionUnavailable) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "connection_unavailable")
             }
             Some(ErrorCode::FetchFailed) => (StatusCode::BAD_GATEWAY, "fetch_failed"),
             Some(ErrorCode::MaterialisationRequired) => {
@@ -120,11 +128,11 @@ impl IntoResponse for ApiError {
             "invalid_value" | "malformed_request" => "Check the request fields and values.",
             _ => "The request could not be completed.",
         };
-        let mut response = (
-            status,
-            Json(json!({"code":code,"message":message,"request_id":id,"details":[]})),
-        )
-            .into_response();
+        let mut body = json!({"code":code,"message":message,"request_id":id,"details":[]});
+        if let Some(reason) = stale_reason {
+            body["reason"] = json!(reason.as_str());
+        }
+        let mut response = (status, Json(body)).into_response();
         if status == StatusCode::TOO_MANY_REQUESTS {
             response
                 .headers_mut()

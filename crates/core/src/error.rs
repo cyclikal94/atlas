@@ -5,6 +5,7 @@ pub enum ErrorCode {
     BatchTooLarge,
     CalendarLimit,
     Conflict,
+    ConnectionUnavailable,
     CredentialMismatch,
     DefaultsChanged,
     DeliveryFailed,
@@ -53,6 +54,7 @@ impl ErrorCode {
             Self::BatchTooLarge => "batch_too_large",
             Self::CalendarLimit => "calendar_limit",
             Self::Conflict => "conflict",
+            Self::ConnectionUnavailable => "connection_unavailable",
             Self::CredentialMismatch => "credential_mismatch",
             Self::DefaultsChanged => "defaults_changed",
             Self::DeliveryFailed => "delivery_failed",
@@ -102,3 +104,29 @@ impl std::fmt::Display for ErrorCode {
     }
 }
 impl std::error::Error for ErrorCode {}
+/// Distinguishes B8 causes 4 and 5, which both raise `ErrorCode::StaleRefresh`
+/// (`409 stale_refresh`): a generation change proves something else touched
+/// this source since the attempt began — a newer refresh or a concurrent
+/// settings edit (cause 4) — while an unchanged generation with an expired
+/// lease means only this attempt's own lease timed out (cause 5). The two
+/// need different client handling despite sharing a wire code, so the HTTP
+/// layer reports this as an additional `reason` field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaleRefreshReason {
+    GenerationChanged,
+    LeaseExpired,
+}
+impl StaleRefreshReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GenerationChanged => "generation_changed",
+            Self::LeaseExpired => "lease_expired",
+        }
+    }
+}
+impl std::fmt::Display for StaleRefreshReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+impl std::error::Error for StaleRefreshReason {}

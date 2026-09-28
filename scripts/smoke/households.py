@@ -38,6 +38,30 @@ def run(call, accounts, tokens, secrets, person, field):
            'expected_version':1,'accept':True}, 404)
     manage(tokens['bob'], {'kind':'respond_to_household_invitation','id':invitation,
            'expected_version':1,'accept':True})
+    # BE-Q16: durable, all-states sent-invitation history, keyed by sender.
+    revoked_invitation = str(uuid.uuid4())
+    manage(tokens['alice'], {'kind':'invite_to_household','id':revoked_invitation,
+           'household_id':household,'recipient_id':accounts['carol'],
+           'expected_version':call('GET', '/api/experimental/v1/households', tokens['alice'])[0]['version']})
+    manage(tokens['alice'], {'kind':'revoke_household_invitation','id':revoked_invitation,
+           'expected_version':1})
+    sent = call('GET', '/api/experimental/v1/invitations/sent', tokens['alice'])
+    sent_by_id = {item['id']: item for item in sent['items']}
+    if sent_by_id.get(invitation, {}).get('status') != 'accepted':
+        raise RuntimeError('Sent-invitation history did not report the accepted invitation')
+    if sent_by_id.get(revoked_invitation, {}).get('status') != 'revoked':
+        raise RuntimeError('Sent-invitation history did not report the revoked invitation')
+    # BE-Q16 R2: the whole point of this read is that a fresh device with no local record of
+    # what was sent can still identify and label each recipient.
+    if sent_by_id[invitation]['recipient_id'] != accounts['bob']:
+        raise RuntimeError('Sent-invitation history did not identify the accepted recipient')
+    if sent_by_id[invitation]['recipient_username'] != 'bob':
+        raise RuntimeError('Sent-invitation history did not name the accepted recipient')
+    if sent_by_id[revoked_invitation]['recipient_id'] != accounts['carol']:
+        raise RuntimeError('Sent-invitation history did not identify the revoked recipient')
+    if sent_by_id[revoked_invitation]['recipient_username'] != 'carol':
+        raise RuntimeError('Sent-invitation history did not name the revoked recipient')
+    call('GET', '/api/experimental/v1/invitations/sent?limit=1', tokens['alice'])
     page = call('GET', '/api/experimental/v1/sync', tokens['bob'])
     visible_ids = {change['resource']['id'] for batch in page['batches'] for change in batch['changes']}
     if household_person not in visible_ids or person in visible_ids or field in visible_ids:

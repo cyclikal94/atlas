@@ -35,6 +35,22 @@ confers no household access. Managers can revoke it. Removing a member revokes t
 member's unused invitations to the household, preventing reuse to rejoin. Invitations
 currently target existing Atlas accounts; they are not account-registration links.
 
+`GET /invitations/sent` lists this account's own sent household-membership
+invitations, paginated and across every state (`pending`/`accepted`/`declined`/
+`revoked`/`expired`), not just the recipient-facing pending view above. It is backed
+by a durable record mirrored alongside the operational table that has no automatic
+age limit, so a sent invitation keeps reporting its true, authoritative status —
+including a computed `expired` for one that timed out unanswered — even after it
+would otherwise have aged out of any operational cleanup. Every row names its
+recipient (`recipient_id` and `recipient_username`), so a device with no local record
+of what was sent can label the Sent list and choose which invitation to revoke. The
+sender selected that recipient, so this discloses nothing they did not already know,
+and it is returned whether or not `ATLAS_DIRECTORY_ENABLED` allows browsing the
+directory. It is a distinct shape from the recipient-facing `Invitation` returned by
+`GET /invitations`, which is unchanged. It is also distinct from
+`GET /account-invitations`'s signup-token issuer view, which is unrelated to
+household membership.
+
 `GET /directory` lists account IDs and usernames. `ATLAS_DIRECTORY_ENABLED=false`
 requires an exact `?username=...` lookup instead. Neither mode exposes private people
 fields or email addresses. Looking someone up does not grant them resource access.

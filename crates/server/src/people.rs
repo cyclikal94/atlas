@@ -51,6 +51,36 @@ pub(super) async fn requests(
         json!({"items":app.store.people_requests(&actor,now()).await?}),
     ))
 }
+pub(super) async fn sent_requests(
+    State(app): State<App>,
+    headers: HeaderMap,
+    query: Result<Query<TimerFilter>, QueryRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (actor, _) = identity(&app, &headers).await?;
+    let Query(filter) = query.map_err(|_| anyhow!(ErrorCode::MalformedRequest))?;
+    Ok(Json(serde_json::to_value(
+        app.store
+            .sent_people_requests(
+                &actor,
+                filter.after.as_deref(),
+                filter.limit.unwrap_or(50),
+                now(),
+            )
+            .await?,
+    )?))
+}
+pub(super) async fn recipient_preview(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (actor, _) = identity(&app, &headers).await?;
+    Ok(Json(serde_json::to_value(
+        app.store
+            .recipient_merge_preview(&actor, &id, now())
+            .await?,
+    )?))
+}
 pub(super) async fn detail(
     State(app): State<App>,
     headers: HeaderMap,

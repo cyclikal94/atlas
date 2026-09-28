@@ -63,11 +63,11 @@ async fn scenario(s: Store, other: Store) -> Result<()> {
     let source = source(&s, &a).await?;
     import(&s, &a, &source, &feed("20260910T100000Z"), now()).await?;
     let events = s
-        .calendar_resources(&a, "event", Some(&source), None, 200)
+        .calendar_resources(&a, "event", Some(&source), None, 200, now())
         .await?;
     assert_eq!(events.len(), 1);
     assert!(
-        s.calendar_resources(&b, "event", Some(&source), None, 200)
+        s.calendar_resources(&b, "event", Some(&source), None, 200, now())
             .await?
             .is_empty()
     );
@@ -118,12 +118,12 @@ async fn scenario(s: Store, other: Store) -> Result<()> {
     assert_eq!(moved.data.slot.date.as_deref(), Some("2026-09-10"));
     assert_eq!(moved.data.slot.key, first.data.slot.key);
     let review = s
-        .calendar_resources(&a, "review", Some(&moved.id), None, 200)
+        .calendar_resources(&a, "review", Some(&moved.id), None, 200, now() + 1)
         .await?;
     assert_eq!(review.len(), 1);
     assert!(review[0].value.to_string().contains("moved"));
     let last_good = s
-        .calendar_resources(&a, "event", Some(&source), None, 200)
+        .calendar_resources(&a, "event", Some(&source), None, 200, now() + 1)
         .await?[0]
         .value
         .clone();
@@ -139,7 +139,7 @@ async fn scenario(s: Store, other: Store) -> Result<()> {
     )
     .await?;
     assert_eq!(
-        s.calendar_resources(&a, "event", Some(&source), None, 200)
+        s.calendar_resources(&a, "event", Some(&source), None, 200, now() + 2)
             .await?[0]
             .value,
         last_good
@@ -153,7 +153,7 @@ async fn scenario(s: Store, other: Store) -> Result<()> {
     )
     .await?;
     assert!(
-        s.calendar_resources(&a, "event", Some(&source), None, 200)
+        s.calendar_resources(&a, "event", Some(&source), None, 200, now() + 3)
             .await?[0]
             .value
             .to_string()
@@ -168,7 +168,7 @@ async fn scenario(s: Store, other: Store) -> Result<()> {
     );
     import(&s,&a,&source,"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:trip\r\nSTATUS:CANCELLED\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",now()+4).await?;
     assert!(
-        s.calendar_resources(&a, "event", Some(&source), None, 200)
+        s.calendar_resources(&a, "event", Some(&source), None, 200, now() + 4)
             .await?[0]
             .value
             .to_string()
@@ -191,7 +191,10 @@ async fn scenario(s: Store, other: Store) -> Result<()> {
         .await
         .unwrap_err()
         .to_string(),
-        "stale_refresh"
+        // A newer refresh attempt bumped `generation` since `old` began — BE-B8 distinguishes
+        // this from a mere lease expiry via `StaleRefreshReason`; `calendar_error()` still
+        // maps both to the wire code `stale_refresh` (crates/server/tests/cases/calendars.rs).
+        "generation_changed"
     );
     s.finish_calendar_refresh(
         &a,
@@ -328,7 +331,7 @@ async fn scenario(s: Store, other: Store) -> Result<()> {
     let stale = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:CANCEL\r\nBEGIN:VEVENT\r\nUID:trip\r\nSEQUENCE:9\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     import(&s, &a, &source, stale, now() + 71).await?;
     let event: ics::Event = serde_json::from_value(
-        s.calendar_resources(&a, "event", Some(&source), None, 200)
+        s.calendar_resources(&a, "event", Some(&source), None, 200, now() + 71)
             .await?[0]
             .value
             .clone(),
@@ -354,7 +357,7 @@ async fn scenario(s: Store, other: Store) -> Result<()> {
     )
     .await?;
     let before_reviews = s
-        .calendar_resources(&a, "review", Some(&moved.id), None, 200)
+        .calendar_resources(&a, "review", Some(&moved.id), None, 200, due)
         .await?
         .len();
     import(
@@ -366,7 +369,7 @@ async fn scenario(s: Store, other: Store) -> Result<()> {
     )
     .await?;
     assert_eq!(
-        s.calendar_resources(&a, "review", Some(&moved.id), None, 200)
+        s.calendar_resources(&a, "review", Some(&moved.id), None, 200, due + 1)
             .await?
             .len(),
         before_reviews
@@ -545,12 +548,12 @@ async fn people_and_private_anchors(s: Store) -> Result<()> {
     assert_eq!(public.len(), 1);
     assert_eq!(public[0].data.slot.date, occurrence.data.slot.date);
     assert!(
-        s.calendar_resources(&b, "review", Some(&occurrence.id), None, 200)
+        s.calendar_resources(&b, "review", Some(&occurrence.id), None, 200, now())
             .await?
             .is_empty()
     );
     assert!(
-        s.calendar_resources(&a, "review", Some(&occurrence.id), None, 200)
+        s.calendar_resources(&a, "review", Some(&occurrence.id), None, 200, now())
             .await?
             .iter()
             .any(|p| p.value.to_string().contains("context_unavailable"))

@@ -36,6 +36,24 @@ pub(crate) async fn invitations(
     let (actor, _) = identity(&app, &headers).await?;
     Ok(Json(app.store.invitations(&actor).await?))
 }
+pub(crate) async fn sent_invitations(
+    State(app): State<App>,
+    headers: HeaderMap,
+    query: Result<Query<crate::tasks::TimerFilter>, QueryRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (actor, _) = identity(&app, &headers).await?;
+    let Query(filter) = query.map_err(|_| anyhow!(ErrorCode::MalformedRequest))?;
+    Ok(Json(serde_json::to_value(
+        app.store
+            .sent_invitations(
+                &actor,
+                filter.after.as_deref(),
+                filter.limit.unwrap_or(50),
+                now(),
+            )
+            .await?,
+    )?))
+}
 pub(crate) async fn defaults(
     State(app): State<App>,
     headers: HeaderMap,

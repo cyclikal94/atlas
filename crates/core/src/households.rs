@@ -82,6 +82,25 @@ pub struct Invitation {
     pub expires_at: String,
     pub version: i64,
 }
+/// A household invitation as its sender sees it. Unlike the recipient-facing [`Invitation`] it
+/// names the recipient, so a fresh device can label and pick rows without any local mapping.
+#[derive(Serialize)]
+pub struct SentInvitation {
+    pub id: String,
+    pub household_id: String,
+    pub household_name: String,
+    pub sender_id: String,
+    pub recipient_id: String,
+    pub recipient_username: String,
+    pub status: String,
+    pub expires_at: String,
+    pub version: i64,
+}
+#[derive(Serialize)]
+pub struct SentInvitationPage {
+    pub items: Vec<SentInvitation>,
+    pub next_after: Option<String>,
+}
 
 impl Store {
     pub(super) async fn member(
@@ -176,6 +195,63 @@ impl Store {
                 })
             })
             .collect()
+    }
+    /// Durable, sender-keyed, all-states history: draws from `household_invitation_history`,
+    /// which is mirrored alongside (never instead of) `household_invitations` and has no
+    /// automatic age limit, so a sender's history survives operational cleanup/expiry. Each row
+    /// names its recipient (account ID and username) from `accounts`, which is never cleaned up;
+    /// the sender chose that recipient, so this discloses nothing beyond what they already knew
+    /// and works whether or not the account directory is enabled.
+    pub async fn sent_invitations(
+        &self,
+        actor: &str,
+        after: Option<&str>,
+        limit: u16,
+        now: i64,
+    ) -> Result<SentInvitationPage> {
+        ensure!((1..=200).contains(&limit), ErrorCode::InvalidValue);
+        if let Some(after) = after {
+            identifier(after)?;
+        }
+        let rows = sqlx::query(
+            "SELECT i.id,i.household_id,h.name,i.sender_id,i.recipient_id,a.username,i.status,\
+             i.expires_at,i.version \
+             FROM household_invitation_history i JOIN households h ON h.id=i.household_id \
+             JOIN accounts a ON a.id=i.recipient_id \
+             WHERE i.sender_id=$1 AND ($2 IS NULL OR i.id>$2) ORDER BY i.id LIMIT $3",
+        )
+        .bind(actor)
+        .bind(after)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        let next_after = (rows.len() == usize::from(limit)).then(|| rows.last().unwrap().get(0));
+        let items = rows
+            .into_iter()
+            .map(|r| {
+                let status: String = r.get(6);
+                let expires_at: i64 = r.get(7);
+                let status = if status == "pending" && expires_at <= now {
+                    "expired".into()
+                } else {
+                    status
+                };
+                Ok(SentInvitation {
+                    id: r.get(0),
+                    household_id: r.get(1),
+                    household_name: r.get(2),
+                    sender_id: r.get(3),
+                    recipient_id: r.get(4),
+                    recipient_username: r.get(5),
+                    status,
+                    expires_at: chrono::DateTime::from_timestamp(expires_at, 0)
+                        .ok_or_else(|| anyhow!(ErrorCode::InvalidValue))?
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    version: r.get(8),
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(SentInvitationPage { items, next_after })
     }
     pub async fn management(
         &self,
@@ -322,6 +398,7 @@ impl Store {
                         ErrorCode::Conflict
                     );
                     sqlx::query("UPDATE household_invitations SET status='revoked',version=version+1 WHERE id=$1").bind(id).execute(&mut *tx).await?;
+                    sqlx::query("UPDATE household_invitation_history SET status='revoked',version=version+1,updated_at=$2 WHERE id=$1").bind(id).bind(now).execute(&mut *tx).await?;
                     sqlx::query("UPDATE households SET version=version+1 WHERE id=$1")
                         .bind(household)
                         .execute(&mut *tx)
@@ -356,8 +433,13 @@ impl Store {
                         .fetch_one(&mut *tx)
                         .await?
                             < 200, ErrorCode::SliceCapacity);
+                    let invitation_expires_at = now
+                        .checked_add(7 * 86400)
+                        .ok_or_else(|| anyhow!(ErrorCode::InvalidValue))?;
                     sqlx::query("INSERT INTO household_invitations(id,household_id,sender_id,recipient_id,status,expires_at) VALUES ($1,$2,$3,$4,'pending',$5)")
-                        .bind(id).bind(household_id).bind(actor).bind(recipient_id).bind(now.checked_add(7*86400).ok_or_else(|| anyhow!(ErrorCode::InvalidValue))?).execute(&mut *tx).await?;
+                        .bind(id).bind(household_id).bind(actor).bind(recipient_id).bind(invitation_expires_at).execute(&mut *tx).await?;
+                    sqlx::query("INSERT INTO household_invitation_history(id,household_id,sender_id,recipient_id,status,expires_at,version,updated_at) VALUES ($1,$2,$3,$4,'pending',$5,1,$6)")
+                        .bind(id).bind(household_id).bind(actor).bind(recipient_id).bind(invitation_expires_at).bind(now).execute(&mut *tx).await?;
                     sqlx::query("UPDATE households SET version=version+1 WHERE id=$1")
                         .bind(household_id)
                         .execute(&mut *tx)
@@ -391,6 +473,14 @@ impl Store {
                     .bind(id)
                     .execute(&mut *tx)
                     .await?;
+                    sqlx::query(
+                        "UPDATE household_invitation_history SET status=$1,version=version+1,updated_at=$3 WHERE id=$2",
+                    )
+                    .bind(if *accept { "accepted" } else { "declined" })
+                    .bind(id)
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await?;
                     sqlx::query("UPDATE households SET version=version+1 WHERE id=$1")
                         .bind(&household)
                         .execute(&mut *tx)
@@ -419,6 +509,8 @@ impl Store {
                     // A removed member cannot rejoin using another old pending invitation.
                     sqlx::query("UPDATE household_invitations SET status='revoked',version=version+1 WHERE household_id=$1 AND recipient_id=$2 AND status='pending'")
                         .bind(household_id).bind(account_id).execute(&mut *tx).await?;
+                    sqlx::query("UPDATE household_invitation_history SET status='revoked',version=version+1,updated_at=$3 WHERE household_id=$1 AND recipient_id=$2 AND status='pending'")
+                        .bind(household_id).bind(account_id).bind(now).execute(&mut *tx).await?;
                     sqlx::query("UPDATE households SET version=version+1 WHERE id=$1")
                         .bind(household_id)
                         .execute(&mut *tx)

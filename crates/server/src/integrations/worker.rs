@@ -1,7 +1,7 @@
 use super::{IntegrationConfig, Link, Subscription};
 use crate::*;
 use atlas_core::calendars::ics;
-use atlas_core::error::ErrorCode;
+use atlas_core::error::{ErrorCode, StaleRefreshReason};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Import {
@@ -79,6 +79,7 @@ impl App {
                     .await
             }
             Err(error) => {
+                let error = parse_outcome(error);
                 let reason = calendar_error(&error);
                 self.store
                     .finish_calendar_refresh(
@@ -91,7 +92,11 @@ impl App {
                         now(),
                     )
                     .await?;
-                Err(anyhow!(reason))
+                Err(if error.downcast_ref::<StaleRefreshReason>().is_some() {
+                    error
+                } else {
+                    anyhow!(reason)
+                })
             }
         }
     }
@@ -127,17 +132,16 @@ impl App {
             let feed = if let Some(text) = text {
                 let zone = refresh.timezone;
                 let date = chrono::Utc::now().date_naive();
-                Some(
-                    tokio::task::spawn_blocking(move || {
-                        ics::parse(
-                            &text,
-                            &zone,
-                            &(date - chrono::Duration::days(30)).to_string(),
-                            &(date + chrono::Duration::days(400)).to_string(),
-                        )
-                    })
-                    .await??,
-                )
+                let parsed = tokio::task::spawn_blocking(move || {
+                    ics::parse(
+                        &text,
+                        &zone,
+                        &(date - chrono::Duration::days(30)).to_string(),
+                        &(date + chrono::Duration::days(400)).to_string(),
+                    )
+                })
+                .await?;
+                Some(parsed.map_err(parse_outcome)?)
             } else {
                 None
             };
@@ -169,7 +173,11 @@ impl App {
                     now(),
                 )
                 .await;
-            return Err(anyhow!(reason));
+            return Err(if error.downcast_ref::<StaleRefreshReason>().is_some() {
+                error
+            } else {
+                anyhow!(reason)
+            });
         }
         result
     }
@@ -226,14 +234,43 @@ impl App {
         )
     }
 }
+/// `ics::parse` raises `ErrorCode::InvalidValue` for a malformed request-supplied date and for
+/// an oversized event `SUMMARY` (calendar-content validation) — a different stage and meaning
+/// from the finish-stage archived-check's `InvalidValue` (`calendars/service.rs`), which must
+/// still reach `calendar_error()`'s pass-through unchanged so cause 6a keeps its `422
+/// invalid_value` wire code. Remapping only this parse-stage raise, here, before it ever
+/// reaches `calendar_error()`, restores the pre-B8 `fetch_failed` outcome these two parser
+/// triggers already had — B8 does not name them as one of its six causes, and `fetch_failed`
+/// is an allow-listed failure-publication string, so the fallback health/lease-release write
+/// keeps succeeding instead of failing its own allowlist `ensure!` (BE-B8 revision, R1).
+fn parse_outcome(error: anyhow::Error) -> anyhow::Error {
+    if matches!(
+        error.downcast_ref::<ErrorCode>(),
+        Some(ErrorCode::InvalidValue)
+    ) {
+        anyhow!(ErrorCode::FetchFailed)
+    } else {
+        error
+    }
+}
 fn calendar_error(error: &anyhow::Error) -> ErrorCode {
+    if error.downcast_ref::<StaleRefreshReason>().is_some() {
+        return ErrorCode::StaleRefresh;
+    }
     match error.downcast_ref::<ErrorCode>().copied() {
         Some(
             code @ (ErrorCode::UnsupportedCalendarTimezone
             | ErrorCode::UnsupportedCalendarRule
             | ErrorCode::CalendarLimit
-            | ErrorCode::InvalidIcs),
+            | ErrorCode::InvalidIcs
+            | ErrorCode::IntegrationUnconfigured
+            | ErrorCode::InvalidValue
+            | ErrorCode::NotFound
+            | ErrorCode::Forbidden),
         ) => code,
+        Some(ErrorCode::InvalidSecret | ErrorCode::SourceConnectionRequired) => {
+            ErrorCode::ConnectionUnavailable
+        }
         _ => ErrorCode::FetchFailed,
     }
 }

@@ -162,6 +162,14 @@ impl App {
                 get(people::requests),
             )
             .route(
+                "/api/experimental/v1/people/requests/sent",
+                get(people::sent_requests),
+            )
+            .route(
+                "/api/experimental/v1/people/requests/{id}/merge-preview",
+                get(people::recipient_preview),
+            )
+            .route(
                 "/api/experimental/v1/people/{id}/duplicates",
                 get(people::duplicates),
             )
@@ -247,6 +255,10 @@ impl App {
             .route("/api/experimental/v1/sync", get(sync))
             .route("/api/experimental/v1/households", get(households))
             .route("/api/experimental/v1/invitations", get(invitations))
+            .route(
+                "/api/experimental/v1/invitations/sent",
+                get(sent_invitations),
+            )
             .route("/api/experimental/v1/defaults", get(defaults))
             .route(
                 "/api/experimental/v1/defaults/templates",

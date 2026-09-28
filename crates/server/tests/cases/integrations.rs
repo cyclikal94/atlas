@@ -341,7 +341,14 @@ async fn worker_refreshes_encrypted_link_and_dispatches_persisted_rule() -> Resu
     assert_eq!(messages[0].0["authorization"], "Bearer worker-token");
     assert!(!String::from_utf8(messages[0].1.to_vec())?.contains("Private reminder text"));
     let source = store
-        .calendar_resources(&actor, "calendar_source", None, None, 200)
+        .calendar_resources(
+            &actor,
+            "calendar_source",
+            None,
+            None,
+            200,
+            atlas_server::now(),
+        )
         .await?
         .remove(0);
     assert_eq!(

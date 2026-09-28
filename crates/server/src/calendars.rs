@@ -116,6 +116,7 @@ async fn resources(
             filter.parent_id.as_deref(),
             filter.after.as_deref(),
             limit,
+            now(),
         )
         .await?;
     let after = if items.len() == usize::from(limit) {

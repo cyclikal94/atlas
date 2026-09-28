@@ -30,6 +30,18 @@ the JSON envelope limit is 2 MiB. Recurrence expansion has a shared iteration bu
 Unsupported imports fail atomically and retain the last good events. Source health and
 last-success time show the failure without exposing connection details.
 
+`POST /calendar-sources/{id}/refresh` distinguishes six refresh-failure causes with their
+own wire codes, none of which expose credentials or connection details: missing or
+undecryptable connection details (`422 connection_unavailable`, no automatic retry — the
+connection needs re-entering); a genuine provider fetch failure (`502 fetch_failed`,
+bounded automatic retry); a missing server encryption key (`503
+integration_unconfigured`, an administrator-only fix); a superseded or expired refresh
+(`409 stale_refresh`, with a `reason` of `generation_changed` — a newer refresh or a
+settings edit touched the source — or `lease_expired` — this attempt's own lease simply
+timed out); an archived source (`422 invalid_value`); and lost access or a deleted source
+(`404`/`403`). A rejected stale/archived/access-lost attempt never changes the source's
+recorded health.
+
 Supported: date-only, UTC, floating dates in the source timezone, IANA timezones,
 daily/weekly/monthly/yearly recurrence, interval, count/until, BYDAY, BYMONTH,
 BYMONTHDAY, WKST, RDATE, EXDATE and individual RECURRENCE-ID overrides. Generated times
@@ -51,6 +63,11 @@ events; fetch and parsing failures never count as an empty successful import.
 resource pages, optionally filtered by `parent_id`, with `after` and `limit` pagination.
 Their `value` is native structured JSON, like other Atlas projections.
 Source/event identity and visibility changes use the existing sync protocol.
+`GET /calendar-sources` additionally reports a read-time `refresh_in_progress` boolean on
+each source, computed fresh from the live refresh lease at the moment of the request and
+never persisted: `true` only while a genuine refresh attempt currently holds its lease,
+`false` once that lease expires or a settings change invalidates it. It never exposes the
+underlying lease timestamp or generation counter.
 
 ## Anchored tasks and review
 

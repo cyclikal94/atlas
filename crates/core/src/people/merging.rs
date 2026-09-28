@@ -1,14 +1,147 @@
 use crate::error::ErrorCode;
 use crate::{
-    Store, content,
+    Projection, Store, content,
     policy::{Policy, PrincipalGrant},
     receipt_digest,
 };
-use anyhow::{Result, ensure};
-use sqlx::{Any, Transaction};
+use anyhow::{Result, anyhow, ensure};
+use serde::Serialize;
+use sqlx::{Any, Row, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::workflows::*;
+
+/// Visibility-tolerant preview computation returned to a merge recipient: requires the actor
+/// to *own* one of the two canonical identities (a fresh ownership check, not a visibility
+/// check), but never requires visibility of the other. Fields/identities the actor cannot
+/// currently see are simply absent from the result, never a permission error.
+pub(super) struct SafeMergeState {
+    pub(super) token: String,
+    pub(super) source: Option<Projection>,
+    pub(super) target: Option<Projection>,
+    pub(super) fields: Vec<MergeField>,
+    pub(super) requires_approval: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecipientMergePreview {
+    pub token: String,
+    pub source: Option<Projection>,
+    pub target: Option<Projection>,
+    pub fields: Vec<MergeField>,
+    pub requires_approval: bool,
+    pub combines_identity_audiences: bool,
+    pub freezes_field_policies: bool,
+    /// True when the sender's own view of this merge (recomputed now) no longer matches the
+    /// `preview_token` captured when the request was created — i.e. the underlying content
+    /// changed since the request was made. Not an error: still returns the recipient's
+    /// current-state preview so they can inspect it.
+    pub stale: bool,
+}
+
+impl Store {
+    /// Existence/archived check that does not require the caller to see the resource — only
+    /// `merge_preview_in` (the owner/initiator path) still gates on visibility.
+    async fn person_exists_unarchived(tx: &mut Transaction<'_, Any>, id: &str) -> Result<()> {
+        let archived: Option<i64> =
+            sqlx::query_scalar("SELECT archived FROM resources WHERE id=$1 AND kind='person'")
+                .bind(id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        ensure!(archived == Some(0), ErrorCode::NotFound);
+        Ok(())
+    }
+
+    pub(super) async fn safe_merge_state(
+        tx: &mut Transaction<'_, Any>,
+        actor: &str,
+        source: &str,
+        target: &str,
+    ) -> Result<SafeMergeState> {
+        let source = Self::canonical_person(tx, source).await?;
+        let target = Self::canonical_person(tx, target).await?;
+        ensure!(source != target, ErrorCode::InvalidValue);
+        Self::person_exists_unarchived(tx, &source).await?;
+        Self::person_exists_unarchived(tx, &target).await?;
+        let owns_source = Self::person_owner(tx, &source).await? == actor;
+        let owns_target = Self::person_owner(tx, &target).await? == actor;
+        ensure!(owns_source || owns_target, ErrorCode::Forbidden);
+        let (touched, _, _) = Self::people_scope(tx, &[&source, &target]).await?;
+        let visible = Self::subset(tx, actor, &touched).await?;
+        let token = receipt_digest(&serde_json::to_string(&(
+            actor, &source, &target, &visible,
+        ))?);
+        let fields = visible
+            .values()
+            .filter(|p| p.kind == "field")
+            .cloned()
+            .map(|p| MergeField {
+                id: p.id,
+                parent_id: p.parent_id,
+                label: p.label,
+                version: p.version,
+            })
+            .collect();
+        Ok(SafeMergeState {
+            token,
+            source: visible.get(&source).cloned(),
+            target: visible.get(&target).cloned(),
+            fields,
+            requires_approval: !(owns_source && owns_target),
+        })
+    }
+
+    /// Request-authorised preview for the recipient of a pending merge request: filtered to
+    /// fields the recipient can currently see, without requiring them to independently pass
+    /// `merge_preview`'s direct-visibility check for the identity they don't own.
+    pub async fn recipient_merge_preview(
+        &self,
+        actor: &str,
+        request_id: &str,
+        now: i64,
+    ) -> Result<RecipientMergePreview> {
+        let mut tx = self.task_read().await?;
+        crate::identifier(request_id)?;
+        let row = sqlx::query(
+            "SELECT sender_id,state,expires_at,payload FROM people_requests WHERE id=$1 AND recipient_id=$2",
+        )
+        .bind(request_id)
+        .bind(actor)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow!(ErrorCode::NotFound))?;
+        ensure!(row.get::<String, _>(1) == "pending", ErrorCode::NotFound);
+        ensure!(row.get::<i64, _>(2) > now, ErrorCode::InvitationExpired);
+        let (source_id, target_id, sender_preview_token) =
+            match serde_json::from_str::<Proposal>(&row.get::<String, _>(3))? {
+                Proposal::Merge {
+                    source_id,
+                    target_id,
+                    preview_token,
+                    ..
+                } => (source_id, target_id, preview_token),
+                Proposal::Link { .. } => return Err(anyhow!(ErrorCode::InvalidValue)),
+            };
+        let sender: String = row.get(0);
+        let stale = match Self::merge_preview_in(&mut tx, &sender, &source_id, &target_id).await {
+            Ok(current) => current.token != sender_preview_token,
+            Err(_) => true,
+        };
+        let safe = Self::safe_merge_state(&mut tx, actor, &source_id, &target_id).await?;
+        tx.commit().await?;
+        Ok(RecipientMergePreview {
+            token: safe.token,
+            source: safe.source,
+            target: safe.target,
+            fields: safe.fields,
+            requires_approval: safe.requires_approval,
+            combines_identity_audiences: true,
+            freezes_field_policies: true,
+            stale,
+        })
+    }
+}
+
 impl Store {
     pub async fn merge_preview(
         &self,

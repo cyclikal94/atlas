@@ -157,6 +157,17 @@ CREATE TABLE frozen_owner_visibility (
     resource_id text NOT NULL
 );
 
+CREATE TABLE household_invitation_history (
+    id text NOT NULL,
+    household_id text NOT NULL,
+    sender_id text NOT NULL,
+    recipient_id text NOT NULL,
+    status text NOT NULL,
+    expires_at bigint NOT NULL,
+    version bigint NOT NULL,
+    updated_at bigint NOT NULL
+);
+
 CREATE TABLE household_invitations (
     id text NOT NULL,
     household_id text NOT NULL,
@@ -246,6 +257,17 @@ CREATE TABLE operation_outcomes (
     CONSTRAINT operation_outcomes_check CHECK (((outcome <> 'rejected_stale'::text) OR (kind = 'retire_device'::text))),
     CONSTRAINT operation_outcomes_kind_check CHECK ((kind = ANY (ARRAY['retire_device'::text, 'revoke_session'::text]))),
     CONSTRAINT operation_outcomes_outcome_check CHECK ((outcome = ANY (ARRAY['confirmed_applied'::text, 'rejected_stale'::text, 'superseded'::text])))
+);
+
+CREATE TABLE people_request_history (
+    id text NOT NULL,
+    sender_id text NOT NULL,
+    recipient_id text NOT NULL,
+    kind text NOT NULL,
+    payload text NOT NULL,
+    state text NOT NULL,
+    expires_at bigint NOT NULL,
+    updated_at bigint NOT NULL
 );
 
 CREATE TABLE people_request_ids (
@@ -570,6 +592,9 @@ ALTER TABLE ONLY external_identities
 ALTER TABLE ONLY frozen_owner_visibility
     ADD CONSTRAINT frozen_owner_visibility_pkey PRIMARY KEY (resource_id);
 
+ALTER TABLE ONLY household_invitation_history
+    ADD CONSTRAINT household_invitation_history_pkey PRIMARY KEY (id);
+
 ALTER TABLE ONLY household_invitations
     ADD CONSTRAINT household_invitations_pkey PRIMARY KEY (id);
 
@@ -602,6 +627,9 @@ ALTER TABLE ONLY oidc_flows
 
 ALTER TABLE ONLY operation_outcomes
     ADD CONSTRAINT operation_outcomes_pkey PRIMARY KEY (account_id, operation_id);
+
+ALTER TABLE ONLY people_request_history
+    ADD CONSTRAINT people_request_history_pkey PRIMARY KEY (id);
 
 ALTER TABLE ONLY people_request_ids
     ADD CONSTRAINT people_request_ids_pkey PRIMARY KEY (id);
@@ -759,6 +787,8 @@ CREATE INDEX grants_account ON resource_grants USING btree (account_id, resource
 
 CREATE INDEX household_grants_household ON resource_household_grants USING btree (household_id, resource_id);
 
+CREATE INDEX household_invitation_history_sender ON household_invitation_history USING btree (sender_id, id);
+
 CREATE INDEX invitations_recipient ON household_invitations USING btree (recipient_id, status, id);
 
 CREATE INDEX lists_task ON list_items USING btree (task_id, list_id);
@@ -772,6 +802,8 @@ CREATE INDEX occurrences_task ON task_occurrences USING btree (task_id, id);
 CREATE INDEX occurrences_window ON task_occurrences USING btree (opens_at, closes_at, id);
 
 CREATE INDEX oidc_flow_expiry ON oidc_flows USING btree (expires_at);
+
+CREATE INDEX people_request_history_sender ON people_request_history USING btree (sender_id, id);
 
 CREATE INDEX people_requests_expiry ON people_requests USING btree (expires_at, id);
 
@@ -873,6 +905,15 @@ ALTER TABLE ONLY external_identities
 ALTER TABLE ONLY frozen_owner_visibility
     ADD CONSTRAINT frozen_owner_visibility_resource_id_fkey FOREIGN KEY (resource_id) REFERENCES resources(id);
 
+ALTER TABLE ONLY household_invitation_history
+    ADD CONSTRAINT household_invitation_history_household_id_fkey FOREIGN KEY (household_id) REFERENCES households(id);
+
+ALTER TABLE ONLY household_invitation_history
+    ADD CONSTRAINT household_invitation_history_recipient_id_fkey FOREIGN KEY (recipient_id) REFERENCES accounts(id);
+
+ALTER TABLE ONLY household_invitation_history
+    ADD CONSTRAINT household_invitation_history_sender_id_fkey FOREIGN KEY (sender_id) REFERENCES accounts(id);
+
 ALTER TABLE ONLY household_invitations
     ADD CONSTRAINT household_invitations_household_id_fkey FOREIGN KEY (household_id) REFERENCES households(id);
 
@@ -917,6 +958,12 @@ ALTER TABLE ONLY occurrence_participants
 
 ALTER TABLE ONLY operation_outcomes
     ADD CONSTRAINT operation_outcomes_account_id_fkey FOREIGN KEY (account_id) REFERENCES accounts(id);
+
+ALTER TABLE ONLY people_request_history
+    ADD CONSTRAINT people_request_history_recipient_id_fkey FOREIGN KEY (recipient_id) REFERENCES accounts(id);
+
+ALTER TABLE ONLY people_request_history
+    ADD CONSTRAINT people_request_history_sender_id_fkey FOREIGN KEY (sender_id) REFERENCES accounts(id);
 
 ALTER TABLE ONLY people_requests
     ADD CONSTRAINT people_requests_recipient_id_fkey FOREIGN KEY (recipient_id) REFERENCES accounts(id);
@@ -1068,4 +1115,4 @@ ALTER TABLE ONLY timer_sessions
 
 
 INSERT INTO sync_clock(id,revision,resource_count) VALUES(1,0,0);
-INSERT INTO atlas_schema(version) VALUES(1002);
+INSERT INTO atlas_schema(version) VALUES(1003);
