@@ -827,11 +827,9 @@ CREATE INDEX snapshots_expiry ON sync_snapshots USING btree (expires_at);
 
 CREATE INDEX subscriptions_account ON notification_subscriptions USING btree (account_id, id);
 
-CREATE INDEX timer_account_stopped ON timer_sessions USING btree (account_id, stopped_at, id) WHERE ((stopped_at IS NOT NULL) AND (cancelled = 0));
-
 CREATE INDEX timer_account_times ON timer_sessions USING btree (account_id, started_at, stopped_at);
 
-CREATE UNIQUE INDEX timer_active_account_occurrence ON timer_sessions USING btree (account_id, progress_id) WHERE ((stopped_at IS NULL) AND (cancelled = 0));
+CREATE UNIQUE INDEX timer_active_account ON timer_sessions USING btree (account_id) WHERE ((stopped_at IS NULL) AND (cancelled = 0));
 
 CREATE INDEX timer_progress ON timer_sessions USING btree (progress_id, id);
 
@@ -1117,4 +1115,4 @@ ALTER TABLE ONLY timer_sessions
 
 
 INSERT INTO sync_clock(id,revision,resource_count) VALUES(1,0,0);
-INSERT INTO atlas_schema(version) VALUES(1004);
+INSERT INTO atlas_schema(version) VALUES(1003);

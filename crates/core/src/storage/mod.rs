@@ -3,7 +3,7 @@ use anyhow::{Result, anyhow, ensure};
 use sqlx::{Acquire, Any, Connection, Transaction, any::AnyPoolOptions};
 
 /// Version recorded by a freshly initialised database; the last step of `UPGRADES`.
-const SCHEMA_VERSION: i64 = 1003;
+const SCHEMA_VERSION: i64 = 1004;
 
 /// One additive, in-place step. Steps run inside `migrate()`'s serialising transaction, in
 /// order, and each must move the recorded version forward by exactly its `to`.
@@ -31,6 +31,12 @@ const UPGRADES: &[Upgrade] = &[
         to: 1003,
         sqlite: include_str!("schema/upgrade_1003_sqlite.sql"),
         postgres: include_str!("schema/upgrade_1003_postgres.sql"),
+    },
+    Upgrade {
+        from: 1003,
+        to: 1004,
+        sqlite: include_str!("schema/upgrade_1004_sqlite.sql"),
+        postgres: include_str!("schema/upgrade_1004_postgres.sql"),
     },
 ];
 
@@ -241,5 +247,31 @@ mod tests {
                 "INSERT INTO atlas_schema(version) VALUES({SCHEMA_VERSION});"
             )));
         }
+    }
+
+    /// `scripts/backup.py` refuses a bundle whose schema it does not list, so every version the
+    /// server can hold or walk (the first upgradable baseline to the current one) must be listed.
+    /// A schema bump that forgets the tool fails here, in the ordinary test job, instead of at
+    /// the moment an operator needs a backup (the 1003 defect).
+    #[test]
+    fn recovery_tool_supports_every_schema_the_server_can_migrate() {
+        let source = include_str!("../../../../scripts/backup.py");
+        let line = source
+            .lines()
+            .find(|l| l.starts_with("SUPPORTED_SCHEMAS = ("))
+            .expect("backup.py declares SUPPORTED_SCHEMAS");
+        let listed: Vec<i64> = line
+            .trim_start_matches("SUPPORTED_SCHEMAS = (")
+            .trim_end_matches(')')
+            .split(',')
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| v.trim().parse().expect("a numeric schema version"))
+            .collect();
+        let first = UPGRADES.first().expect("at least one upgrade").from;
+        let expected: Vec<i64> = (first..=SCHEMA_VERSION).collect();
+        assert_eq!(
+            listed, expected,
+            "scripts/backup.py SUPPORTED_SCHEMAS must be {first}..={SCHEMA_VERSION}"
+        );
     }
 }

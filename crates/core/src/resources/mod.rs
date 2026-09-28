@@ -452,6 +452,37 @@ impl Store {
             .ok_or_else(|| anyhow!(ErrorCode::Unauthenticated))
     }
 
+    /// `subset` for many ids in a few statements: the same visibility rule (`policy::VISIBLE`,
+    /// ancestors and exclusions included) and the same projection, one `IN` list per chunk instead
+    /// of one round trip per id. Ids the actor cannot see are simply absent from the result.
+    pub(crate) async fn subset_batch(
+        tx: &mut Transaction<'_, Any>,
+        actor: &str,
+        ids: &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, Projection>> {
+        let mut map = BTreeMap::new();
+        let ids: Vec<&String> = ids.iter().collect();
+        for chunk in ids.chunks(100) {
+            let placeholders = (0..chunk.len())
+                .map(|i| format!("${}", i + 2))
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(format!("SELECT {} FROM resources r LEFT JOIN resource_grants g ON g.resource_id=r.id AND g.account_id=$1 WHERE r.id IN ({placeholders}) AND {}", policy::COLUMNS, policy::VISIBLE)))
+                .bind(actor);
+            for id in chunk {
+                query = query.bind(id.as_str());
+            }
+            for row in query.fetch_all(&mut **tx).await? {
+                let mut p = projection_row(&row)?;
+                if p.kind == "list" {
+                    p.value = serde_json::from_str(&Self::list_value(tx, actor, &p.id).await?)?;
+                }
+                map.insert(p.id.clone(), p);
+            }
+        }
+        Ok(map)
+    }
+
     pub(crate) async fn subset(
         tx: &mut Transaction<'_, Any>,
         actor: &str,

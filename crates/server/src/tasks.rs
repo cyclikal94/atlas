@@ -1,6 +1,6 @@
 use super::*;
 use atlas_core::error::ErrorCode;
-use atlas_core::tasks::{TaskCommand, ViewFilter};
+use atlas_core::tasks::{TaskCommand, TimerState, ViewFilter};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Input {
@@ -252,6 +252,40 @@ pub(super) async fn timers(
         None
     };
     Ok(Json(json!({"items":items,"next_after":next_after})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AccountTimerFilter {
+    state: Option<String>,
+    after: Option<String>,
+    limit: Option<u16>,
+}
+/// The caller's own timers across every occurrence (BE-B6). Like every protected read it binds
+/// the credential first; access to each task is applied per row by redaction, never by omission.
+pub(super) async fn account_timers(
+    State(app): State<App>,
+    headers: HeaderMap,
+    query: Result<Query<AccountTimerFilter>, QueryRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (actor, _) = identity(&app, &headers).await?;
+    let Query(filter) = query.map_err(|_| anyhow!(ErrorCode::MalformedRequest))?;
+    let state = match filter.state.as_deref() {
+        None | Some("all") => TimerState::All,
+        Some("running") => TimerState::Running,
+        Some("stopped") => TimerState::Stopped,
+        Some(_) => return Err(anyhow!(ErrorCode::InvalidValue).into()),
+    };
+    Ok(Json(serde_json::to_value(
+        app.store
+            .account_timer_sessions(
+                &actor,
+                state,
+                filter.after.as_deref(),
+                filter.limit.unwrap_or(50),
+            )
+            .await?,
+    )?))
 }
 
 #[derive(Deserialize)]

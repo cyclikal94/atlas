@@ -102,6 +102,23 @@ existing response: `GET /defaults`, `GET /households`, the defaults revision and
 write guard behave as before. The compatibility baseline gains a probe group for it.
 See [sharing](sharing.md).
 
+`0.27.0` replaces the account-wide timer rule with one per person per task occurrence and
+adds the account-wide timer list. It removes a validation rule and changes a status a
+built client can observe: a `start_timer` on a second occurrence while another timer runs
+was a `409 conflict` and is now accepted, and a `stop_timer` no longer conflicts with the
+person's intervals on other occurrences (the same-occurrence rules are unchanged, as is
+authority, versioning and idempotency). It adds one operation, `GET /timer-sessions`
+(`listAccountTimerSessions`), and three schemas: `AccountTimerSession`,
+`RestrictedTimerSession` and `AccountTimerPage`, whose `items` are told apart by their
+`access` member. A restricted row exposes no task detail. The list is the caller's own
+account only, is not part of `/sync`, and follows the same authentication, CSRF and
+`Cache-Control: private, no-store` rules as every other protected read. It needs
+database schema `1004`. A web client must not drop its cross-task overlap message until
+the server reports `0.27.0` or later; against `0.26.x` the account-wide rule still
+applies. See [tasks](tasks.md#dependencies-timers-and-recurrence). The compatibility
+baseline gains a probe group for the second-occurrence start, both row shapes, redaction
+and the rejected inputs.
+
 Mutations require an account-scoped UUID `Idempotency-Key` and explicit version
 preconditions where defined. Commands that replace existing authored text also carry the
 resource's sharing revision (`expected_policy_version`), so a write cannot commit under
@@ -132,7 +149,7 @@ statuses and [sync](sync.md) for client recovery.
 `GET /health` returns the version of the API contract the running server was built with:
 
 ```json
-{"status": "ok", "api_version": "0.26.0"}
+{"status": "ok", "api_version": "0.27.0"}
 ```
 
 `api_version` is exactly `info.version` in [the contract](../api/openapi.json), read from

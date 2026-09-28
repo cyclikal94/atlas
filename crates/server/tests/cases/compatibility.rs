@@ -1942,6 +1942,228 @@ async fn sharing_snapshot_probes() -> Result<Value> {
 /// disconnection, inactive-subscription retirement/version changes, command batch-size
 /// acceptance/rejection, and the Declarative Web Push payload and its encrypted delivery.
 /// `/health` omits `api_version`, which is asserted separately.
+/// BE-B6 probes: independent per-occurrence timers and the account-wide listing (`docs/api.md`
+/// `0.27.0` entry). Records the deterministic status/code/key-set shape of the observable
+/// behaviour change (a second occurrence now starts; the same occurrence still conflicts), the two
+/// row shapes and their member names, the redaction of an inaccessible task, and the rejected
+/// inputs; never an ID, title or timestamp.
+async fn independent_timer_probes() -> Result<Value> {
+    use crate::support::http::request;
+    use atlas_core::{Command, tasks::occurrence_id};
+    use atlas_server::{hash_password, now};
+
+    fn shape(reply: &(StatusCode, axum::http::HeaderMap, Value)) -> Value {
+        json!({"status": reply.0.as_u16(), "code": reply.2.get("code")})
+    }
+    fn names(value: &Value) -> Value {
+        let mut names: Vec<&String> = value.as_object().unwrap().keys().collect();
+        names.sort();
+        json!(names)
+    }
+    fn listing(reply: &(StatusCode, axum::http::HeaderMap, Value)) -> Value {
+        let items = reply.2["items"].as_array().cloned().unwrap_or_default();
+        json!({
+            "status": reply.0.as_u16(),
+            "cache_control": reply.1.get("cache-control").map(|v| v.to_str().unwrap()),
+            "set_cookie": reply.1.contains_key("set-cookie"),
+            "count": items.len(),
+            "access": items.iter().map(|i| i["access"].clone()).collect::<Vec<_>>(),
+            "running": items.iter().map(|i| i["stopped_at"].is_null()).collect::<Vec<_>>(),
+            "can_modify": items.iter().map(|i| i.get("can_modify").cloned().unwrap_or(Value::Null)).collect::<Vec<_>>(),
+            "item_members": items.first().map(names),
+            "page_members": names(&reply.2),
+            "has_next": !reply.2["next_after"].is_null(),
+        })
+    }
+
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let store = Store::connect(&url).await?;
+    store.migrate().await?;
+    let hash = hash_password("timer-probe-123".into()).await?;
+    let app = App::new(store.clone()).await?.router();
+    let mut accounts = BTreeMap::new();
+    for name in ["alice", "bob"] {
+        let id = Uuid::new_v4().to_string();
+        store
+            .add_account(&id, &format!("timer-probe-{name}"), &hash)
+            .await?;
+        let login = request(
+            &app,
+            "POST",
+            "sessions",
+            &[],
+            json!({"username":format!("timer-probe-{name}"),"password":"timer-probe-123","device_id":"probe"}),
+        )
+        .await;
+        assert_eq!(login.0, StatusCode::OK, "{}", login.2);
+        accounts.insert(
+            name,
+            (
+                id,
+                format!("Bearer {}", login.2["access_token"].as_str().unwrap()),
+            ),
+        );
+    }
+    let (alice, bob) = (&accounts["alice"], &accounts["bob"]);
+    let task_body = |task: &str, participation: &str, policy: Option<Value>| {
+        let mut body = json!({"command":{"kind":"create_task","id":task,"execution_id":Uuid::new_v4().to_string(),"title":"Timer probe","definition":{
+            "schedule":{"start_date":null,"time":null,"timezone":"Europe/Vienna","repeat":null},
+            "goal":{"kind":"numeric","minimum":"60","maximum":null,"unit":"seconds"},
+            "carry":"retain_one","participation":participation,"open_days_before":0,"close_days_after":1}}});
+        if let Some(policy) = policy {
+            body["command"]["initial_policy"] = policy;
+        }
+        body
+    };
+    let send = |path: &'static str, who: &(String, String), body: Value| {
+        let app = app.clone();
+        let auth = who.1.clone();
+        async move {
+            request(
+                &app,
+                "POST",
+                path,
+                &[
+                    ("authorization", &auth),
+                    ("idempotency-key", &Uuid::new_v4().to_string()),
+                ],
+                body,
+            )
+            .await
+        }
+    };
+    let read = |who: &(String, String), query: String| {
+        let app = app.clone();
+        let auth = who.1.clone();
+        async move {
+            request(
+                &app,
+                "GET",
+                &format!("timer-sessions{query}"),
+                &[("authorization", &auth)],
+                Value::Null,
+            )
+            .await
+        }
+    };
+    let start = |o: &str, at: i64| json!({"command":{"kind":"start_timer","occurrence_id":o,"session_id":Uuid::new_v4().to_string(),"started_at":at}});
+    let mut results = serde_json::Map::new();
+
+    let (first_task, second_task) = (Uuid::new_v4().to_string(), Uuid::new_v4().to_string());
+    for task in [&first_task, &second_task] {
+        let created = send("task-commands", alice, task_body(task, "personal", None)).await;
+        assert_eq!(created.0, StatusCode::OK, "{}", created.2);
+    }
+    let (first, second) = (
+        occurrence_id(&first_task, "once")?,
+        occurrence_id(&second_task, "once")?,
+    );
+    let base = now();
+    let session = Uuid::new_v4().to_string();
+    let started = send(
+        "task-commands",
+        alice,
+        json!({"command":{"kind":"start_timer","occurrence_id":first,"session_id":session,"started_at":base - 600}}),
+    )
+    .await;
+    assert_eq!(started.0, StatusCode::OK, "{}", started.2);
+    results.insert("first_occurrence_start".into(), shape(&started));
+    // Before 0.27.0 this was a conflict for the whole account.
+    let other = send("task-commands", alice, start(&second, base - 500)).await;
+    assert_eq!(other.0, StatusCode::OK, "{}", other.2);
+    results.insert("second_occurrence_start".into(), shape(&other));
+    let same = send("task-commands", alice, start(&first, base - 400)).await;
+    assert_eq!(same.0, StatusCode::CONFLICT, "{}", same.2);
+    results.insert("same_occurrence_start".into(), shape(&same));
+
+    let running = read(alice, String::new()).await;
+    assert_eq!(running.0, StatusCode::OK, "{}", running.2);
+    assert_eq!(running.2["items"].as_array().unwrap().len(), 2);
+    results.insert("list_running".into(), listing(&running));
+    let stopped = send(
+        "task-commands",
+        alice,
+        json!({"command":{"kind":"stop_timer","occurrence_id":first,"session_id":session,"expected_version":1,"stopped_at":base - 100}}),
+    )
+    .await;
+    assert_eq!(stopped.0, StatusCode::OK, "{}", stopped.2);
+    results.insert("stop_with_another_running".into(), shape(&stopped));
+    results.insert(
+        "list_mixed".into(),
+        listing(&read(alice, String::new()).await),
+    );
+    results.insert(
+        "list_stopped".into(),
+        listing(&read(alice, "?state=stopped".into()).await),
+    );
+    results.insert(
+        "list_first_page".into(),
+        listing(&read(alice, "?limit=1".into()).await),
+    );
+
+    // Restricted rows: bob times a task alice shares with him, then alice withdraws the share.
+    let shared_task = Uuid::new_v4().to_string();
+    let shared = send(
+        "task-access-commands",
+        alice,
+        task_body(
+            &shared_task,
+            "anyone",
+            Some(
+                json!({"grants":[{"kind":"account","id":bob.0,"edit":true}],"exclude_accounts":[]}),
+            ),
+        ),
+    )
+    .await;
+    assert_eq!(shared.0, StatusCode::OK, "{}", shared.2);
+    let shared_occurrence = occurrence_id(&shared_task, "once")?;
+    let bobs = send("task-commands", bob, start(&shared_occurrence, base - 300)).await;
+    assert_eq!(bobs.0, StatusCode::OK, "{}", bobs.2);
+    results.insert(
+        "shared_list_available".into(),
+        listing(&read(bob, String::new()).await),
+    );
+    let version: i64 = sqlx::query_scalar("SELECT policy_version FROM resources WHERE id=$1")
+        .bind(&shared_task)
+        .fetch_one(&store.pool)
+        .await?;
+    store
+        .apply(
+            &alice.0,
+            &Uuid::new_v4().to_string(),
+            &[Command::Revoke {
+                id: shared_task.clone(),
+                expected_version: version,
+                account_id: bob.0.clone(),
+            }],
+        )
+        .await?;
+    let restricted = read(bob, String::new()).await;
+    assert_eq!(restricted.2["items"][0]["access"], "restricted");
+    results.insert("shared_list_restricted".into(), listing(&restricted));
+
+    results.insert(
+        "unauthenticated".into(),
+        probe(&app, "/api/experimental/v1/timer-sessions", &["request_id"]).await,
+    );
+    let cursor = |kind: &str| format!("{kind}.1.{}", Uuid::new_v4());
+    for (name, query) in [
+        ("bad_cursor", "?after=garbage".to_string()),
+        ("bad_state", "?state=bogus".into()),
+        ("limit_zero", "?limit=0".into()),
+        ("limit_over", "?limit=201".into()),
+        (
+            "cursor_state_mismatch",
+            format!("?state=stopped&after={}", cursor("r")),
+        ),
+        ("unknown_parameter", "?unknown=1".into()),
+        ("non_numeric_limit", "?limit=x".into()),
+    ] {
+        results.insert(name.into(), shape(&read(alice, query).await));
+    }
+    Ok(Value::Object(results))
+}
+
 async fn observe(app: &Router) -> Value {
     json!({
         "activation": activation_probes().await.expect("activation-grant protocol probes"),
@@ -1955,6 +2177,7 @@ async fn observe(app: &Router) -> Value {
         "error_mapping": error_mapping().await,
         "web_push_payload": web_push_payload_probes().await.expect("BE-B4 Declarative Web Push payload probes"),
         "content_and_retirement": content_and_retirement().await.expect("combined protocol probes"),
+        "independent_timers": independent_timer_probes().await.expect("BE-B6 independent-timer probes"),
         "health": probe(app, "/health", &["api_version"]).await,
         "me_unauthenticated": probe(app, "/api/experimental/v1/me", &["request_id"]).await,
         "ready": probe(app, "/ready", &[]).await,

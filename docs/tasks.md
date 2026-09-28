@@ -31,7 +31,7 @@ accepts current server defaults. An explicit empty policy creates privately.
 | `put_field` | Create/update a typed contribution under a person or task. Each contribution has its own policy and edit version. Updating sends both `expected_version` and the field's `expected_policy_version`; creating sends neither. |
 | `set_dependencies` | Replaces explicit occurrence prerequisites using the occurrence version; concurrent cycles are rejected. |
 | `complete_dependencies` | Applies a current preview atomically, with an explicit completion mode and optional numeric/checklist root evidence. |
-| `start_timer`, `stop_timer`, `cancel_timer` | Records duration sessions, checking authority, dependencies and interval overlap; a rejected stop can be retried or cancelled. |
+| `start_timer`, `stop_timer`, `cancel_timer` | Records duration sessions, checking authority and dependencies. Timers on different occurrences run independently; a person's own intervals on one occurrence cannot overlap. A rejected stop can be retried or cancelled. |
 | `set_rota`, `rota_consent` | Online-only roster configuration and self-consent on `/task-access-commands`; assignments apply prospectively. |
 | `archive` | Reversible archive of a task, list, person or field. History, receipts and sync content survive. |
 
@@ -258,16 +258,54 @@ partial progress and corrections remain possible without completing prerequisite
 
 `start_timer`, `stop_timer` and `cancel_timer` use numeric goals whose unit is
 `seconds`. Stop records one exact integer duration in the ordinary progress journal.
-One active timer per account and checks against historical intervals prevent overlap
-across devices. Sessions last at most seven days. Stop/start represents pause/resume;
-cancel records no progress and reserves the session ID against reuse. Timers and
-cascades support on-demand participation in editable Anyone occurrences, just like
-`record`. `GET /occurrences/{id}/timers` pages the caller's own sessions. These commands
-can be queued offline, with conflicts resolved on synchronisation. A stop that would
-complete a task still requires its prerequisites; rejection rolls back both the stop
-and evidence. Retry after satisfying them, submit a valid shorter interval, or cancel
-the session to free the account. Backdated sessions can fill gaps before recorded
-intervals, but cannot overlap them.
+Timers are independent per person per task occurrence. A person can time several
+occurrences at once, each recording only its own duration, but has at most one running
+timer per occurrence across devices, and a start or stop whose interval would overlap
+another interval of the same occurrence is a `conflict`. Intervals of different
+occurrences may nest or overlap freely, in whatever order the commands arrive, so an
+offline queue replays exactly as it would online. The database enforces the same scope
+(a unique index on the running session of each account and progress stream), so the
+rule holds whichever path writes a row. The server never stops, cancels or expires a
+timer on anyone's behalf. Sessions last at most seven days. Stop/start represents
+pause/resume; cancel records no progress, frees the occurrence's timer slot and
+reserves the session ID against reuse. Timers and cascades support on-demand
+participation in editable Anyone occurrences, just like `record`.
+`GET /occurrences/{id}/timers` pages the caller's own sessions of one occurrence. These
+commands can be queued offline, with conflicts resolved on synchronisation. A stop that
+would complete a task still requires its prerequisites; rejection rolls back both the
+stop and evidence. Retry after satisfying them, submit a valid shorter interval, or
+cancel the session to free the occurrence. Backdated sessions can fill gaps before
+recorded intervals of the same occurrence, but cannot overlap them.
+
+`GET /timer-sessions` (`listAccountTimerSessions`) lists the caller's own timers across
+every occurrence: running sessions first (newest start first), then finished ones
+(latest finish first), ties by session ID; cancelled sessions are not listed. `state`
+(`running`, `stopped` or `all`, the default), `limit` (1 to 200, default 50) and an
+opaque `after` cursor page it by keyset, so paging is stable while timers start and
+stop. `next_after` is null when no further row existed at the read, so there is no
+trailing empty page. An ID that appears again on a later page supersedes its earlier
+row (a session that stops between two reads can be seen once running and once
+finished); refresh the first page to see newer activity. The list is not part of `/sync`
+and is served `private, no-store`.
+
+Access is applied per row by redaction, never by omission. A session whose task the
+caller can no longer read is returned as `restricted`, carrying only its ID, times and
+version, so a running timer is never hidden and no task, occurrence, title or date is
+disclosed. On an `available` row, `can_modify` is advisory: it is true for a running
+session the caller could stop or discard now, and the command remains the authority.
+A running timer whose task its owner can no longer read stays running and cannot be
+stopped or discarded by its owner until access is restored (both commands require read
+access to the occurrence); it no longer blocks any other timer.
+
+<!-- experimental-schema: AccountTimerSession -->
+```json
+{"access":"available","id":"6f1d1f0a-5c1e-4c55-9d3e-2a1b8c6d7e01","occurrence_id":"0a5c6f5e-1d0e-5b7a-8d38-3c4b8b0a9e11","task_id":"9d2f4a1c-7e33-4c0a-b1a2-5d6e7f809a10","task_title":"Practise piano","slot_date":"2026-09-28","started_at":1788868200,"stopped_at":null,"version":1,"can_modify":true}
+```
+
+<!-- experimental-schema: RestrictedTimerSession -->
+```json
+{"access":"restricted","id":"6f1d1f0a-5c1e-4c55-9d3e-2a1b8c6d7e02","started_at":1788868200,"stopped_at":null,"version":1}
+```
 
 `repeat.frequency = after_completion` uses the interval as calendar days after
 completion in the saved task timezone. Each predecessor can issue one deterministic

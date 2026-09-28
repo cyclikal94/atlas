@@ -65,7 +65,7 @@ async fn timer_recovery(s: &Store) -> Result<()> {
         NOW,
     )
     .await?;
-    // Cancellation frees the account. No elapsed evidence bypassed the prerequisite.
+    // Cancellation frees the occurrence's timer slot. No elapsed evidence bypassed the prerequisite.
     assert_eq!(sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM progress_entries e JOIN resources r ON r.id=e.progress_id WHERE r.parent_id=$1").bind(&root).fetch_one(&s.pool).await?,0);
     run(
         s,

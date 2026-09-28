@@ -426,9 +426,7 @@ CREATE INDEX deliveries_due ON reminder_deliveries(state,next_attempt,lease_unti
 
 CREATE INDEX dependency_reverse ON occurrence_dependencies(prerequisite_id, occurrence_id);
 
-CREATE UNIQUE INDEX timer_active_account_occurrence ON timer_sessions(account_id,progress_id) WHERE stopped_at IS NULL AND cancelled=0;
-
-CREATE INDEX timer_account_stopped ON timer_sessions(account_id,stopped_at,id) WHERE stopped_at IS NOT NULL AND cancelled=0;
+CREATE UNIQUE INDEX timer_active_account ON timer_sessions(account_id) WHERE stopped_at IS NULL AND cancelled=0;
 
 CREATE INDEX timer_progress ON timer_sessions(progress_id,id);
 
@@ -479,4 +477,4 @@ BEGIN
  SELECT NEW.id,ancestor_id,depth+1 FROM resource_ancestors WHERE resource_id=NEW.parent_id;
 END;
 INSERT INTO sync_clock(id,revision,resource_count) VALUES(1,0,0);
-INSERT INTO atlas_schema(version) VALUES(1004);
+INSERT INTO atlas_schema(version) VALUES(1003);

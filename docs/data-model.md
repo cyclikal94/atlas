@@ -15,7 +15,7 @@ This document explains ownership and relationships rather than duplicating every
 | `tasks`, `task_definitions`, `task_enrolments`, `task_enrolment_history` | Task identity, execution definitions and versioned participation |
 | `task_occurrences`, `occurrence_participants`, `progress_entries` | Stable scheduled instances, participant snapshots and correction-aware evidence |
 | `list_items` | Authorised references to tasks; list visibility does not grant task visibility |
-| `occurrence_dependencies`, `dependency_rules`, `timer_sessions` | Dependency decisions and durable timer state |
+| `occurrence_dependencies`, `dependency_rules`, `timer_sessions` | Dependency decisions and durable timer state. A partial unique index allows one running, uncancelled session per account and progress stream (`timer_active_account_occurrence`); `timer_account_stopped` orders the finished history for the account-wide list |
 | `task_rotas`, `rota_consents`, `completion_pending`, `completion_successors` | Consented assignments and deduplicated completion-relative scheduling |
 | `calendar_sources`, `calendar_events`, `task_anchors`, `anchored_occurrences`, `calendar_reviews` | Imported evidence, stable source identity, task binding and reviewable reconciliation |
 | `reminder_rules`, `notification_subscriptions`, `reminder_deliveries` | Reminder ownership, encrypted destinations and claimed delivery attempts |

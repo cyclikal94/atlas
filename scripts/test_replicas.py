@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 import uuid
 from smoke.client import ContractClient
-from smoke import calendars, sharing, households, tasks, people, devices
+from smoke import calendars, sharing, households, tasks, people, devices, timers
 
 ROOT = Path(__file__).resolve().parents[1]
 # ATLAS_TEST_BINARY names the exact executable under test (the release-shaped build).
@@ -157,6 +157,88 @@ def race_retirements(clients, document, tokens, secrets, rounds):
     return {'rounds': rounds, 'twin_rounds': max(2, rounds // 10),
             'elapsed_seconds': round(time.monotonic() - started, 1),
             'orders_observed': {f'{k[0]}/{k[1]}/writer_{k[2]}': v for k, v in sorted(seen.items())}}
+
+
+def race_timers(clients, tokens, accounts, rounds):
+    """BE-B6 between real processes on PostgreSQL: timer starts released together from both.
+
+    Each round, on fresh occurrences of one person:
+
+    * two different occurrences, one start per process: both must be accepted (before 0.27.0 the
+      account-wide rule made one of them a conflict);
+    * one occurrence, a start per process with different session IDs: exactly one is accepted and
+      the other is a `conflict`, decided by the database, never two running timers;
+    * the account-wide list read through each process is identical and holds all three running
+      timers, then each is stopped through the other process, recording only its own duration.
+    """
+    alice = tokens['alice']
+    seen = collections.Counter()
+    started = time.monotonic()
+
+    def command(client, body):
+        request = urllib.request.Request(client.base + V1 + '/task-commands', method='POST',
+            data=json.dumps({'command': body}).encode(), headers={
+                'Authorization': 'Bearer ' + alice, 'Content-Type': 'application/json',
+                'Idempotency-Key': str(uuid.uuid4())})
+        try:
+            response = urllib.request.urlopen(request, timeout=30)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            payload = response.read()
+            return response.status, (json.loads(payload) if payload else None)
+
+    def together(calls):
+        barrier = threading.Barrier(len(calls))
+
+        def released(call):
+            barrier.wait()
+            time.sleep(random.uniform(0, 0.004))
+            return call()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(calls)) as pool:
+            return [future.result() for future in [pool.submit(released, call) for call in calls]]
+
+    def start_body(occurrence, session, at):
+        return {'kind': 'start_timer', 'occurrence_id': occurrence, 'session_id': session, 'started_at': at}
+
+    def stop_body(occurrence, session, at):
+        return {'kind': 'stop_timer', 'occurrence_id': occurrence, 'session_id': session,
+                'expected_version': 1, 'stopped_at': at}
+
+    for index in range(rounds):
+        first, second = clients[index % 2], clients[(index + 1) % 2]
+        (_, x), (_, y), (_, z) = [timers.seconds_task(first, alice) for _ in range(3)]
+        sx, sy, sz1, sz2 = (str(uuid.uuid4()) for _ in range(4))
+        now = int(time.time())
+        distinct = together([lambda: command(first, start_body(x, sx, now - 300)),
+                             lambda: command(second, start_body(y, sy, now - 250))])
+        assert [status for status, _ in distinct] == [200, 200], distinct
+        same = together([lambda: command(first, start_body(z, sz1, now - 200)),
+                         lambda: command(second, start_body(z, sz2, now - 200))])
+        assert sorted(status for status, _ in same) == [200, 409], same
+        loser = next(body for status, body in same if status == 409)
+        assert loser['code'] == 'conflict', loser
+        winner_index = next(i for i, (status, _) in enumerate(same) if status == 200)
+        winner_session = (sz1, sz2)[winner_index]
+        seen[('same_occurrence', 'first_process_won' if winner_index == 0 else 'second_process_won')] += 1
+
+        pages = [client('GET', V1 + '/timer-sessions?state=running&limit=200', alice) for client in (first, second)]
+        assert pages[0] == pages[1], pages
+        running = {item['id'] for item in pages[0]['items']}
+        assert {sx, sy, winner_session} <= running, (running, sx, sy, winner_session)
+        assert (sz1 in running) != (sz2 in running), 'exactly one of the contested sessions is running'
+
+        # Stop each through the other process at once; every duration is its own, the intervals nest.
+        stops = together([lambda: command(second, stop_body(x, sx, now - 100)),
+                          lambda: command(first, stop_body(y, sy, now - 150)),
+                          lambda: command(second, stop_body(z, winner_session, now - 50))])
+        assert [status for status, _ in stops] == [200, 200, 200], stops
+        for occurrence, expected in ((x, '200'), (y, '100'), (z, '150')):
+            assert timers.recorded(first, alice, occurrence, accounts['alice']) == [expected], (occurrence, expected)
+        assert psql("SELECT count(*) FROM (SELECT progress_id FROM timer_sessions WHERE stopped_at IS NULL "
+                    "AND cancelled=0 GROUP BY account_id, progress_id HAVING count(*)>1) d") == '0'
+    return {'rounds': rounds, 'elapsed_seconds': round(time.monotonic() - started, 1),
+            'orders_observed': {f'{k[0]}/{k[1]}': v for k, v in sorted(seen.items())}}
 
 
 def race_activations(clients, document, tokens, secrets, rounds):
@@ -322,6 +404,8 @@ def main():
             households.run(call, accounts, tokens, secrets, person, field, snapshot_lanes)
             workflow = tasks.run(call, accounts, tokens, document)
             people.run(call, accounts, tokens, workflow)
+            # Alternating processes serve every request; one timer is left running for the backup.
+            print(json.dumps(timers.run(call, accounts, tokens, document)))
             def seed(account, device, kind):
                 """Fixture rows for devices.run: no OpenID provider or push endpoint exists here."""
                 expires = int(time.time()) + 3600
@@ -357,6 +441,8 @@ def main():
             print(json.dumps({'scenario': 'two-postgres-processes', 'concurrent_clients': 8,
                               'writes': len(elapsed), 'elapsed_seconds': time.monotonic() - start,
                               'write_p50_ms': statistics.median(elapsed), 'write_p95_ms': elapsed[94]}))
+            print(json.dumps({'scenario': 'independent-timer-races', **race_timers(
+                clients, tokens, accounts, int(os.environ.get('ATLAS_TIMER_RACE_ROUNDS', '25')))}))
             rounds = int(os.environ.get('ATLAS_RACE_ROUNDS', '200'))
             if rounds:
                 print(json.dumps({'scenario': 'device-retirement-races', **race_retirements(clients, document, tokens, secrets, rounds)}))

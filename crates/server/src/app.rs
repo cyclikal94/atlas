@@ -146,6 +146,10 @@ impl App {
                 "/api/experimental/v1/occurrences/{id}/timers",
                 get(tasks::timers),
             )
+            .route(
+                "/api/experimental/v1/timer-sessions",
+                get(tasks::account_timers),
+            )
             .route("/api/experimental/v1/lists", get(tasks::lists))
             .route("/api/experimental/v1/people", get(people::people))
             .route("/api/experimental/v1/people/{id}", get(people::detail))

@@ -2,7 +2,7 @@
   "openapi": "3.1.1",
   "info": {
     "title": "Atlas API",
-    "version": "0.26.0",
+    "version": "0.27.0",
     "description": "Pre-release API. Breaking changes and explicit database resets are permitted until a supported release."
   },
   "servers": [
@@ -13921,6 +13921,228 @@
         "summary": "List this account\u2019s timer sessions"
       }
     },
+    "/timer-sessions": {
+      "get": {
+        "operationId": "listAccountTimerSessions",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountTimerPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "malformed_request",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "unauthenticated",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "forbidden",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "invalid_value",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "internal_error",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "slice_capacity, temporarily_unavailable",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "x-error-codes": {
+          "400": [
+            "malformed_request"
+          ],
+          "401": [
+            "unauthenticated"
+          ],
+          "403": [
+            "forbidden",
+            "credential_mismatch"
+          ],
+          "404": [
+            "not_found"
+          ],
+          "422": [
+            "invalid_value"
+          ],
+          "500": [
+            "internal_error"
+          ],
+          "503": [
+            "slice_capacity",
+            "temporarily_unavailable"
+          ]
+        },
+        "parameters": [
+          {
+            "in": "query",
+            "name": "state",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "running",
+                "stopped",
+                "all"
+              ],
+              "default": "all"
+            },
+            "description": "Which sessions to list. `all` returns running sessions first, then finished ones."
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "description": "Opaque cursor: the `next_after` of the previous page. A cursor from a running row cannot resume `state=stopped`, nor one from a finished row `state=running`."
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          }
+        ],
+        "description": "The caller\u2019s own timer sessions across every task occurrence: running sessions first (newest start first), then finished sessions (latest finish first), ties broken by session ID. Discarded (cancelled) sessions are not listed. Only the caller\u2019s own account is listed. Access is applied per row by redaction, never by omission: a session whose task the caller can no longer read is still returned as `restricted`, carrying only its ID, times and version, so no task, occurrence or title detail is disclosed and no running timer is hidden. `can_modify` on an `available` row is advisory: it is true for a running session the caller could stop or discard now, and the command remains the authority (version, goal-unit and covered-occurrence rules still apply). The server never stops or discards a timer on anyone\u2019s behalf. A running timer whose task the owner can no longer read stays running, is listed `restricted`, and cannot be stopped or discarded by its owner until access is restored. `after` is opaque; `next_after` is null when no further row exists at the time of the read, so there is no trailing empty page. Items are keyed by `id`; if an ID appears again on a later page, the later occurrence supersedes the earlier one (a session that stops between two page reads can appear once as running and once as finished). Refresh the first page to observe newer activity. Not part of `/sync`; not cacheable (`Cache-Control: private, no-store`); a client that keeps an offline copy holds protected content and must scope it per account and hide it under the same rules as any other retained content.",
+        "summary": "List this account\u2019s timer sessions across all tasks"
+      }
+    },
     "/task-presets": {
       "get": {
         "operationId": "listTaskPresets",
@@ -21017,7 +21239,8 @@
           "session_id",
           "started_at"
         ],
-        "additionalProperties": false
+        "additionalProperties": false,
+        "description": "Starts a timer. A person has at most one running timer per task occurrence, across devices; timers on different occurrences run independently and concurrently. A second start on an occurrence that already has a running timer, or inside one of its own finished intervals, is a conflict."
       },
       "TaskStopTimer": {
         "type": "object",
@@ -21048,7 +21271,8 @@
           "expected_version",
           "stopped_at"
         ],
-        "additionalProperties": false
+        "additionalProperties": false,
+        "description": "Stops a running timer and records its duration once on that occurrence\u2019s progress stream. Stopping is refused with a conflict only if the interval would overlap another interval of the same occurrence; the person\u2019s timers on other occurrences are unaffected."
       },
       "TaskCancelTimer": {
         "type": "object",
@@ -21126,6 +21350,140 @@
               {
                 "type": "string",
                 "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_after"
+        ],
+        "additionalProperties": false
+      },
+      "AccountTimerSession": {
+        "description": "A session the caller can currently see, with its task. Returned only while the caller can read the occurrence and its task.",
+        "type": "object",
+        "properties": {
+          "access": {
+            "const": "available"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "occurrence_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "task_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "task_title": {
+            "type": "string"
+          },
+          "slot_date": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "started_at": {
+            "type": "integer"
+          },
+          "stopped_at": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "can_modify": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "access",
+          "id",
+          "occurrence_id",
+          "task_id",
+          "task_title",
+          "slot_date",
+          "started_at",
+          "stopped_at",
+          "version",
+          "can_modify"
+        ],
+        "additionalProperties": false
+      },
+      "RestrictedTimerSession": {
+        "description": "A session of the caller\u2019s whose task the caller can no longer read. It exposes no task, occurrence, title or date.",
+        "type": "object",
+        "properties": {
+          "access": {
+            "const": "restricted"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "started_at": {
+            "type": "integer"
+          },
+          "stopped_at": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "access",
+          "id",
+          "started_at",
+          "stopped_at",
+          "version"
+        ],
+        "additionalProperties": false
+      },
+      "AccountTimerPage": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/AccountTimerSession"
+                },
+                {
+                  "$ref": "#/components/schemas/RestrictedTimerSession"
+                }
+              ]
+            },
+            "maxItems": 200
+          },
+          "next_after": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
               },
               {
                 "type": "null"

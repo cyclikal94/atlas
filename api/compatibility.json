@@ -1,6 +1,6 @@
 {
-  "api_version": "0.26.0",
-  "contract_sha256": "9a3a0ffd64031f0b26d7e15f8c1f992ad7a1e777d3de4caf073f7f315ef71ad7",
+  "api_version": "0.27.0",
+  "contract_sha256": "ba586a03dd10b82590533beaaecdb387524c302c18707a5c8d83a1fd28847900",
   "behaviour": {
     "activation": {
       "activate": {
@@ -369,6 +369,257 @@
       "referrer_policy": "no-referrer",
       "set_cookie": false,
       "status": 200
+    },
+    "independent_timers": {
+      "bad_cursor": {
+        "code": "invalid_value",
+        "status": 422
+      },
+      "bad_state": {
+        "code": "invalid_value",
+        "status": 422
+      },
+      "cursor_state_mismatch": {
+        "code": "invalid_value",
+        "status": 422
+      },
+      "first_occurrence_start": {
+        "code": null,
+        "status": 200
+      },
+      "limit_over": {
+        "code": "invalid_value",
+        "status": 422
+      },
+      "limit_zero": {
+        "code": "invalid_value",
+        "status": 422
+      },
+      "list_first_page": {
+        "access": [
+          "available"
+        ],
+        "cache_control": "private, no-store",
+        "can_modify": [
+          true
+        ],
+        "count": 1,
+        "has_next": true,
+        "item_members": [
+          "access",
+          "can_modify",
+          "id",
+          "occurrence_id",
+          "slot_date",
+          "started_at",
+          "stopped_at",
+          "task_id",
+          "task_title",
+          "version"
+        ],
+        "page_members": [
+          "items",
+          "next_after"
+        ],
+        "running": [
+          true
+        ],
+        "set_cookie": false,
+        "status": 200
+      },
+      "list_mixed": {
+        "access": [
+          "available",
+          "available"
+        ],
+        "cache_control": "private, no-store",
+        "can_modify": [
+          true,
+          false
+        ],
+        "count": 2,
+        "has_next": false,
+        "item_members": [
+          "access",
+          "can_modify",
+          "id",
+          "occurrence_id",
+          "slot_date",
+          "started_at",
+          "stopped_at",
+          "task_id",
+          "task_title",
+          "version"
+        ],
+        "page_members": [
+          "items",
+          "next_after"
+        ],
+        "running": [
+          true,
+          false
+        ],
+        "set_cookie": false,
+        "status": 200
+      },
+      "list_running": {
+        "access": [
+          "available",
+          "available"
+        ],
+        "cache_control": "private, no-store",
+        "can_modify": [
+          true,
+          true
+        ],
+        "count": 2,
+        "has_next": false,
+        "item_members": [
+          "access",
+          "can_modify",
+          "id",
+          "occurrence_id",
+          "slot_date",
+          "started_at",
+          "stopped_at",
+          "task_id",
+          "task_title",
+          "version"
+        ],
+        "page_members": [
+          "items",
+          "next_after"
+        ],
+        "running": [
+          true,
+          true
+        ],
+        "set_cookie": false,
+        "status": 200
+      },
+      "list_stopped": {
+        "access": [
+          "available"
+        ],
+        "cache_control": "private, no-store",
+        "can_modify": [
+          false
+        ],
+        "count": 1,
+        "has_next": false,
+        "item_members": [
+          "access",
+          "can_modify",
+          "id",
+          "occurrence_id",
+          "slot_date",
+          "started_at",
+          "stopped_at",
+          "task_id",
+          "task_title",
+          "version"
+        ],
+        "page_members": [
+          "items",
+          "next_after"
+        ],
+        "running": [
+          false
+        ],
+        "set_cookie": false,
+        "status": 200
+      },
+      "non_numeric_limit": {
+        "code": "malformed_request",
+        "status": 400
+      },
+      "same_occurrence_start": {
+        "code": "conflict",
+        "status": 409
+      },
+      "second_occurrence_start": {
+        "code": null,
+        "status": 200
+      },
+      "shared_list_available": {
+        "access": [
+          "available"
+        ],
+        "cache_control": "private, no-store",
+        "can_modify": [
+          true
+        ],
+        "count": 1,
+        "has_next": false,
+        "item_members": [
+          "access",
+          "can_modify",
+          "id",
+          "occurrence_id",
+          "slot_date",
+          "started_at",
+          "stopped_at",
+          "task_id",
+          "task_title",
+          "version"
+        ],
+        "page_members": [
+          "items",
+          "next_after"
+        ],
+        "running": [
+          true
+        ],
+        "set_cookie": false,
+        "status": 200
+      },
+      "shared_list_restricted": {
+        "access": [
+          "restricted"
+        ],
+        "cache_control": "private, no-store",
+        "can_modify": [
+          null
+        ],
+        "count": 1,
+        "has_next": false,
+        "item_members": [
+          "access",
+          "id",
+          "started_at",
+          "stopped_at",
+          "version"
+        ],
+        "page_members": [
+          "items",
+          "next_after"
+        ],
+        "running": [
+          true
+        ],
+        "set_cookie": false,
+        "status": 200
+      },
+      "stop_with_another_running": {
+        "code": null,
+        "status": 200
+      },
+      "unauthenticated": {
+        "body": {
+          "code": "unauthenticated",
+          "details": [],
+          "message": "A valid session is required."
+        },
+        "cache_control": "private, no-store",
+        "content_type": "application/json",
+        "referrer_policy": "no-referrer",
+        "set_cookie": false,
+        "status": 401
+      },
+      "unknown_parameter": {
+        "code": "malformed_request",
+        "status": 400
+      }
     },
     "me_unauthenticated": {
       "body": {

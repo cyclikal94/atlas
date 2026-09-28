@@ -14,8 +14,11 @@ recovery. Start `target/debug/atlas-server` with no arguments to serve requests.
 
 Atlas is unreleased. Current startup creates the complete schema transactionally,
 or validates its baseline identity. An ordered chain of additive in-place steps upgrades
-a database recorded at an earlier supported version: today one step, `1000 → 1001`, which
-adds the `operation_outcomes` table and changes no existing row. Each step runs inside the
+a database recorded at an earlier supported version: today `1000 → 1001` through
+`1003 → 1004`, each adding tables, columns or indexes without changing an existing row (the
+last, `1003 → 1004`, only swaps the unique timer index for one scoped to each occurrence and
+adds a history index; on PostgreSQL its index build blocks timer writes for the seconds it
+takes, about two on a million rows). Each step runs inside the
 serialising startup transaction (an advisory lock on PostgreSQL, an immediate transaction
 on SQLite), so replicas starting together upgrade once. Any other recorded version, and any
 database that is not a single recorded version, produces a reset-required error. There is

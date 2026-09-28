@@ -12,4 +12,5 @@ mod sessions;
 mod snapshot;
 mod sync;
 mod tasks;
+mod timer_sessions;
 mod writers;

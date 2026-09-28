@@ -20,7 +20,7 @@ a subprocess helper invoked by the sync lifecycle test; do not run it directly.
 | Stable saved timezone slots, gaps/folds, date-only recurrence, exact numeric goals | `tasks/domain` | HTTP command validation |
 | Immutable occurrences/history, corrections, shared completion and streaks | `tasks/lifecycle`, `participation`, `joint`, `checklists`, `numeric` | Task HTTP routes |
 | Atomic dependency consent and cycle prevention | `tasks/dependencies` | Task HTTP routes |
-| Timer overlap, rejection recovery, durable completion successors and rotas | `tasks/timers`, `timer_recovery`, `successors`, `missed_recurrence`, `completion_worker`, `rotas` | Task HTTP routes |
+| Independent per-occurrence timers (any arrival order, replay, concurrent starts, the unique index as a database-level backstop), rejection recovery, the account-wide timer list (order, keyset paging, redaction, `can_modify`), durable completion successors and rotas | `tasks/timers`, `timer_listing`, `timer_recovery`, `successors`, `missed_recurrence`, `completion_worker`, `rotas` | Server `timer_sessions` and the `independent_timers` compatibility probes; `scripts/smoke/timers.py` on a real server; two real PostgreSQL processes in `scripts/test_replicas.py` |
 | Parent visibility, independent policies and policy/content versions | `resources` | Authenticated cross-device HTTP sync |
 | Content writes rejected atomically when sharing changed since they were read, for owners and collaborators, on both engines; held-gate ordering of `replace_policy` and existing-field `put_field`; edits never re-addressed through a merged alias | `resources/policy_precondition`, `tasks/policy_precondition`, `storage/contention`, `people/workflows` | Server `policy_precondition`; smoke and replica runs, including overlapping narrowing and save |
 | Household membership, defaults, invitations and exclusions; durable sent-invitation history across every state, its cascade-revoke on member removal and concurrent-response consistency; the defaults revision formula pinned by a golden value; the combined sharing snapshot (one consistent read of defaults, households and members, on both engines against real writers, with negative controls and static tripwires on the writers it depends on) | `households` (`households/snapshot`) | Onboarding HTTP routes; server `snapshot` (real routes and the real onboarding writer against a paused read) |
@@ -30,7 +30,7 @@ a subprocess helper invoked by the sync lifecycle test; do not run it directly.
 | Retirement ordered against every writer of a member row, retry as a unit, the rows-affected assertion, READ COMMITTED and REPEATABLE READ | `accounts/retirement_coordination` (engine-specific schedules: revoke, sweeps, retention cleanup, registration create and `last_seen`, and the real `reminder_command` subscription set) | Server `devices` (ordinary revoke and `DELETE /sessions/current` route table) and server `writers` (the real routes for session issue, handoff create and consume, password change); two real PostgreSQL processes in `scripts/test_replicas.py` |
 | Every device holding a live member is listed with a token, including one left with only a handoff or subscription | `accounts/approved_state` | Server `devices`; `scripts/smoke/devices.py` (seeded fixture rows, real server) |
 | No unlisted or moved writer of an approved-state member | `accounts/writer_inventory` | — |
-| Additive `1000 → 1003` upgrade chain, unknown versions, concurrent upgrade, durable sent-history backfill on the `1002 → 1003` step | `storage/migration` | `scripts/test_recovery.py` restores a 1000 bundle |
+| Additive `1000 → 1004` upgrade chain rooted on a frozen genuine 1003 schema (row digests of every table unchanged, index parity with a fresh database), unknown versions, concurrent upgrade, durable sent-history backfill on the `1002 → 1003` step; `scripts/backup.py` accepting exactly the schemas the chain can produce | `storage/migration`, the `SUPPORTED_SCHEMAS` test in `storage/mod.rs` | `scripts/test_recovery.py` and `scripts/test-postgres-release.sh` restore bundles of every accepted schema and start a real server on the result |
 | Atomic receipts/publication, read/write contention and real process crash recovery | `sync`, `storage/contention` | SQLite and PostgreSQL execution |
 | Clean startup/reopen, concurrent initialisation, incompatible-schema rejection | `storage/initialisation` | Both database engines |
 | Foreign keys and failed-initialisation rollback | `resources/hierarchy`, `storage/initialisation` | SQLite connection pool; transactional DDL on both engines |
@@ -46,8 +46,9 @@ atlas-server --test api compatibility`; see [API](api.md#api-version-and-compati
 The probes are a floor, not a proof, and cover only what they record.
 
 The unreleased migration-chain tests were deliberately removed with the clean
-baseline; the single additive `1000 → 1001` step has its own case (`storage/migration`),
-and earlier experimental schemas still require a reset. Runtime receipt replay, alias resolution, request-ID reservation, and
+baseline; each additive step of the `1000 → 1004` chain has its own case
+(`storage/migration`, rooted on the frozen `tests/fixtures/schema_1003_*.sql`, never on
+the current schema), and earlier experimental schemas still require a reset. Runtime receipt replay, alias resolution, request-ID reservation, and
 snapshot/delta recovery remain supported and tested. Similar unit, database and
 HTTP checks exercise different boundaries; do not remove one merely because it
 mentions the same feature.
@@ -97,21 +98,38 @@ Use `crates/core/examples/sync_load.rs` for current-runtime workloads, and
 `crates/core/examples/retire_load.rs` (with `ATLAS_TEST_POSTGRES_URL` for PostgreSQL) for the
 cost of a retirement, of the device listing, and of unrelated writers beside retirements, and
 `crates/core/examples/sharing_snapshot_load.rs` for the payload and latency of the sharing
-snapshot against separate `defaults` and `households` reads. Record the
+snapshot against separate `defaults` and `households` reads, and
+`crates/core/examples/timer_list_load.rs` for the account-wide timer list (pages over 1k to
+100k finished sessions, the access-check cost, query plans with and without the
+`timer_account_stopped` index) and, with `ATLAS_LOAD_MODE=migrate`, the `1003 → 1004` upgrade
+of a database holding up to a million timer rows. Record the
 revision, database, architecture, workload and resource limits when reporting capacity;
 results from a different implementation do not establish current throughput.
 
 ## Deployment and recovery checks
 
-After building the server, `python3 scripts/test_recovery.py` exercises real SQLite
-exports, credential files, corruption rejection and occupied-destination protection.
+After building the server, `python3 scripts/test_recovery.py` (with
+`scripts/requirements-contract.txt` installed) populates a SQLite database through a real
+server, then exercises real exports, credential files, corruption and unknown-schema
+rejection, occupied-destination protection (an existing or empty file is refused and left
+byte for byte unchanged) and restore. Row digests of the durable tables, including the
+timer history and both sent histories, must match across the restore; a real server then
+starts on the restored file, serves the same history and accepts a new concurrent timer.
+Bundles of every older schema, built from the frozen 1003 baseline, restore and upgrade
+in place, and a server started directly on a 1003 database migrates it at startup.
 `scripts/test-postgres-release.sh` owns a disposable PostgreSQL cluster and runs two
 actual server processes, alternating domain HTTP requests between them, racing one
 operation ID, racing device retirements against revokes and logouts, racing activation-grant
 redemption against a retirement of the same device and against a concurrent cancellation of
-the same grant, measuring a bounded concurrent write sample, stopping one replica and
-restoring an export into a second database (the operation ledger must survive the restore,
-and restore preparation must leave no activation grant behind). Set `ATLAS_PYTHON` to a Python environment
+the same grant, racing timer starts released together from both processes (different
+occurrences must both start; one occurrence must have exactly one winner), measuring a bounded
+concurrent write sample, stopping one replica and restoring an export into a second database.
+Through `scripts/test_recovery_postgres.py` the restore is then compared row for row with the
+source (timer history in both states, both sent histories and the operation ledger, with non-zero
+counts), a refused restore into the occupied database must leave it unchanged, real servers on
+the source and the restored database must serve identical history, and older bundles, a real
+startup upgrade and the unknown-schema refusals are exercised (restore preparation must leave no
+activation grant behind). Set `ATLAS_PYTHON` to a Python environment
 with `scripts/requirements-contract.txt` installed. Worker generation and retry fencing
 are also tested through independent database pools in the calendar reconciliation cases.
 
