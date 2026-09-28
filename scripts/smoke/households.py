@@ -1,7 +1,9 @@
 import base64
+import concurrent.futures
 import datetime
 import hashlib
 import json
+import threading
 import time
 import uuid
 from jsonschema import Draft202012Validator, FormatChecker
@@ -12,7 +14,65 @@ def _verifier():
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b'=').decode()
     return verifier, challenge
 
-def run(call, accounts, tokens, secrets, person, field):
+SNAPSHOT = '/api/experimental/v1/defaults/snapshot'
+
+def _canonical(household):
+    """A household with its members in account-id order, so two projections compare equal."""
+    return {**household, 'members': sorted(household['members'], key=lambda member: member['account_id'])}
+
+def _roles(household):
+    return {member['account_id']: member['role'] for member in household['members']}
+
+def snapshot_race(lanes, tokens, household, member, turns=40):
+    """A writer toggles one member's role while readers, each with its own client, read the snapshot.
+
+    Every revision must always come back with the same households, and the readers must have seen
+    more than one revision. This is a floor: it can fail only if a tear happens to be sampled. The
+    deterministic proof is the paused-read schedule in the Rust tests.
+    """
+    writer, readers = lanes[0], lanes[1:]
+    stop = threading.Event()
+    def read(client):
+        seen, versions = {}, []
+        while True:
+            finished = stop.is_set()
+            body = client('GET', SNAPSHOT, tokens['alice'])
+            listed = [_canonical(h) for h in body['households']]
+            revision = body['defaults']['revision']
+            if seen.setdefault(revision, listed) != listed:
+                raise RuntimeError('One snapshot revision was returned with two different sets of households')
+            primary = body['defaults']['primary_household_id']
+            if primary is not None and primary not in [h['id'] for h in listed]:
+                raise RuntimeError('A snapshot named a primary household it did not list')
+            versions.append(next(h['version'] for h in listed if h['id'] == household))
+            if finished:
+                if versions != sorted(versions):
+                    raise RuntimeError('A reader saw a household version go backwards')
+                return seen
+    def write():
+        try:
+            for turn in range(turns):
+                version = next(h['version'] for h in writer('GET', '/api/experimental/v1/households', tokens['alice'])
+                               if h['id'] == household)
+                writer('POST', '/api/experimental/v1/management-commands', tokens['alice'],
+                       {'commands':[{'kind':'set_household_role','household_id':household,'account_id':member,
+                                     'expected_version':version,'manager':turn % 2 == 0}]}, str(uuid.uuid4()))
+        finally:
+            stop.set()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(readers) + 1) as pool:
+        futures = [pool.submit(read, client) for client in readers]
+        pool.submit(write).result()
+        merged = {}
+        for future in futures:
+            for revision, listed in future.result().items():
+                if merged.setdefault(revision, listed) != listed:
+                    raise RuntimeError('Two readers saw one snapshot revision with different households')
+    if len(merged) < 2:
+        raise RuntimeError(f'Snapshot readers saw {len(merged)} revision(s): the writer never overlapped them')
+    return {'scenario': 'sharing-snapshot-race', 'role_changes': turns, 'revisions_observed': len(merged)}
+
+def run(call, accounts, tokens, secrets, person, field, lanes):
+    """`lanes` are at least four independent clients: one writer and the readers of the snapshot race."""
     household = str(uuid.uuid4())
     def manage(token, command, expected=200):
         return call('POST', '/api/experimental/v1/management-commands', token,
@@ -22,6 +82,10 @@ def run(call, accounts, tokens, secrets, person, field):
     if homes[0]['members'][0]['account_id'] != accounts['alice']:
         raise RuntimeError('Creator was not added as a household member')
     defaults = call('GET', '/api/experimental/v1/defaults', tokens['alice'])
+    # BE-B5: the snapshot is exactly what the two separate reads say for the same state.
+    created = call('GET', SNAPSHOT, tokens['alice'])
+    if created['defaults'] != defaults or [_canonical(h) for h in created['households']] != [_canonical(h) for h in homes]:
+        raise RuntimeError('The sharing snapshot disagreed with GET /defaults and GET /households')
     household_person = str(uuid.uuid4())
     call('POST', '/api/experimental/v1/commands', tokens['alice'],
          {'defaults_revision':defaults['revision'],'commands':[
@@ -38,6 +102,16 @@ def run(call, accounts, tokens, secrets, person, field):
            'expected_version':1,'accept':True}, 404)
     manage(tokens['bob'], {'kind':'respond_to_household_invitation','id':invitation,
            'expected_version':1,'accept':True})
+    joined = call('GET', SNAPSHOT, tokens['alice'])
+    if _roles(joined['households'][0]) != {accounts['alice']: 'manager', accounts['bob']: 'member'}:
+        raise RuntimeError('The snapshot did not list the household with both members after the invitation was accepted')
+    if joined['defaults']['revision'] == created['defaults']['revision']:
+        raise RuntimeError('A membership change did not move the defaults revision')
+    if joined['defaults']['revision'] != call('GET', '/api/experimental/v1/defaults', tokens['alice'])['revision']:
+        raise RuntimeError('The snapshot revision differs from GET /defaults for the same state')
+    bobs = call('GET', SNAPSHOT, tokens['bob'])
+    if [h['id'] for h in bobs['households']] != [household] or bobs['households'][0]['role'] != 'member':
+        raise RuntimeError('The new member did not see their household, as a member')
     # BE-Q16: durable, all-states sent-invitation history, keyed by sender.
     revoked_invitation = str(uuid.uuid4())
     manage(tokens['alice'], {'kind':'invite_to_household','id':revoked_invitation,
@@ -81,6 +155,9 @@ def run(call, accounts, tokens, secrets, person, field):
     version = call('GET', '/api/experimental/v1/households', tokens['alice'])[0]['version']
     manage(tokens['alice'], {'kind':'remove_household_member','household_id':household,
            'account_id':accounts['bob'],'expected_version':version})
+    gone = call('GET', SNAPSHOT, tokens['bob'])
+    if gone['households'] != [] or gone['defaults']['primary_household_id'] is not None:
+        raise RuntimeError('A removed member still saw the household in their snapshot')
     removed = call('GET', '/api/experimental/v1/sync?cursor='+page['next_cursor'], tokens['bob'])
     if not any(change == {'kind':'remove','id':household_person} for batch in removed['batches'] for change in batch['changes']):
         raise RuntimeError('Leaving failed to remove household-derived visibility')
@@ -91,6 +168,7 @@ def run(call, accounts, tokens, secrets, person, field):
     preview = call('POST', '/api/experimental/v1/registration/preview', body={'token':signup['token']})
     if preview['household']['id'] != household:
         raise RuntimeError('Signup preview named the wrong household')
+    before_signup = call('GET', SNAPSHOT, tokens['alice'])
     verifier, challenge = _verifier()
     granted = call('POST', '/api/experimental/v1/browser-registration', body={
         'token':signup['token'],'username':'charlie','password':secrets[0],'device_id':'browser',
@@ -103,6 +181,15 @@ def run(call, accounts, tokens, secrets, person, field):
         extra_headers={'Origin':'https://atlas.example'})
     secrets.append(registered['csrf_token'])
     secrets.append(call.last_headers['set-cookie'].split(';')[0].split('=',1)[1])
+    # BE-B5: signing up into a household is a membership change like any other.
+    after_signup = call('GET', SNAPSHOT, tokens['alice'])
+    if _roles(after_signup['households'][0]) != {accounts['alice']: 'manager', registered['account_id']: 'member'}:
+        raise RuntimeError('The snapshot did not list the household member who signed up')
+    if after_signup['households'][0]['version'] != before_signup['households'][0]['version'] + 1:
+        raise RuntimeError('Signing up into a household did not advance its version by one')
+    if after_signup['defaults']['revision'] == before_signup['defaults']['revision']:
+        raise RuntimeError('Signing up into a household did not move the defaults revision')
+    print(json.dumps(snapshot_race(lanes, tokens, household, registered['account_id'])))
     call('POST', '/api/experimental/v1/registration', body={
         'token':signup['token'],'username':'replay','password':secrets[0],'device_id':'phone'}, expected=401)
     unused = call('POST', '/api/experimental/v1/account-invitations', tokens['alice'], {'household_id':household})

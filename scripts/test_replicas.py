@@ -317,7 +317,9 @@ def main():
                     'overlap_owner_process': 0, 'overlap_collaborator_process': 1}
             assert race['policy_change_process'] is not None and race['policy_change_process'] != race['stale_write_process'], race
             sharing.alias_edit(call, accounts, tokens)
-            households.run(call, accounts, tokens, secrets, person, field)
+            # The writer is served by process 0; the readers alternate between both processes.
+            snapshot_lanes = [ContractClient(clients[number % 2].base, document, set()) for number in range(4)]
+            households.run(call, accounts, tokens, secrets, person, field, snapshot_lanes)
             workflow = tasks.run(call, accounts, tokens, document)
             people.run(call, accounts, tokens, workflow)
             def seed(account, device, kind):

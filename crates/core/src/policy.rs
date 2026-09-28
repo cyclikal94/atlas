@@ -33,6 +33,22 @@ pub struct Defaults {
     pub progress: DefaultTemplate,
 }
 
+/// `Defaults` plus the households whose versions its revision covers.
+pub(super) struct DefaultsRead {
+    pub(super) defaults: Defaults,
+    /// Exactly the households hashed into `defaults.revision` with `Some(version)`, ascending by ID.
+    pub(super) households: Vec<(String, i64)>,
+}
+
+/// The resolved defaults with the households that revision covers, read from one database
+/// snapshot so a client can display the audience of a captured revision without combining
+/// separately timed reads.
+#[derive(Serialize)]
+pub struct SharingSnapshot {
+    pub defaults: Defaults,
+    pub households: Vec<crate::households::Household>,
+}
+
 // Each query is built only from these repository-owned fragments; user values bind.
 pub(super) const COLUMNS: &str = "r.id,r.kind,r.parent_id,r.label,r.value,r.version,r.policy_version AS policy_version,CASE WHEN EXISTS(SELECT 1 FROM person_accounts pa WHERE pa.person_id=r.id AND pa.account_id<>$1) THEN 0 WHEN r.owner_id=$1 OR COALESCE(g.can_edit,0)=1 OR EXISTS(SELECT 1 FROM resource_household_grants hg JOIN household_memberships hm ON hm.household_id=hg.household_id WHERE hg.resource_id=r.id AND hm.account_id=$1 AND hg.can_edit=1) THEN 1 ELSE 0 END AS editable,r.archived";
 pub(super) const VISIBLE: &str = "NOT (r.owner_id=$1 AND EXISTS(SELECT 1 FROM frozen_owner_visibility f WHERE f.resource_id=r.id)) AND (r.owner_id=$1 OR ((g.account_id=$1 OR EXISTS(SELECT 1 FROM resource_household_grants hg JOIN household_memberships hm ON hm.household_id=hg.household_id WHERE hg.resource_id=r.id AND hm.account_id=$1)) AND NOT EXISTS(SELECT 1 FROM resource_exclusions x WHERE x.resource_id=r.id AND x.account_id=$1))) AND NOT EXISTS(SELECT 1 FROM resource_ancestors a JOIN resources p ON p.id=a.ancestor_id WHERE a.resource_id=r.id AND NOT (p.owner_id=$1 OR ((EXISTS(SELECT 1 FROM resource_grants pg WHERE pg.resource_id=p.id AND pg.account_id=$1) OR EXISTS(SELECT 1 FROM resource_household_grants phg JOIN household_memberships phm ON phm.household_id=phg.household_id WHERE phg.resource_id=p.id AND phm.account_id=$1)) AND NOT EXISTS(SELECT 1 FROM resource_exclusions px WHERE px.resource_id=p.id AND px.account_id=$1))))";
@@ -219,6 +235,15 @@ impl Store {
         tx: &mut Transaction<'_, Any>,
         actor: &str,
     ) -> Result<Defaults> {
+        Ok(Self::defaults_read_in(tx, actor).await?.defaults)
+    }
+    /// The resolved defaults and, alongside them, exactly the `(household, version)` pairs their
+    /// revision hashes for households the account belongs to. The revision itself is unchanged:
+    /// queued offline drafts hold revisions across upgrades.
+    pub(super) async fn defaults_read_in(
+        tx: &mut Transaction<'_, Any>,
+        actor: &str,
+    ) -> Result<DefaultsRead> {
         let row = sqlx::query(
             "SELECT primary_household_id,preferences_version FROM accounts WHERE id=$1",
         )
@@ -270,23 +295,100 @@ impl Store {
                 }
             }
         }
+        let mut member_households = Vec::new();
         for household in households {
             let version: Option<i64> = sqlx::query_scalar("SELECT h.version FROM households h JOIN household_memberships m ON m.household_id=h.id WHERE h.id=$1 AND m.account_id=$2")
                 .bind(&household).bind(actor).fetch_optional(&mut **tx).await?;
             // A retained personal template must not turn its revision into an
             // activity oracle for a household the account can no longer see.
             revisions.push(format!("household:{household}:{version:?}"));
+            if let Some(version) = version {
+                member_households.push((household, version));
+            }
         }
-        Ok(Defaults {
-            revision: receipt_digest(&revisions.join("\n")),
-            preferences_version,
-            primary_household_id: primary,
-            person: templates.remove(0),
-            field: templates.remove(0),
-            task: templates.remove(0),
-            list: templates.remove(0),
-            progress: templates.remove(0),
+        Ok(DefaultsRead {
+            defaults: Defaults {
+                revision: receipt_digest(&revisions.join("\n")),
+                preferences_version,
+                primary_household_id: primary,
+                person: templates.remove(0),
+                field: templates.remove(0),
+                task: templates.remove(0),
+                list: templates.remove(0),
+                progress: templates.remove(0),
+            },
+            households: member_households,
         })
+    }
+    /// The resolved defaults, the households their revision covers and those households' members,
+    /// all read in one transaction, so `defaults.revision` is the revision of exactly the
+    /// versions and members returned. PostgreSQL: a repeatable-read, read-only snapshot. SQLite: a
+    /// deferred BEGIN whose first read fixes the WAL snapshot; readers never block the writers.
+    /// Neither can be forced to retry, so there is no retry loop (as in `defaults`).
+    pub async fn sharing_snapshot(&self, actor: &str) -> Result<SharingSnapshot> {
+        let mut tx = self.pool.begin().await?;
+        if !self.sqlite {
+            #[cfg(feature = "test-hooks")]
+            let committed = self.hooks.reads_committed();
+            #[cfg(not(feature = "test-hooks"))]
+            let committed = false;
+            sqlx::query(if committed {
+                "SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ ONLY"
+            } else {
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+            })
+            .execute(&mut *tx)
+            .await?;
+        }
+        let read = Self::defaults_read_in(&mut tx, actor).await?;
+        hook!(self, "sharing_snapshot.between_reads", &mut tx);
+        // Negative control only: a later snapshot for the household reads.
+        #[cfg(feature = "test-hooks")]
+        let mut later = if self.hooks.splits_snapshot_reads() {
+            Some(self.pool.begin().await?)
+        } else {
+            None
+        };
+        let mut households = Vec::new();
+        for (id, hashed) in read.households {
+            #[cfg(feature = "test-hooks")]
+            let reader = later.as_mut().unwrap_or(&mut tx);
+            #[cfg(not(feature = "test-hooks"))]
+            let reader = &mut tx;
+            let household = Self::household_in(reader, actor, &id).await?;
+            // Under one snapshot the household the revision hashed is exactly the one loaded. A
+            // mismatch means that guarantee failed: refuse rather than return a torn body.
+            match household {
+                Some(mut household) => {
+                    ensure!(
+                        household.version == hashed || !self.snapshot_verified(),
+                        ErrorCode::InternalError
+                    );
+                    household
+                        .members
+                        .sort_by(|a, b| a.account_id.cmp(&b.account_id));
+                    households.push(household);
+                }
+                None => ensure!(!self.snapshot_verified(), ErrorCode::InternalError),
+            }
+        }
+        #[cfg(feature = "test-hooks")]
+        if let Some(later) = later {
+            later.commit().await?;
+        }
+        tx.commit().await?;
+        Ok(SharingSnapshot {
+            defaults: read.defaults,
+            households,
+        })
+    }
+    /// Whether the sharing snapshot checks its own result: always, in a release build.
+    fn snapshot_verified(&self) -> bool {
+        #[cfg(feature = "test-hooks")]
+        if !self.hooks.verifies_snapshot() {
+            return false;
+        }
+        true
     }
     pub(super) fn resolved_policy(defaults: &Defaults, kind: &str) -> Policy {
         match match kind {

@@ -457,7 +457,7 @@ const TRANSACTION_PRODUCING_HELPERS: [(&str, &str); 1] =
 /// .begin()` still contained the literal text `begin_serial(` even though it no longer calls it
 /// (R5). The char-literal gap above is the same finding, continued: a quote character literal
 /// ahead of a string retaining the old call text defeated the first fix (R5, second round).
-fn mask_non_code(text: &str) -> String {
+pub(crate) fn mask_non_code(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
@@ -651,16 +651,16 @@ fn char_literal_len(bytes: &[u8]) -> Option<usize> {
 /// True if `text` contains `needle` as executable code — never inside a comment or a string/char
 /// literal. Use this, not `str::contains`, for every check below that treats a literal call as
 /// evidence of serialisation (R5).
-fn calls(text: &str, needle: &str) -> bool {
+pub(crate) fn calls(text: &str, needle: &str) -> bool {
     mask_non_code(text).contains(needle)
 }
 
-struct Function {
-    name: String,
-    text: String,
+pub(crate) struct Function {
+    pub(crate) name: String,
+    pub(crate) text: String,
 }
 
-fn functions(source: &str) -> Vec<(usize, Function)> {
+pub(crate) fn functions(source: &str) -> Vec<(usize, Function)> {
     let mut starts = Vec::new();
     let bytes = source.as_bytes();
     let mut from = 0;
@@ -692,7 +692,7 @@ fn functions(source: &str) -> Vec<(usize, Function)> {
     out
 }
 
-fn enclosing(functions: &[(usize, Function)], position: usize) -> Option<&Function> {
+pub(crate) fn enclosing(functions: &[(usize, Function)], position: usize) -> Option<&Function> {
     functions
         .iter()
         .take_while(|(at, _)| *at <= position)
@@ -700,7 +700,7 @@ fn enclosing(functions: &[(usize, Function)], position: usize) -> Option<&Functi
         .map(|(_, function)| function)
 }
 
-fn sources() -> Vec<(String, String)> {
+pub(crate) fn sources() -> Vec<(String, String)> {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut files = Vec::new();
     for krate in ["core", "server"] {

@@ -151,6 +151,35 @@ impl Store {
         ensure!(remaining > 0, ErrorCode::LastManager);
         Ok(())
     }
+    /// Every member of `household`, ascending by account ID, read on the caller's transaction.
+    /// The caller has already established that it may see the household.
+    pub(super) async fn members_in(
+        tx: &mut Transaction<'_, Any>,
+        household: &str,
+    ) -> Result<Vec<HouseholdMember>> {
+        Ok(sqlx::query("SELECT a.id,a.username,m.role FROM household_memberships m JOIN accounts a ON a.id=m.account_id WHERE m.household_id=$1 ORDER BY a.id")
+            .bind(household).fetch_all(&mut **tx).await?.into_iter().map(|r|HouseholdMember { account_id:r.get(0), username:r.get(1), role:r.get(2) }).collect())
+    }
+    /// One household as `actor` sees it, or `None` when `actor` is not a member: the same
+    /// projection as `households`, read on the caller's transaction.
+    pub(super) async fn household_in(
+        tx: &mut Transaction<'_, Any>,
+        actor: &str,
+        household: &str,
+    ) -> Result<Option<Household>> {
+        let Some(row) = sqlx::query("SELECT h.name,h.version,m.role FROM households h JOIN household_memberships m ON m.household_id=h.id WHERE h.id=$1 AND m.account_id=$2")
+            .bind(household).bind(actor).fetch_optional(&mut **tx).await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Household {
+            id: household.to_owned(),
+            name: row.get(0),
+            version: row.get(1),
+            role: row.get(2),
+            members: Self::members_in(tx, household).await?,
+        }))
+    }
     pub async fn households(&self, actor: &str) -> Result<Vec<Household>> {
         let mut tx = self.pool.begin().await?;
         if !self.sqlite {
@@ -163,8 +192,7 @@ impl Store {
         let mut households = Vec::new();
         for row in rows {
             let id: String = row.get(0);
-            let members = sqlx::query("SELECT a.id,a.username,m.role FROM household_memberships m JOIN accounts a ON a.id=m.account_id WHERE m.household_id=$1 ORDER BY a.id")
-                .bind(&id).fetch_all(&mut *tx).await?.into_iter().map(|r|HouseholdMember { account_id:r.get(0), username:r.get(1), role:r.get(2) }).collect();
+            let members = Self::members_in(&mut tx, &id).await?;
             households.push(Household {
                 id,
                 name: row.get(1),

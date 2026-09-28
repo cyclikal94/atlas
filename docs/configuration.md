@@ -8,7 +8,7 @@ operator-managed secret store; never commit `atlas.env`, `.env` or key files.
 | --- | --- |
 | `ATLAS_DATABASE_URL` | `sqlite://atlas.sqlite?mode=rwc`; dedicated writable PostgreSQL URL also supported |
 | `ATLAS_BIND` | `127.0.0.1:3000`; image uses `0.0.0.0:3000` |
-| `ATLAS_PUBLIC_ORIGIN` | Optional outside browser/OIDC use; exact public origin including scheme |
+| `ATLAS_PUBLIC_ORIGIN` | Optional outside browser/OIDC use; exact public origin including scheme. Also the origin of Declarative Web Push notification links |
 | `ATLAS_TRUSTED_PROXY_IPS` | Empty; comma-separated exact proxy IPs allowed to supply forwarded information |
 | `ATLAS_DIRECTORY_ENABLED` | `true`; server account directory discoverability |
 | `ATLAS_SYNC_RETENTION_DAYS` | `90`; integer 1–3650, delivery metadata retention only |

@@ -50,4 +50,10 @@ for path in (ROOT / "docs").glob("*.md"):
     for name, raw in re.findall(r"<!-- experimental-schema: ([A-Za-z0-9_]+) -->\s*```json\n(.*?)\n```", path.read_text(), re.DOTALL):
         check_example(name, json.loads(raw))
         count += 1
+# The payloads the compatibility probe records come from the real builder, so they must satisfy
+# the schema; this keeps the schema and the code from drifting apart.
+recorded = json.loads((ROOT / "api/compatibility.json").read_text())["behaviour"]["web_push_payload"]
+for shape in ("declarative", "identifiers_only"):
+    check_example("WebPushPayload", recorded[shape]["payload"])
+    count += 1
 print(f"Validated OpenAPI, {len(document['components']['schemas'])} schemas and {count} examples")

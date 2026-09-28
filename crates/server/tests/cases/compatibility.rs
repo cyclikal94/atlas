@@ -1514,9 +1514,434 @@ async fn merge_preview_and_sent_history_probes() -> Result<Value> {
     Ok(Value::Object(results))
 }
 
+/// BE-B4: the plaintext of a reminder Web Push message (Declarative Web Push envelope and the
+/// identifiers-only fallbacks) and the real encrypted delivery path that carries it, through
+/// `IntegrationConfig::deliver` to a loopback push-service double. Fixed identifiers keep the
+/// transcript deterministic; only facts that do not vary between runs are recorded.
+async fn web_push_payload_probes() -> Result<Value> {
+    use atlas_core::calendars::Notification;
+    use atlas_server::integrations::{IntegrationConfig, Subscription, web_push_payload};
+    use axum::{body::Bytes, extract::State, http::HeaderMap, routing::post};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    type Received = Arc<Mutex<Vec<(HeaderMap, Bytes)>>>;
+    async fn capture(State(received): State<Received>, headers: HeaderMap, body: Bytes) {
+        received.lock().await.push((headers, body));
+    }
+
+    let notification = Notification {
+        id: "3f2b8c1e-5a7d-4e90-b1c4-8d6e2a9f0b73".into(),
+        reminder_id: "a1d4e7f2-9c35-4b68-8e1a-5f3c7d2b9a40".into(),
+        occurrence_id: "c8e5b3a9-2d71-4f06-9a84-1b7e6c0d3f52".into(),
+    };
+    let public = Some("https://atlas.example");
+    let declarative = web_push_payload(&notification, public)?;
+    let identifiers = web_push_payload(&notification, None)?;
+    assert_eq!(identifiers, serde_json::to_vec(&notification)?);
+    let unusable = web_push_payload(&notification, Some("ftp://atlas.example"))?;
+    let very_long_host: String = (0..3100)
+        .map(|i| if i % 61 == 60 { '.' } else { 'a' })
+        .collect();
+    let oversize = web_push_payload(&notification, Some(&format!("https://{very_long_host}")))?;
+    assert!(oversize.len() <= 3052);
+
+    let received = Received::default();
+    let router = Router::new()
+        .route("/web", post(capture))
+        .route("/ntfy", post(capture))
+        .route("/gone", post(|| async { StatusCode::GONE }))
+        .route(
+            "/unavailable",
+            post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        )
+        .with_state(received.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let origin = format!("http://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move { axum::serve(listener, router).await });
+    let config = IntegrationConfig::new(
+        Some(&"01".repeat(32)),
+        vec![origin.clone()],
+        Some(URL_SAFE_NO_PAD.encode([1_u8; 32])),
+        Some("mailto:test@example.invalid".into()),
+    )?;
+    let (key, auth) = ece::generate_keypair_and_auth_secret()?;
+    let web = |path: &str| Subscription::WebPush {
+        endpoint: format!("{origin}/{path}"),
+        p256dh: URL_SAFE_NO_PAD.encode(key.pub_as_raw().unwrap()),
+        auth: URL_SAFE_NO_PAD.encode(auth),
+    };
+    let ntfy = Subscription::Ntfy {
+        url: format!("{origin}/ntfy"),
+        bearer: None,
+    };
+    let outcome = |(success, permanent): (bool, bool)| json!([success, permanent]);
+    let accepted = outcome(
+        config
+            .deliver(&web("web"), &notification, i64::MAX, public)
+            .await?,
+    );
+    let without_origin = outcome(
+        config
+            .deliver(&web("web"), &notification, i64::MAX, None)
+            .await?,
+    );
+    let gone = outcome(
+        config
+            .deliver(&web("gone"), &notification, i64::MAX, public)
+            .await?,
+    );
+    let unavailable = outcome(
+        config
+            .deliver(&web("unavailable"), &notification, i64::MAX, public)
+            .await?,
+    );
+    let ntfy_accepted = outcome(
+        config
+            .deliver(&ntfy, &notification, i64::MAX, public)
+            .await?,
+    );
+
+    let messages = received.lock().await;
+    assert_eq!(messages.len(), 3);
+    let header = |headers: &HeaderMap, name: &str| headers[name].to_str().unwrap().to_owned();
+    let delivered = |index: usize, expected: &[u8]| -> Result<Value> {
+        let (headers, body) = &messages[index];
+        let plaintext = ece::decrypt(&key.raw_components()?, &auth, body)?;
+        Ok(json!({
+            "authorization_scheme": header(headers, "authorization").split(' ').next(),
+            "content_encoding": header(headers, "content-encoding"),
+            "plaintext_is_builder_output": plaintext == expected,
+            "topic": header(headers, "topic"),
+            "ttl": header(headers, "ttl"),
+        }))
+    };
+    let transcript = json!({
+        "declarative": {
+            "bytes": declarative.len(),
+            "payload": serde_json::from_slice::<Value>(&declarative)?,
+        },
+        "delivery": {
+            "declarative": {"message": delivered(0, &declarative)?, "result": accepted},
+            "identifiers_only": {"message": delivered(1, &identifiers)?, "result": without_origin},
+            "gone": gone,
+            "unavailable": unavailable,
+        },
+        "identifiers_only": {
+            "bytes": identifiers.len(),
+            "payload": serde_json::from_slice::<Value>(&identifiers)?,
+        },
+        "ntfy": {
+            "body": String::from_utf8(messages[2].1.to_vec())?,
+            "cache": header(&messages[2].0, "cache"),
+            "result": ntfy_accepted,
+            "title": header(&messages[2].0, "title"),
+        },
+        "oversize_origin_falls_back": oversize == identifiers,
+        "unusable_origin_falls_back": unusable == identifiers,
+    });
+    drop(messages);
+    server.abort();
+    Ok(transcript)
+}
+
+/// BE-B5: `GET /defaults/snapshot`. Records only deterministic shape and outcome, never a random
+/// identity: authentication, the headers a client relies on, the body's keys, that its `defaults`
+/// are what `GET /defaults` returns for the same state, the households listed for a manager, a
+/// removed member and a member whose household-layer template names a household they do not belong
+/// to (which must be omitted and must not move their revision).
+async fn sharing_snapshot_probes() -> Result<Value> {
+    use crate::support::http::request;
+    use atlas_core::households::ManagementCommand as M;
+    use atlas_server::{hash_password, now};
+
+    const PASSWORD: &str = "sharing-snapshot-probe-123";
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let store = Store::connect(&url).await?;
+    store.migrate().await?;
+    let hash = hash_password(PASSWORD.into()).await?;
+    let app = App::new(store.clone()).await?.router();
+    let new_id = || Uuid::new_v4().to_string();
+    let mut people = BTreeMap::new();
+    for name in ["alice", "bob", "carol"] {
+        let id = new_id();
+        store
+            .add_account(&id, &format!("snapshot-probe-{name}"), &hash)
+            .await?;
+        let login = request(
+            &app,
+            "POST",
+            "sessions",
+            &[],
+            json!({"username":format!("snapshot-probe-{name}"),"password":PASSWORD,"device_id":"probe"}),
+        )
+        .await;
+        assert_eq!(login.0, StatusCode::OK, "{}", login.2);
+        people.insert(
+            name,
+            (
+                id,
+                format!("Bearer {}", login.2["access_token"].as_str().unwrap()),
+            ),
+        );
+    }
+    let manage = |who: &str, command: M| {
+        let store = store.clone();
+        let actor = people[who].0.clone();
+        async move {
+            store
+                .management(&actor, &Uuid::new_v4().to_string(), &[command], now())
+                .await
+        }
+    };
+    let read = |who: &str, path: &'static str| {
+        let app = app.clone();
+        let auth = people[who].1.clone();
+        async move { request(&app, "GET", path, &[("authorization", &auth)], Value::Null).await }
+    };
+    let snapshot = |who: &str| read(who, "defaults/snapshot");
+    let join = |owner: &str, other: &str, household: String, version: i64| {
+        let (owner, other) = (owner.to_owned(), other.to_owned());
+        let (people, manage) = (&people, &manage);
+        async move {
+            let invitation = Uuid::new_v4().to_string();
+            manage(
+                &owner,
+                M::InviteToHousehold {
+                    id: invitation.clone(),
+                    household_id: household,
+                    recipient_id: people[other.as_str()].0.clone(),
+                    expected_version: version,
+                },
+            )
+            .await?;
+            manage(
+                &other,
+                M::RespondToHouseholdInvitation {
+                    id: invitation,
+                    expected_version: 1,
+                    accept: true,
+                },
+            )
+            .await
+        }
+    };
+    let summary = |reply: &(StatusCode, axum::http::HeaderMap, Value)| {
+        let body = &reply.2;
+        let households: Vec<Value> = body["households"]
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .map(|h| {
+                        let mut roles: Vec<&str> = h["members"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|m| m["role"].as_str().unwrap())
+                            .collect();
+                        roles.sort_unstable();
+                        json!({"role": h["role"], "version": h["version"], "member_roles": roles})
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        json!({
+            "status": reply.0.as_u16(),
+            "code": body.get("code"),
+            "households": households,
+            "primary_household_set": body["defaults"]["primary_household_id"].is_string(),
+        })
+    };
+    let equals_defaults = |who: &'static str, reply: (StatusCode, axum::http::HeaderMap, Value)| {
+        let defaults = read(who, "defaults");
+        async move { defaults.await.2 == reply.2["defaults"] }
+    };
+
+    let mut results = serde_json::Map::new();
+
+    // Unauthenticated: the same answer every protected read gives, with the same headers.
+    let unauthenticated = request(&app, "GET", "defaults/snapshot", &[], Value::Null).await;
+    assert_eq!(unauthenticated.0, StatusCode::UNAUTHORIZED);
+    results.insert(
+        "unauthenticated".into(),
+        json!({
+            "status": unauthenticated.0.as_u16(),
+            "code": unauthenticated.2["code"],
+            "cache_control": unauthenticated.1["cache-control"].to_str()?,
+            "set_cookie": unauthenticated.1.contains_key("set-cookie"),
+        }),
+    );
+
+    // No household: defaults, an empty list, and exactly the contract's two members.
+    let none = snapshot("alice").await;
+    assert_eq!(none.0, StatusCode::OK, "{}", none.2);
+    assert!(equals_defaults("alice", none.clone()).await);
+    Uuid::parse_str(none.1["x-request-id"].to_str()?)?;
+    let revision = none.2["defaults"]["revision"].as_str().unwrap();
+    assert!(revision.len() == 64 && revision.bytes().all(|b| b.is_ascii_hexdigit()));
+    let mut keys: Vec<&String> = none.2.as_object().unwrap().keys().collect();
+    keys.sort();
+    results.insert(
+        "no_household".into(),
+        json!({
+            "summary": summary(&none),
+            "keys": keys,
+            "cache_control": none.1["cache-control"].to_str()?,
+            "content_type": none.1["content-type"].to_str()?,
+            "set_cookie": none.1.contains_key("set-cookie"),
+        }),
+    );
+
+    // A manager with one other member: the household, both roles, and the defaults GET returns.
+    let home = new_id();
+    manage(
+        "alice",
+        M::CreateHousehold {
+            id: home.clone(),
+            name: "Home".into(),
+        },
+    )
+    .await?;
+    join("alice", "bob", home.clone(), 1).await?;
+    let manager = snapshot("alice").await;
+    assert_eq!(manager.0, StatusCode::OK, "{}", manager.2);
+    assert!(equals_defaults("alice", manager.clone()).await);
+    results.insert("manager".into(), summary(&manager));
+    let member = snapshot("bob").await;
+    assert_eq!(member.2["households"][0]["role"], "member");
+    results.insert("member".into(), summary(&member));
+
+    // A household-layer template names a household carol cannot see: it is omitted, and activity in
+    // it neither lists it nor moves her revision, although it moves the manager's.
+    let flat = new_id();
+    manage(
+        "bob",
+        M::CreateHousehold {
+            id: flat.clone(),
+            name: "Flat".into(),
+        },
+    )
+    .await?;
+    join("bob", "alice", flat.clone(), 1).await?;
+    let invitation = new_id();
+    manage(
+        "alice",
+        M::InviteToHousehold {
+            id: invitation.clone(),
+            household_id: home.clone(),
+            recipient_id: people["carol"].0.clone(),
+            expected_version: 3,
+        },
+    )
+    .await?;
+    manage(
+        "carol",
+        M::RespondToHouseholdInvitation {
+            id: invitation,
+            expected_version: 1,
+            accept: true,
+        },
+    )
+    .await?;
+    manage(
+        "alice",
+        M::SetDefaults {
+            household_id: Some(home.clone()),
+            resource_kind: "list".into(),
+            expected_version: 0,
+            template: Some(atlas_core::policy::DefaultTemplate::Explicit {
+                policy: atlas_core::policy::Policy {
+                    grants: vec![atlas_core::policy::PrincipalGrant::Household {
+                        id: flat.clone(),
+                        edit: false,
+                    }],
+                    exclude_accounts: vec![],
+                },
+            }),
+        },
+    )
+    .await?;
+    let carol = snapshot("carol").await;
+    assert_eq!(
+        carol.2["defaults"]["list"]["policy"]["grants"][0]["id"],
+        json!(flat)
+    );
+    assert_eq!(carol.2["households"].as_array().unwrap().len(), 1);
+    let alice_before = snapshot("alice").await.2["defaults"]["revision"].clone();
+    manage(
+        "bob",
+        M::RenameHousehold {
+            id: flat.clone(),
+            name: "Renamed".into(),
+            expected_version: 3,
+        },
+    )
+    .await?;
+    let carol_after = snapshot("carol").await;
+    let alice_after = snapshot("alice").await;
+    assert_eq!(carol_after.2, carol.2, "carol's whole body is unchanged");
+    assert_ne!(alice_after.2["defaults"]["revision"], alice_before);
+    results.insert(
+        "template_names_an_unjoined_household".into(),
+        json!({
+            "summary": summary(&carol),
+            "template_still_names_it": true,
+            "unchanged_by_activity_in_it": true,
+            "moves_for_a_member_of_it": true,
+        }),
+    );
+
+    // A removed member: an empty list, no primary household, and a revision that no longer moves
+    // with what happens in the household they left.
+    let version = alice_after.2["households"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["id"] == json!(home))
+        .unwrap()["version"]
+        .as_i64()
+        .unwrap();
+    manage(
+        "alice",
+        M::RemoveHouseholdMember {
+            household_id: home.clone(),
+            account_id: people["bob"].0.clone(),
+            expected_version: version,
+        },
+    )
+    .await?;
+    let removed = snapshot("bob").await;
+    assert!(equals_defaults("bob", removed.clone()).await);
+    manage(
+        "alice",
+        M::RenameHousehold {
+            id: home.clone(),
+            name: "Private".into(),
+            expected_version: version + 1,
+        },
+    )
+    .await?;
+    let still = snapshot("bob").await;
+    assert_eq!(
+        still.2, removed.2,
+        "a former member's whole body is unchanged"
+    );
+    results.insert(
+        "removed_member".into(),
+        json!({
+            "summary": summary(&removed),
+            "unchanged_by_activity_in_it": true,
+        }),
+    );
+
+    Ok(Value::Object(results))
+}
+
 /// The combined probe transcript includes activation, calendar connection preservation and
-/// disconnection, inactive-subscription retirement/version changes, and command batch-size
-/// acceptance/rejection. `/health` omits `api_version`, which is asserted separately.
+/// disconnection, inactive-subscription retirement/version changes, command batch-size
+/// acceptance/rejection, and the Declarative Web Push payload and its encrypted delivery.
+/// `/health` omits `api_version`, which is asserted separately.
 async fn observe(app: &Router) -> Value {
     json!({
         "activation": activation_probes().await.expect("activation-grant protocol probes"),
@@ -1526,7 +1951,9 @@ async fn observe(app: &Router) -> Value {
         "merge_preview_and_sent_history": merge_preview_and_sent_history_probes()
             .await
             .expect("BE-Q16 recipient-safe preview and sent-history probes"),
+        "sharing_snapshot": sharing_snapshot_probes().await.expect("BE-B5 sharing-snapshot probes"),
         "error_mapping": error_mapping().await,
+        "web_push_payload": web_push_payload_probes().await.expect("BE-B4 Declarative Web Push payload probes"),
         "content_and_retirement": content_and_retirement().await.expect("combined protocol probes"),
         "health": probe(app, "/health", &["api_version"]).await,
         "me_unauthenticated": probe(app, "/api/experimental/v1/me", &["request_id"]).await,

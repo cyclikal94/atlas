@@ -261,6 +261,10 @@ impl App {
             )
             .route("/api/experimental/v1/defaults", get(defaults))
             .route(
+                "/api/experimental/v1/defaults/snapshot",
+                get(sharing_snapshot),
+            )
+            .route(
                 "/api/experimental/v1/defaults/templates",
                 get(default_templates),
             )

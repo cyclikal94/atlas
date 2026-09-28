@@ -65,7 +65,8 @@ with tempfile.TemporaryDirectory(prefix='atlas-server-smoke-') as temporary:
             print(json.dumps({'scenario': 'policy-precondition-one-process',
                               **sharing.policy_precondition(call, accounts, tokens, lanes)}))
             sharing.alias_edit(call, accounts, tokens)
-            households.run(call, accounts, tokens, secrets, person, field)
+            snapshot_lanes = [ContractClient(base, document, request_ids) for _ in range(4)]
+            households.run(call, accounts, tokens, secrets, person, field, snapshot_lanes)
             workflow = tasks.run(call, accounts, tokens, document)
             people.run(call, accounts, tokens, workflow)
             def seed(account, device, kind):

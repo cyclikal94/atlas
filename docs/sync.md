@@ -5,6 +5,8 @@ progress can be queued offline. Account management, invitations, consent and per
 changes require a connection. Keep pending drafts separate from the server cache.
 An offline create using implicit defaults carries the previously fetched defaults
 revision; a changed revision requires review instead of silently sharing under new defaults.
+`GET /defaults/snapshot` returns those defaults with the household membership their revision
+covers from one database snapshot; capture that response, not separate reads, with a draft.
 
 A sync request without a cursor builds an immutable authorised snapshot in SQL.
 Snapshot items are separate rows, paged with opaque stored cursors that expire after

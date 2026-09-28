@@ -2,7 +2,7 @@
   "openapi": "3.1.1",
   "info": {
     "title": "Atlas API",
-    "version": "0.24.0",
+    "version": "0.26.0",
     "description": "Pre-release API. Breaking changes and explicit database resets are permitted until a supported release."
   },
   "servers": [
@@ -1882,6 +1882,169 @@
           ]
         },
         "description": "Layered creation defaults and revision. People default to primary household edit access; fields, tasks and lists default private; progress defaults to primary household read access, always gated by its ancestors. Personal settings override household settings. Explicit policies override defaults."
+      }
+    },
+    "/defaults/snapshot": {
+      "get": {
+        "operationId": "readSharingSnapshot",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharingSnapshot"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "malformed_request",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "unauthenticated",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "forbidden",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "internal_error",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "slice_capacity, temporarily_unavailable",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "description": "Server-generated correlation ID."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "x-error-codes": {
+          "400": [
+            "malformed_request"
+          ],
+          "401": [
+            "unauthenticated"
+          ],
+          "403": [
+            "forbidden",
+            "credential_mismatch"
+          ],
+          "404": [
+            "not_found"
+          ],
+          "500": [
+            "internal_error"
+          ],
+          "503": [
+            "slice_capacity",
+            "temporarily_unavailable"
+          ]
+        },
+        "description": "The resolved sharing defaults and the households they depend on, with those households' members, read from one database snapshot, so a concurrent change to membership, a household or a default is either wholly included or wholly excluded. `defaults.revision` is the revision of exactly the defaults and household versions returned. It equals what `GET /defaults` returns for the same state, and is the value a queued create sends as `defaults_revision`. `households` lists, in id order, only households the caller currently belongs to that are the primary household or are named by a grant of a resolved `explicit` default template; members are in account id order. A household the caller does not belong to is never listed and never affects the revision, and a pending invitation is not membership. A client that shows the audience of a captured revision must store this response and must not combine it with separate `GET /defaults` or `GET /households` reads, which are timed separately."
       }
     },
     "/defaults/templates": {
@@ -20465,6 +20628,136 @@
         ],
         "additionalProperties": false
       },
+      "DeclarativeWebPushNotification": {
+        "type": "object",
+        "description": "The `notification` member of a Declarative Web Push message (W3C Push API, declarative push message). `title` and `body` are generic, server-authored text. They never contain task, calendar, account or device text, and their exact wording is not part of this contract. `tag` is the delivery ID, so a platform may replace a repeated delivery instead of showing it twice. `navigate` is an absolute URL on the configured public origin whose query parameters `delivery_id`, `reminder_id` and `occurrence_id` carry the same identifiers as the message. Atlas sets no other notification member.",
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "body": {
+            "type": "string",
+            "minLength": 1
+          },
+          "lang": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Language tag of `title` and `body`; currently `en-GB`."
+          },
+          "dir": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "ltr",
+              "rtl"
+            ],
+            "description": "Text direction of `title` and `body`; currently `ltr`."
+          },
+          "tag": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The delivery ID, equal to the message `id`."
+          },
+          "navigate": {
+            "type": "string",
+            "format": "uri",
+            "description": "Absolute URL on the public origin, opened when the notification is activated."
+          }
+        },
+        "required": [
+          "title",
+          "body",
+          "lang",
+          "dir",
+          "tag",
+          "navigate"
+        ],
+        "additionalProperties": false
+      },
+      "DeclarativeWebPushMessage": {
+        "type": "object",
+        "description": "A reminder Web Push message sent when `ATLAS_PUBLIC_ORIGIN` is configured. A browser that supports Declarative Web Push displays `notification` without running service-worker code. Any other browser delivers the same bytes to the service worker's `push` event, where `id`, `reminder_id` and `occurrence_id` are the identifiers of `ReminderNotification`. Atlas sets no `mutable`, `silent`, `data`, `actions`, icon or badge member.",
+        "properties": {
+          "web_push": {
+            "type": "integer",
+            "const": 8030,
+            "description": "Opts the message into declarative parsing."
+          },
+          "notification": {
+            "$ref": "#/components/schemas/DeclarativeWebPushNotification"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The delivery ID; also the Web Push Topic without hyphens. Retries keep it."
+          },
+          "reminder_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "occurrence_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "web_push",
+          "notification",
+          "id",
+          "reminder_id",
+          "occurrence_id"
+        ],
+        "additionalProperties": false,
+        "examples": [
+          {
+            "web_push": 8030,
+            "notification": {
+              "title": "Atlas reminder",
+              "body": "Open Atlas to view your reminder.",
+              "lang": "en-GB",
+              "dir": "ltr",
+              "tag": "3f2b8c1e-5a7d-4e90-b1c4-8d6e2a9f0b73",
+              "navigate": "https://atlas.example/?delivery_id=3f2b8c1e-5a7d-4e90-b1c4-8d6e2a9f0b73&reminder_id=a1d4e7f2-9c35-4b68-8e1a-5f3c7d2b9a40&occurrence_id=c8e5b3a9-2d71-4f06-9a84-1b7e6c0d3f52"
+            },
+            "id": "3f2b8c1e-5a7d-4e90-b1c4-8d6e2a9f0b73",
+            "reminder_id": "a1d4e7f2-9c35-4b68-8e1a-5f3c7d2b9a40",
+            "occurrence_id": "c8e5b3a9-2d71-4f06-9a84-1b7e6c0d3f52"
+          }
+        ]
+      },
+      "WebPushPayload": {
+        "description": "The decrypted plaintext of one reminder Web Push message. Atlas sends `DeclarativeWebPushMessage` when a public origin is configured, and `ReminderNotification` otherwise. It also sends `ReminderNotification` if the declarative form would exceed the 3,052-byte plaintext limit, which only a very long public origin can cause. Retries of one delivery carry identical plaintext; clients de-duplicate by `id`. Neither form contains private task or calendar text, so fetch current authorised details through Atlas after opening a notification.",
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/DeclarativeWebPushMessage"
+          },
+          {
+            "$ref": "#/components/schemas/ReminderNotification"
+          }
+        ],
+        "examples": [
+          {
+            "web_push": 8030,
+            "notification": {
+              "title": "Atlas reminder",
+              "body": "Open Atlas to view your reminder.",
+              "lang": "en-GB",
+              "dir": "ltr",
+              "tag": "3f2b8c1e-5a7d-4e90-b1c4-8d6e2a9f0b73",
+              "navigate": "https://atlas.example/?delivery_id=3f2b8c1e-5a7d-4e90-b1c4-8d6e2a9f0b73&reminder_id=a1d4e7f2-9c35-4b68-8e1a-5f3c7d2b9a40&occurrence_id=c8e5b3a9-2d71-4f06-9a84-1b7e6c0d3f52"
+            },
+            "id": "3f2b8c1e-5a7d-4e90-b1c4-8d6e2a9f0b73",
+            "reminder_id": "a1d4e7f2-9c35-4b68-8e1a-5f3c7d2b9a40",
+            "occurrence_id": "c8e5b3a9-2d71-4f06-9a84-1b7e6c0d3f52"
+          },
+          {
+            "id": "3f2b8c1e-5a7d-4e90-b1c4-8d6e2a9f0b73",
+            "reminder_id": "a1d4e7f2-9c35-4b68-8e1a-5f3c7d2b9a40",
+            "occurrence_id": "c8e5b3a9-2d71-4f06-9a84-1b7e6c0d3f52"
+          }
+        ]
+      },
       "CalendarEventTime": {
         "type": "object",
         "properties": {
@@ -21717,6 +22010,27 @@
           "next_after"
         ],
         "additionalProperties": false
+      },
+      "SharingSnapshot": {
+        "type": "object",
+        "properties": {
+          "defaults": {
+            "$ref": "#/components/schemas/Defaults"
+          },
+          "households": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Household"
+            },
+            "maxItems": 32
+          }
+        },
+        "required": [
+          "defaults",
+          "households"
+        ],
+        "additionalProperties": false,
+        "description": "Resolved defaults and the households their revision covers, read from one database snapshot. `defaults.revision` is the revision of exactly these defaults and these household versions. `households` holds only households the caller currently belongs to that are the primary household or are named by a grant of a resolved `explicit` template, so a template grant with no matching entry names a household the caller does not belong to."
       }
     }
   }

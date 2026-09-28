@@ -23,7 +23,7 @@ a subprocess helper invoked by the sync lifecycle test; do not run it directly.
 | Timer overlap, rejection recovery, durable completion successors and rotas | `tasks/timers`, `timer_recovery`, `successors`, `missed_recurrence`, `completion_worker`, `rotas` | Task HTTP routes |
 | Parent visibility, independent policies and policy/content versions | `resources` | Authenticated cross-device HTTP sync |
 | Content writes rejected atomically when sharing changed since they were read, for owners and collaborators, on both engines; held-gate ordering of `replace_policy` and existing-field `put_field`; edits never re-addressed through a merged alias | `resources/policy_precondition`, `tasks/policy_precondition`, `storage/contention`, `people/workflows` | Server `policy_precondition`; smoke and replica runs, including overlapping narrowing and save |
-| Household membership, defaults, invitations and exclusions; durable sent-invitation history across every state, its cascade-revoke on member removal and concurrent-response consistency | `households` | Onboarding HTTP routes |
+| Household membership, defaults, invitations and exclusions; durable sent-invitation history across every state, its cascade-revoke on member removal and concurrent-response consistency; the defaults revision formula pinned by a golden value; the combined sharing snapshot (one consistent read of defaults, households and members, on both engines against real writers, with negative controls and static tripwires on the writers it depends on) | `households` (`households/snapshot`) | Onboarding HTTP routes; server `snapshot` (real routes and the real onboarding writer against a paused read) |
 | Merge aliases, owner visibility, linked identity, consent and request replay; recipient-safe merge previews (hidden identities, staleness, expired/withdrawn/wrong-kind/ownership-shift edge cases) and durable sent-request history surviving operational purge | `people` | Sync and calendar anchor interactions |
 | Device quota, cursor bounds, retention without content loss | `accounts`, `sync` | Sessions and HTTP sync |
 | Atomic device retirement: approved-state token and snapshot listing, ledger-first replay, stale/superseded/applied outcomes, operation-ID reuse | `accounts/approved_state`, `accounts/retirement_ledger` | Server `devices`; real processes in `scripts/smoke/devices.py` |
@@ -37,7 +37,7 @@ a subprocess helper invoked by the sync lifecycle test; do not run it directly.
 | ICS exceptions/cancellation, event reconciliation, private anchors, leap birthdays, connection preserve/replace/disconnect on partial `configure_source` updates, safe, distinguishable refresh-error codes and read-time refresh-in-progress | `calendars` | Calendar HTTP routes and integration worker |
 | Authentication, CSRF, session revocation, OIDC signatures and replay | — | Server `browser`, `sessions`, `onboarding`, `oidc` |
 | API version signal, contract hash and probed behaviour baseline | — | Server `compatibility`, `scripts/validate_contract.py` |
-| Fetch address rules, secret scope and real encrypted push payloads | — | Server `integrations` |
+| Fetch address rules, secret scope, real encrypted push payloads, the Declarative Web Push envelope, its origin-gated fallback and retry-identical plaintext | — | Server `integrations`; the payload probe in `compatibility`. Not browsers: display, clicks and service-worker fallback belong to the web client's tests |
 
 The server `compatibility` cases check `/health`'s `api_version` and compare the contract
 hash and a probe transcript with `api/compatibility.json`. After a deliberate change with
@@ -57,10 +57,15 @@ mentions the same feature.
 The retirement's concurrency cases force named interleavings with test-only hooks (the
 `test-hooks` Cargo feature of both crates): `retire.before_begin`, `retire.after_ledger_read`,
 `retire.after_locking_reads`, `retire.before_effects`, `retire.before_commit`,
-`devices.between_reads` and, in the server, `session_delete.after_identity`. A test arms a
-point, holds the transaction there, lets a competing writer run, then releases it; a point can
-also run one injected statement on the transaction's own connection, and PostgreSQL row locking
-can be switched off as a negative control. Registries belong to one `Store`, never the process.
+`devices.between_reads`, `sharing_snapshot.between_reads` and, in the server,
+`session_delete.after_identity`. A test arms a point, holds the transaction there, lets a
+competing writer run, then releases it; a point can also run one injected statement on the
+transaction's own connection, and PostgreSQL row locking can be switched off as a negative
+control. The sharing snapshot has three more controls:
+its household reads can be moved to a later snapshot (`split_snapshot_reads`), PostgreSQL can
+run it at `READ COMMITTED` (`snapshot_read_committed`), and its own consistency check can be
+turned off (`verify_snapshot`) so a control can see the tear the check otherwise refuses.
+Registries belong to one `Store`, never the process.
 The feature is enabled only through a self dev-dependency, so the call sites expand to nothing
 and no point name reaches a normal or release build. Two consequences: `cargo tree -p
 atlas-server -e no-dev,features` must not show it (plain `-e features` includes dev edges),
@@ -90,7 +95,9 @@ processes (`ATLAS_RACE_ROUNDS`, default 200).
 
 Use `crates/core/examples/sync_load.rs` for current-runtime workloads, and
 `crates/core/examples/retire_load.rs` (with `ATLAS_TEST_POSTGRES_URL` for PostgreSQL) for the
-cost of a retirement, of the device listing, and of unrelated writers beside retirements. Record the
+cost of a retirement, of the device listing, and of unrelated writers beside retirements, and
+`crates/core/examples/sharing_snapshot_load.rs` for the payload and latency of the sharing
+snapshot against separate `defaults` and `households` reads. Record the
 revision, database, architecture, workload and resource limits when reporting capacity;
 results from a different implementation do not establish current throughput.
 

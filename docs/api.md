@@ -84,6 +84,24 @@ response remains in flight. The compatibility probes assert these observations,
 both stale-refresh reasons, the distinct refresh errors, recipient-preview
 acceptance and sent-history behaviour alongside the existing protocol floor.
 
+`0.26.0` changes the plaintext of a reminder Web Push message and no route. When
+`ATLAS_PUBLIC_ORIGIN` is configured the message is a Declarative Web Push envelope
+(`web_push` and `notification`) that keeps the three top-level identifiers; without it
+the message is unchanged. The new `WebPushPayload` schema documents both shapes, and
+`ReminderNotification` remains the identifiers-only shape. A reader of `id`,
+`reminder_id` and `occurrence_id` is unaffected, but a validator that forbids unknown
+members and was built from an earlier contract rejects the envelope, which is why this
+is a MINOR advance. See [notifications](notifications.md#web-push-payload). The
+compatibility probes record both payloads, the size fallback and the encrypted
+delivery path.
+
+The same integrated `0.26.0` contract adds `GET /defaults/snapshot` (`readSharingSnapshot`): the resolved defaults and
+the households their revision covers, with those households' members, read from one
+database snapshot. It adds one operation and one schema (`SharingSnapshot`) and changes no
+existing response: `GET /defaults`, `GET /households`, the defaults revision and every
+write guard behave as before. The compatibility baseline gains a probe group for it.
+See [sharing](sharing.md).
+
 Mutations require an account-scoped UUID `Idempotency-Key` and explicit version
 preconditions where defined. Commands that replace existing authored text also carry the
 resource's sharing revision (`expected_policy_version`), so a write cannot commit under
@@ -114,7 +132,7 @@ statuses and [sync](sync.md) for client recovery.
 `GET /health` returns the version of the API contract the running server was built with:
 
 ```json
-{"status": "ok", "api_version": "0.24.0"}
+{"status": "ok", "api_version": "0.26.0"}
 ```
 
 `api_version` is exactly `info.version` in [the contract](../api/openapi.json), read from

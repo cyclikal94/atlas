@@ -15,6 +15,79 @@ use std::{
     time::Duration,
 };
 use url::Url;
+/// `web_push` member value that opts a message into declarative parsing (W3C Push API,
+/// "declarative push message").
+pub const DECLARATIVE_WEB_PUSH: u32 = 8030;
+/// Generic, server-authored reminder text shared by ntfy and Web Push. Never task, calendar,
+/// account or device text.
+pub const REMINDER_TITLE: &str = "Atlas reminder";
+pub const REMINDER_BODY: &str = "Open Atlas to view your reminder.";
+/// Largest plaintext `web-push` 0.11 encrypts for `aes128gcm` (`http_ece.rs`); anything longer
+/// fails with `PayloadTooLarge` before it is sent.
+const WEB_PUSH_PLAINTEXT_LIMIT: usize = 3052;
+#[derive(Serialize)]
+struct DeclarativeMessage<'a> {
+    web_push: u32,
+    notification: DeclarativeNotification<'a>,
+    #[serde(flatten)]
+    identifiers: &'a atlas_core::calendars::Notification,
+}
+#[derive(Serialize)]
+struct DeclarativeNotification<'a> {
+    title: &'static str,
+    body: &'static str,
+    lang: &'static str,
+    dir: &'static str,
+    tag: &'a str,
+    navigate: String,
+}
+/// Deep link carried by a declarative notification: the public origin's root with the delivery
+/// identifiers as query parameters. Only the origin of `origin` is used; an unusable origin gives
+/// `None`.
+fn navigate_url(notification: &atlas_core::calendars::Notification, origin: &str) -> Option<Url> {
+    let origin = Url::parse(origin).ok()?;
+    if !matches!(origin.scheme(), "http" | "https")
+        || origin.host_str().is_none()
+        || !origin.username().is_empty()
+        || origin.password().is_some()
+    {
+        return None;
+    }
+    let mut url = Url::parse(&origin.origin().ascii_serialization()).ok()?;
+    url.set_path("/");
+    url.query_pairs_mut()
+        .append_pair("delivery_id", &notification.id)
+        .append_pair("reminder_id", &notification.reminder_id)
+        .append_pair("occurrence_id", &notification.occurrence_id);
+    Some(url)
+}
+/// Plaintext of one Web Push reminder message. With a usable `public_origin` it is a Declarative
+/// Web Push envelope that also keeps the three top-level identifiers; otherwise, and when the
+/// envelope would exceed the encryption limit, it is the identifiers alone. Pure and
+/// deterministic, so a retry of the same delivery carries identical plaintext.
+pub fn web_push_payload(
+    notification: &atlas_core::calendars::Notification,
+    public_origin: Option<&str>,
+) -> Result<Vec<u8>> {
+    if let Some(navigate) = public_origin.and_then(|origin| navigate_url(notification, origin)) {
+        let envelope = serde_json::to_vec(&DeclarativeMessage {
+            web_push: DECLARATIVE_WEB_PUSH,
+            notification: DeclarativeNotification {
+                title: REMINDER_TITLE,
+                body: REMINDER_BODY,
+                lang: "en-GB",
+                dir: "ltr",
+                tag: &notification.id,
+                navigate: navigate.into(),
+            },
+            identifiers: notification,
+        })?;
+        if envelope.len() <= WEB_PUSH_PLAINTEXT_LIMIT {
+            return Ok(envelope);
+        }
+    }
+    Ok(serde_json::to_vec(notification)?)
+}
 #[derive(Clone)]
 pub struct IntegrationConfig {
     key: Option<Arc<aead::LessSafeKey>>,
@@ -325,16 +398,17 @@ impl IntegrationConfig {
         subscription: &Subscription,
         notification: &atlas_core::calendars::Notification,
         expires: i64,
+        public_origin: Option<&str>,
     ) -> Result<(bool, bool)> {
         let response = match subscription {
             Subscription::Ntfy { url, bearer } => {
                 let (client, url) = self.client(url).await?;
                 let mut request = client
                     .post(url)
-                    .header("Title", "Atlas reminder")
+                    .header("Title", REMINDER_TITLE)
                     .header("Cache", "no")
                     .body(format!(
-                        "Open Atlas to view your reminder.\nNotification: {}",
+                        "{REMINDER_BODY}\nNotification: {}",
                         notification.id
                     ));
                 if let Some(token) = bearer {
@@ -369,7 +443,7 @@ impl IntegrationConfig {
                 builder.set_vapid_signature(signature.build()?);
                 builder.set_ttl((expires - crate::now()).clamp(0, 604800) as u32);
                 builder.set_topic(notification.id.replace('-', ""));
-                let payload = serde_json::to_vec(notification)?;
+                let payload = web_push_payload(notification, public_origin)?;
                 builder.set_payload(web_push::ContentEncoding::Aes128Gcm, &payload);
                 let message = builder.build()?;
                 let payload = message

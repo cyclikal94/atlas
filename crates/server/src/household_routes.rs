@@ -61,6 +61,13 @@ pub(crate) async fn defaults(
     let (actor, _) = identity(&app, &headers).await?;
     Ok(Json(app.store.defaults(&actor).await?))
 }
+pub(crate) async fn sharing_snapshot(
+    State(app): State<App>,
+    headers: HeaderMap,
+) -> Result<Json<atlas_core::policy::SharingSnapshot>, ApiError> {
+    let (actor, _) = identity(&app, &headers).await?;
+    Ok(Json(app.store.sharing_snapshot(&actor).await?))
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TemplateQuery {

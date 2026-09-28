@@ -4,4 +4,5 @@ mod device_quota;
 mod device_retirement;
 mod retirement_coordination;
 mod retirement_ledger;
-mod writer_inventory;
+// The source-scanning helpers are shared with the households snapshot tripwires.
+pub(crate) mod writer_inventory;

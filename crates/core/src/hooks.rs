@@ -21,6 +21,9 @@ struct State {
     pids: HashMap<String, i32>,
     unlocked: bool,
     raised: bool,
+    split_reads: bool,
+    read_committed: bool,
+    unverified: bool,
 }
 
 /// Held by a test for one armed point. Dropping it without `release` also releases the point,
@@ -95,7 +98,26 @@ impl Hooks {
         self.state().raised = true;
     }
 
-    /// `SHOW transaction_isolation` as observed after the locking reads of each attempt.
+    /// Negative control for the sharing snapshot: read the households on a second, later
+    /// snapshot instead of the one the defaults were read in, on either engine.
+    pub fn split_snapshot_reads(&self, enabled: bool) {
+        self.state().split_reads = enabled;
+    }
+
+    /// PostgreSQL negative control for the sharing snapshot: READ COMMITTED instead of
+    /// REPEATABLE READ.
+    pub fn snapshot_read_committed(&self, enabled: bool) {
+        self.state().read_committed = enabled;
+    }
+
+    /// Turn off the sharing snapshot's own consistency check (on by default), so a control can
+    /// observe the torn result the check would otherwise refuse to return.
+    pub fn verify_snapshot(&self, enabled: bool) {
+        self.state().unverified = !enabled;
+    }
+
+    /// `SHOW transaction_isolation` as observed after the locking reads of each attempt, and
+    /// between the two halves of a sharing snapshot.
     pub fn isolation_seen(&self) -> Vec<String> {
         self.state().isolation_seen.clone()
     }
@@ -124,6 +146,18 @@ impl Hooks {
         self.state().raised
     }
 
+    pub(crate) fn splits_snapshot_reads(&self) -> bool {
+        self.state().split_reads
+    }
+
+    pub(crate) fn reads_committed(&self) -> bool {
+        self.state().read_committed
+    }
+
+    pub(crate) fn verifies_snapshot(&self) -> bool {
+        !self.state().unverified
+    }
+
     /// Reach a point outside any transaction (or one that must not run injected SQL).
     pub async fn reach(&self, point: &str) {
         let gate = {
@@ -146,7 +180,11 @@ impl Hooks {
         tx: &mut Transaction<'_, Any>,
         sqlite: bool,
     ) -> Result<()> {
-        if point == "retire.after_locking_reads" && !sqlite {
+        if matches!(
+            point,
+            "retire.after_locking_reads" | "sharing_snapshot.between_reads"
+        ) && !sqlite
+        {
             let level: String = sqlx::query_scalar("SHOW transaction_isolation")
                 .fetch_one(&mut **tx)
                 .await?;

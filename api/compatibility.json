@@ -1,6 +1,6 @@
 {
-  "api_version": "0.24.0",
-  "contract_sha256": "1c8be785affc9f2c5cee94d7ea4e656b01b96e7044aed18778ed03ab8cd020f2",
+  "api_version": "0.26.0",
+  "contract_sha256": "9a3a0ffd64031f0b26d7e15f8c1f992ad7a1e777d3de4caf073f7f315ef71ad7",
   "behaviour": {
     "activation": {
       "activate": {
@@ -434,6 +434,163 @@
       "referrer_policy": "no-referrer",
       "set_cookie": false,
       "status": 200
+    },
+    "sharing_snapshot": {
+      "manager": {
+        "code": null,
+        "households": [
+          {
+            "member_roles": [
+              "manager",
+              "member"
+            ],
+            "role": "manager",
+            "version": 3
+          }
+        ],
+        "primary_household_set": true,
+        "status": 200
+      },
+      "member": {
+        "code": null,
+        "households": [
+          {
+            "member_roles": [
+              "manager",
+              "member"
+            ],
+            "role": "member",
+            "version": 3
+          }
+        ],
+        "primary_household_set": true,
+        "status": 200
+      },
+      "no_household": {
+        "cache_control": "private, no-store",
+        "content_type": "application/json",
+        "keys": [
+          "defaults",
+          "households"
+        ],
+        "set_cookie": false,
+        "summary": {
+          "code": null,
+          "households": [],
+          "primary_household_set": false,
+          "status": 200
+        }
+      },
+      "removed_member": {
+        "summary": {
+          "code": null,
+          "households": [],
+          "primary_household_set": false,
+          "status": 200
+        },
+        "unchanged_by_activity_in_it": true
+      },
+      "template_names_an_unjoined_household": {
+        "moves_for_a_member_of_it": true,
+        "summary": {
+          "code": null,
+          "households": [
+            {
+              "member_roles": [
+                "manager",
+                "member",
+                "member"
+              ],
+              "role": "member",
+              "version": 6
+            }
+          ],
+          "primary_household_set": true,
+          "status": 200
+        },
+        "template_still_names_it": true,
+        "unchanged_by_activity_in_it": true
+      },
+      "unauthenticated": {
+        "cache_control": "private, no-store",
+        "code": "unauthenticated",
+        "set_cookie": false,
+        "status": 401
+      }
+    },
+    "web_push_payload": {
+      "declarative": {
+        "bytes": 511,
+        "payload": {
+          "id": "3f2b8c1e-5a7d-4e90-b1c4-8d6e2a9f0b73",
+          "notification": {
+            "body": "Open Atlas to view your reminder.",
+            "dir": "ltr",
+            "lang": "en-GB",
+            "navigate": "https://atlas.example/?delivery_id=3f2b8c1e-5a7d-4e90-b1c4-8d6e2a9f0b73&reminder_id=a1d4e7f2-9c35-4b68-8e1a-5f3c7d2b9a40&occurrence_id=c8e5b3a9-2d71-4f06-9a84-1b7e6c0d3f52",
+            "tag": "3f2b8c1e-5a7d-4e90-b1c4-8d6e2a9f0b73",
+            "title": "Atlas reminder"
+          },
+          "occurrence_id": "c8e5b3a9-2d71-4f06-9a84-1b7e6c0d3f52",
+          "reminder_id": "a1d4e7f2-9c35-4b68-8e1a-5f3c7d2b9a40",
+          "web_push": 8030
+        }
+      },
+      "delivery": {
+        "declarative": {
+          "message": {
+            "authorization_scheme": "vapid",
+            "content_encoding": "aes128gcm",
+            "plaintext_is_builder_output": true,
+            "topic": "3f2b8c1e5a7d4e90b1c48d6e2a9f0b73",
+            "ttl": "604800"
+          },
+          "result": [
+            true,
+            false
+          ]
+        },
+        "gone": [
+          false,
+          true
+        ],
+        "identifiers_only": {
+          "message": {
+            "authorization_scheme": "vapid",
+            "content_encoding": "aes128gcm",
+            "plaintext_is_builder_output": true,
+            "topic": "3f2b8c1e5a7d4e90b1c48d6e2a9f0b73",
+            "ttl": "604800"
+          },
+          "result": [
+            true,
+            false
+          ]
+        },
+        "unavailable": [
+          false,
+          false
+        ]
+      },
+      "identifiers_only": {
+        "bytes": 153,
+        "payload": {
+          "id": "3f2b8c1e-5a7d-4e90-b1c4-8d6e2a9f0b73",
+          "occurrence_id": "c8e5b3a9-2d71-4f06-9a84-1b7e6c0d3f52",
+          "reminder_id": "a1d4e7f2-9c35-4b68-8e1a-5f3c7d2b9a40"
+        }
+      },
+      "ntfy": {
+        "body": "Open Atlas to view your reminder.\nNotification: 3f2b8c1e-5a7d-4e90-b1c4-8d6e2a9f0b73",
+        "cache": "no",
+        "result": [
+          true,
+          false
+        ],
+        "title": "Atlas reminder"
+      },
+      "oversize_origin_falls_back": true,
+      "unusable_origin_falls_back": true
     }
   }
 }

@@ -40,7 +40,7 @@ with at most eight attempts. A crash on the final attempt becomes failed after i
 Delivery is at-least-once: a crash after a provider accepts a message can cause a retry.
 Retries retain the same ID; Web Push also uses it as Topic. Providers and clients may
 collapse duplicates but Atlas cannot promise exactly-once display. Payloads contain only
-a generic prompt and delivery identifiers, never private task or calendar text. Fetch
+generic text and opaque identifiers, never private task or calendar text. Fetch
 current authorised details through Atlas after opening the notification.
 
 `GET /notification-capabilities` reports configured transports and the public VAPID key.
@@ -48,6 +48,43 @@ current authorised details through Atlas after opening the notification.
 current authorised delivery history. APNs and FCM are reported unavailable: direct native
 provider interoperability remains conditional on credentials and real test clients.
 Web Push uses actual VAPID signing and AES128GCM encryption; ntfy uses its HTTP publishing API.
+
+## Web Push payload
+
+ntfy receives a generic prompt and the delivery ID. The plaintext of a Web Push message is
+JSON. When `ATLAS_PUBLIC_ORIGIN` is configured it is a Declarative Web Push message
+(W3C Push API) that also keeps the three identifiers at the top level:
+
+<!-- experimental-schema: WebPushPayload -->
+```json
+{"web_push":8030,"notification":{"title":"Atlas reminder","body":"Open Atlas to view your reminder.","lang":"en-GB","dir":"ltr","tag":"3f2b8c1e-5a7d-4e90-b1c4-8d6e2a9f0b73","navigate":"https://atlas.example/?delivery_id=3f2b8c1e-5a7d-4e90-b1c4-8d6e2a9f0b73&reminder_id=a1d4e7f2-9c35-4b68-8e1a-5f3c7d2b9a40&occurrence_id=c8e5b3a9-2d71-4f06-9a84-1b7e6c0d3f52"},"id":"3f2b8c1e-5a7d-4e90-b1c4-8d6e2a9f0b73","reminder_id":"a1d4e7f2-9c35-4b68-8e1a-5f3c7d2b9a40","occurrence_id":"c8e5b3a9-2d71-4f06-9a84-1b7e6c0d3f52"}
+```
+
+One payload serves both paths. A browser that implements Declarative Web Push displays
+`notification` without running service-worker code and opens `navigate` when the user
+activates it. Any other browser delivers the same bytes to the service worker's `push`
+event, where a handler can build the notification from `notification` or from the
+identifiers. Without `ATLAS_PUBLIC_ORIGIN`, or if the message would exceed the
+3,052-byte plaintext limit (only a very long origin can), Atlas sends just the three
+identifiers, the `ReminderNotification` shape. `NotificationCapabilities.web_push` does not
+depend on the origin.
+
+- `title` and `body` are fixed generic text. They never contain task, calendar, account
+  or device text, and the payload carries no account, device or subscription identifier.
+- `tag` and `id` are the delivery ID. Retries keep it, and the plaintext of a retry is
+  identical, so platforms and clients can collapse or de-duplicate repeats. Atlas still
+  cannot promise exactly-once display.
+- `navigate` is the public origin's root with `delivery_id`, `reminder_id` and
+  `occurrence_id` as query parameters. The client reads them and fetches authorised
+  details through Atlas; the identifiers alone grant nothing.
+- Atlas sets no `mutable`, `silent`, `data`, `actions`, icon, badge or `app_badge` member.
+- Under the Notifications standard, activating a notification that has a navigation URL
+  navigates and does not fire `notificationclick`, so a client that records clicks must do
+  so from the page it lands on.
+
+Backend checks cover the payload, its encryption and the worker path. They do not show
+how any browser displays or activates a notification; that needs real browsers and the
+client's service worker.
 
 
 ## Configuration and operation
@@ -58,6 +95,8 @@ Web Push uses actual VAPID signing and AES128GCM encryption; ntfy uses its HTTP 
   after a deliberate key change; automatic key rotation is not implemented.
 - `ATLAS_VAPID_PRIVATE_KEY`: base64url P-256 private key for Web Push.
 - `ATLAS_VAPID_SUBJECT`: contact URI, such as `mailto:admin@example.org`.
+- `ATLAS_PUBLIC_ORIGIN`: when set, Web Push reminders are Declarative Web Push messages
+  whose `navigate` link is on this origin; when unset they carry only identifiers.
 - `ATLAS_OUTBOUND_ALLOW_ORIGINS`: optional comma-separated exact origins permitted to
   use HTTP or private addresses, for example a locally hosted ntfy service. This is an
   administrator-granted network exception; omit it for public HTTPS-only integrations.

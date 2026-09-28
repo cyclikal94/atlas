@@ -90,10 +90,72 @@ change household defaults; everyone can change their personal defaults.
 ```
 
 Queued creation using defaults must include the revision previously returned by
-`GET /defaults`. If relevant templates, primary household or membership changed,
+`GET /defaults` (or `defaults.revision` from the snapshot below; the two are the same
+value for the same state). If relevant templates, primary household or membership changed,
 `defaults_changed` preserves the draft for review. Online creation may omit the guard
 and accept current defaults. Retrying a committed operation returns its original
 receipt even if defaults subsequently changed.
+
+### Defaults with household membership
+
+`GET /defaults/snapshot` returns `{ defaults, households }` from one database snapshot.
+`defaults` is exactly what `GET /defaults` returns for the same state. `households` uses
+the shape of `GET /households` (id, name, version, your role and every member), in id order,
+with members in account-id order. It lists the households the revision covers: those you
+belong to that are your primary household or are named by a grant in one of the five
+resolved `explicit` templates. `defaults.revision` is the revision of exactly these
+defaults and household versions. Read them together with this operation, never with
+separate `GET /defaults` and `GET /households` calls: those are separate snapshots, so
+a membership change between them shows an audience that does not belong to the revision.
+A client that displays the audience of a captured revision stores this response as
+one record and captures its revision with the draft. Confirming the draft still
+re-resolves against current defaults on the server, so the display is only what the
+author saw.
+
+<!-- experimental-schema: SharingSnapshot -->
+```json
+{
+  "defaults": {
+    "revision": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+    "preferences_version": 2,
+    "primary_household_id": "2d1b6f0e-8a8c-4b7f-9d3a-5c1e9a7b3f40",
+    "person": { "kind": "primary_household", "edit": true },
+    "field": { "kind": "private" },
+    "task": { "kind": "private" },
+    "list": { "kind": "private" },
+    "progress": { "kind": "primary_household", "edit": false }
+  },
+  "households": [
+    {
+      "id": "2d1b6f0e-8a8c-4b7f-9d3a-5c1e9a7b3f40",
+      "name": "Home",
+      "version": 3,
+      "role": "manager",
+      "members": [
+        {
+          "account_id": "9c2e4a51-0f7d-4e63-b1a8-3d5f7c9e1b24",
+          "username": "alice",
+          "role": "manager"
+        },
+        {
+          "account_id": "e4b8d2a6-1c3f-4a90-8e57-6b2d4f8a0c13",
+          "username": "bob",
+          "role": "member"
+        }
+      ]
+    }
+  ]
+}
+```
+
+A household the caller does not belong to is never listed and never changes the
+revision, including one a retained personal template still names after the caller was
+removed from it; a template grant with no matching `households` entry therefore names a
+household the caller no longer belongs to. Pending invitations are not membership and are
+not part of this read. Every household version the revision hashes advances with each change
+to that household's membership, roles, name, invitations or defaults, so a change to
+any of them changes the revision. A username is returned but does not affect the
+revision (usernames are immutable).
 
 A private creation override takes effect within the creation transaction; it does not
 briefly publish the record before making it private. Null or omitted `initial_policy`

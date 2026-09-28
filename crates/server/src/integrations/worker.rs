@@ -213,7 +213,12 @@ impl App {
                     return Ok((false, true));
                 };
                 self.integrations
-                    .deliver(&subscription, &current.notification, current.expires_at)
+                    .deliver(
+                        &subscription,
+                        &current.notification,
+                        current.expires_at,
+                        self.browser.as_ref().map(|config| config.origin.as_str()),
+                    )
                     .await
             }
             .await;

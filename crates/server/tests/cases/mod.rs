@@ -9,6 +9,7 @@ mod oidc;
 mod onboarding;
 mod policy_precondition;
 mod sessions;
+mod snapshot;
 mod sync;
 mod tasks;
 mod writers;
