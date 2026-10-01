@@ -12,7 +12,7 @@
     "test": "node --test test/*.test.mjs"
   },
   "devDependencies": {
-    "openapi-typescript": "7.4.3",
-    "typescript": "5.9.3"
+    "openapi-typescript": "7.13.0",
+    "typescript": "7.0.2"
   }
 }
