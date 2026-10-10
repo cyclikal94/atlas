@@ -36,7 +36,8 @@ whether or not you include a secrets file. The script does not discover those se
 
 After loading the data, restore invokes `atlas-server prepare-restore --offline`.
 This transaction invalidates login sessions, in-flight OIDC flows, signup invitations,
-snapshot cursors and signed delta cursor keys; resets calendar/delivery leases; and
+snapshot cursors and signed delta cursor keys; forgets every device's name and client label
+(schema `1005`, since every device is forgotten); resets calendar/delivery leases; and
 preserves domain data, resource IDs, history, operation receipts and the device-retirement
 operation ledger (so a recorded outcome still replays). Clients log in
 again and replace their cached view with a new snapshot. They must retain pending
@@ -53,10 +54,10 @@ restore the saved database with its matching executable and keys.
 
 ## Release compatibility
 
-Atlas is unreleased. The current backup format is 1 and the current schema is 1004. A
-bundle records the schema it holds. Backup and restore accept 1000 to 1004: 1000 to 1003
+Atlas is unreleased. The current backup format is 1 and the current schema is 1005. A
+bundle records the schema it holds. Backup and restore accept 1000 to 1005: 1000 to 1004
 are previous baselines, which are what a "back up before upgrading" bundle contains (the
-executable upgrades them in place when restore prepares it), and 1004 is current;
+executable upgrades them in place when restore prepares it), and 1005 is current;
 incompatible experimental schemas, including any version above the current one, are
 rejected by both commands. The accepted range is `SUPPORTED_SCHEMAS` in
 `scripts/backup.py`. A test in `atlas-core` fails when that range stops matching the

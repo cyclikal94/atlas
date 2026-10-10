@@ -12,7 +12,7 @@ import urllib.request
 import uuid
 
 from smoke.client import ContractClient
-from smoke import calendars, sharing, households, tasks, people, devices, timers
+from smoke import calendars, sharing, households, tasks, people, devices, timers, labels
 
 root = Path(__file__).resolve().parents[1]
 binary = Path(os.environ.get('ATLAS_TEST_BINARY', root / 'target/debug/atlas-server'))
@@ -70,6 +70,7 @@ with tempfile.TemporaryDirectory(prefix='atlas-server-smoke-') as temporary:
             workflow = tasks.run(call, accounts, tokens, document)
             people.run(call, accounts, tokens, workflow)
             print(json.dumps(timers.run(call, accounts, tokens, document)))
+            print(json.dumps(labels.run(call, tokens, secrets)))
             def seed(account, device, kind):
                 """Fixture rows for devices.run: no OpenID provider or push endpoint exists here."""
                 expires = int(time.time()) + 3600
@@ -114,4 +115,4 @@ with tempfile.TemporaryDirectory(prefix='atlas-server-smoke-') as temporary:
     logged_ids = {event['request_id'] for event in events if event['event'] == 'http_request'}
     if request_ids != logged_ids:
         raise RuntimeError('Requests and logs are not correlated')
-print('Live contract smoke passed: authentication, sharing, households, tasks, people, independent timers, calendars, device retirement and sanitised logs')
+print('Live contract smoke passed: authentication, sharing, households, tasks, people, independent timers, calendars, session/device labels and capacity, device retirement and sanitised logs')

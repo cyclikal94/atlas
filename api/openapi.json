@@ -2,7 +2,7 @@
   "openapi": "3.1.1",
   "info": {
     "title": "Atlas API",
-    "version": "0.27.0",
+    "version": "0.28.0",
     "description": "Pre-release API. Breaking changes and explicit database resets are permitted until a supported release."
   },
   "servers": [
@@ -286,7 +286,8 @@
             "forbidden",
             "credential_mismatch"
           ]
-        }
+        },
+        "description": "Each session carries the client label captured when it was issued and its device's current name; session_capacity is computed from the same read (BE-Q25)."
       }
     },
     "/sessions/current": {
@@ -6838,7 +6839,7 @@
           ]
         },
         "summary": "List this account\u2019s sync devices and devices with active sessions",
-        "description": "Online device management. last_synced_at is null for a device that has never synced. Device IDs are scoped to the authenticated account. Each device carries the state_token and summary of one consistent read snapshot; pass the token in Atlas-Device-State to retire exactly the state the user confirmed. A device is listed when it holds any member of its approved state (a sync registration, a live session, a live native handoff or an active notification subscription), so a device whose last session has gone stays listed, with a fresh token, until nothing live remains."
+        "description": "Online device management. last_synced_at is null for a device that has never synced. Device IDs are scoped to the authenticated account. Each device carries the state_token and summary of one consistent read snapshot; pass the token in Atlas-Device-State to retire exactly the state the user confirmed. A device is listed when it holds any member of its approved state (a sync registration, a live session, a live native handoff or an active notification subscription), so a device whose last session has gone stays listed, with a fresh token, until nothing live remains. Each device also carries its name and the client label of its latest sign-in (BE-Q25), and the response carries sync_capacity from the same snapshot."
       }
     },
     "/devices/{device_id}": {
@@ -7042,6 +7043,342 @@
         ],
         "summary": "Retire this account\u2019s device",
         "description": "Retire a device only if its complete approved state (its live sessions, native handoffs, active notification subscriptions and sync registration) still equals the state_token the user confirmed, in one serialised, retried transaction that also commits the outcome under the Idempotency-Key. On success it revokes the sessions and native handoffs, deactivates the subscriptions, invalidates the cursors and removes the delivery ledger; content and account-wide operation receipts remain. The outcome is durable: after a lost response, or after a self-retirement has revoked the calling session, repeat the identical call under any other valid session of the account to read it. A repeat never re-evaluates and never clears a newer login. Reusing the ID with a different device or state token is refused. The response sets no cookie: revoking the calling session is not signalled by Set-Cookie, and later use of that credential returns 401. Retirement changes the contract of this operation (0.14.0): the two request headers are required and the success status is 200 with the outcome."
+      }
+    },
+    "/devices/{device_id}/name": {
+      "put": {
+        "operationId": "setDeviceName",
+        "summary": "Name one of this account\u2019s devices",
+        "description": "Set the display name of a device currently listed by GET /devices for the caller's account (BE-Q25). Any live session of the account may name any of its devices; duplicate names are allowed. The name is display metadata: it is not part of the device's state_token, so it never makes a retirement stale, and it is deleted when the device is retired. A rename and a retirement are totally ordered: a rename either commits first and is then deleted with the device, or runs after the retirement and returns 404. Repeating the same request is harmless, so no Idempotency-Key is used.",
+        "parameters": [
+          {
+            "name": "device_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeviceNameUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Name set",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found: no device with this ID is listed for the caller's account (never seen, retired, expired or another account's). Nothing is written.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "internal_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "temporarily_unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "malformed_request: the body is not a JSON object with exactly one string member, name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "invalid_value: the device ID is not 1 to 100 bytes, or the name breaks the DeviceName rules",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          }
+        },
+        "x-error-codes": {
+          "503": [
+            "temporarily_unavailable"
+          ],
+          "403": [
+            "forbidden",
+            "credential_mismatch"
+          ],
+          "400": [
+            "malformed_request"
+          ],
+          "404": [
+            "not_found"
+          ],
+          "422": [
+            "invalid_value"
+          ]
+        }
+      },
+      "delete": {
+        "operationId": "clearDeviceName",
+        "summary": "Remove the name of one of this account\u2019s devices",
+        "description": "Clear the display name of a device currently listed for the caller's account (BE-Q25). Idempotent: 204 also when no name is set. The device's client label is kept.",
+        "parameters": [
+          {
+            "name": "device_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 100
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "No name is set",
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found: no device with this ID is listed for the caller's account (never seen, retired, expired or another account's). Nothing is written.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "internal_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "temporarily_unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "invalid_value: the device ID is not 1 to 100 bytes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          }
+        },
+        "x-error-codes": {
+          "503": [
+            "temporarily_unavailable"
+          ],
+          "403": [
+            "forbidden",
+            "credential_mismatch"
+          ],
+          "404": [
+            "not_found"
+          ],
+          "422": [
+            "invalid_value"
+          ]
+        }
       }
     },
     "/task-commands": {
@@ -17888,7 +18225,9 @@
           "created_at",
           "expires_at",
           "authentication",
-          "current"
+          "current",
+          "client",
+          "device_name"
         ],
         "properties": {
           "id": {
@@ -17915,6 +18254,28 @@
           },
           "current": {
             "type": "boolean"
+          },
+          "client": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ClientLabel"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The label captured when this session was issued; null for a session issued before API 0.28.0."
+          },
+          "device_name": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DeviceName"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The current name of this session's device (the same value as Device.name), or null when it has none."
           }
         }
       },
@@ -17922,7 +18283,8 @@
         "type": "object",
         "additionalProperties": false,
         "required": [
-          "sessions"
+          "sessions",
+          "session_capacity"
         ],
         "properties": {
           "sessions": {
@@ -17930,6 +18292,10 @@
             "items": {
               "$ref": "#/components/schemas/SessionSummary"
             }
+          },
+          "session_capacity": {
+            "$ref": "#/components/schemas/Capacity",
+            "description": "Live sessions of this account against the limit on them. used is the number of sessions listed above, which is exactly what a new sign-in counts (expired sessions are counted by neither). A sign-in when remaining is 0 fails with device_capacity."
           }
         }
       },
@@ -18221,7 +18587,9 @@
           "active_sessions",
           "current",
           "state_token",
-          "summary"
+          "summary",
+          "name",
+          "client"
         ],
         "properties": {
           "id": {
@@ -18250,6 +18618,28 @@
           },
           "summary": {
             "$ref": "#/components/schemas/DeviceSummary"
+          },
+          "name": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DeviceName"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The name set with PUT /devices/{device_id}/name, or null. Display metadata only: not part of state_token, so renaming never makes a retirement confirmation stale. Kept while the device is listed; forgotten when the device is retired, on restore, and when the device stops being listed (it starts unnamed if it signs in again)."
+          },
+          "client": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ClientLabel"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The label of this device's most recently issued session, kept while the device is listed; null when the device has not signed in since API 0.28.0. Several devices can share a label; the name tells them apart."
           }
         }
       },
@@ -18390,7 +18780,8 @@
         "type": "object",
         "additionalProperties": false,
         "required": [
-          "devices"
+          "devices",
+          "sync_capacity"
         ],
         "properties": {
           "devices": {
@@ -18399,6 +18790,10 @@
             "items": {
               "$ref": "#/components/schemas/Device"
             }
+          },
+          "sync_capacity": {
+            "$ref": "#/components/schemas/Capacity",
+            "description": "Sync registrations of this account against the limit on them. used counts every registration, including one older than the retention period that cleanup has not yet removed, exactly as a sync from an unregistered device counts them; a device that is already registered needs no new slot. A sync from a new device when remaining is 0 fails with device_capacity until a retirement or cleanup frees a slot."
           }
         }
       },
@@ -22389,6 +22784,128 @@
         ],
         "additionalProperties": false,
         "description": "Resolved defaults and the households their revision covers, read from one database snapshot. `defaults.revision` is the revision of exactly these defaults and these household versions. `households` holds only households the caller currently belongs to that are the primary household or are named by a grant of a resolved `explicit` template, so a template grant with no matching entry names a household the caller does not belong to."
+      },
+      "ClientLabel": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "channel",
+          "browser",
+          "platform"
+        ],
+        "description": "Coarse description of the client that signed in, captured by the server when the session was issued (BE-Q25). channel comes from the route: browser for POST /browser-sessions/activate, native for POST /sessions, POST /registration and POST /oidc/native/exchange. browser and platform are derived only from that request's User-Agent header, which the client reports about itself and can change, so this is a hint for recognising a sign-in, never identity or proof of a device. Only these closed values are stored: no raw header, version, model, client hint or address. A header that is absent, repeated, over 512 bytes or not printable ASCII gives unknown and never blocks a sign-in. More values may be added in a MINOR version; treat an unrecognised value as unknown.",
+        "properties": {
+          "channel": {
+            "type": "string",
+            "enum": [
+              "browser",
+              "native"
+            ]
+          },
+          "browser": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "chrome",
+              "edge",
+              "firefox",
+              "safari",
+              "opera",
+              "samsung_internet",
+              "unknown",
+              null
+            ],
+            "description": "null exactly when channel is native."
+          },
+          "platform": {
+            "type": "string",
+            "enum": [
+              "windows",
+              "macos",
+              "ios",
+              "android",
+              "linux",
+              "chromeos",
+              "unknown"
+            ]
+          }
+        },
+        "examples": [
+          {
+            "channel": "browser",
+            "browser": "safari",
+            "platform": "ios"
+          },
+          {
+            "channel": "native",
+            "browser": null,
+            "platform": "android"
+          }
+        ]
+      },
+      "Capacity": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "limit",
+          "used",
+          "remaining"
+        ],
+        "description": "Used and remaining slots under one limit the server enforces, read from the same rows the enforcement counts at the time of this response (BE-Q25). Advisory, not a reservation: a concurrent sign-in or registration can take the last slot, and a slot is freed only when the sign-out, retirement or expiry that frees it commits.",
+        "properties": {
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "description": "The configured limit, or null when the server does not enforce one."
+          },
+          "used": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "remaining": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "max(limit - used, 0); null exactly when limit is null."
+          }
+        },
+        "examples": [
+          {
+            "limit": 32,
+            "used": 3,
+            "remaining": 29
+          }
+        ]
+      },
+      "DeviceName": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "description": "A name the account's owner chose for one of their devices (BE-Q25). 1 to 64 Unicode scalar values (at most 256 UTF-8 bytes), with no leading or trailing white space and no control, bidirectional-control (U+061C, U+200E, U+200F, U+202A-U+202E, U+2066-U+2069), invisible (U+200B, U+2060-U+2064, U+FEFF, U+FFF9-U+FFFB), line/paragraph-separator (U+2028, U+2029) or noncharacter code point. ZWJ and ZWNJ are allowed. Stored and returned exactly as accepted, without normalisation or trimming. It is user-supplied text: render it as text, never as markup."
+      },
+      "DeviceNameUpdate": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "$ref": "#/components/schemas/DeviceName"
+          }
+        },
+        "examples": [
+          {
+            "name": "Kieran's phone"
+          }
+        ]
       }
     }
   }

@@ -147,6 +147,20 @@ CREATE TABLE dependency_rules (
     CONSTRAINT dependency_rules_strict_check CHECK ((strict = ANY (ARRAY[(0)::bigint, (1)::bigint])))
 );
 
+CREATE TABLE device_profiles (
+    account_id text NOT NULL,
+    device_id text NOT NULL,
+    name text,
+    client_channel text,
+    client_browser text,
+    client_platform text,
+    updated_at bigint NOT NULL,
+    CONSTRAINT device_profiles_client_browser_check CHECK ((client_browser = ANY (ARRAY['chrome'::text, 'edge'::text, 'firefox'::text, 'safari'::text, 'opera'::text, 'samsung_internet'::text, 'unknown'::text]))),
+    CONSTRAINT device_profiles_client_channel_check CHECK ((client_channel = ANY (ARRAY['browser'::text, 'native'::text]))),
+    CONSTRAINT device_profiles_client_platform_check CHECK ((client_platform = ANY (ARRAY['windows'::text, 'macos'::text, 'ios'::text, 'android'::text, 'linux'::text, 'chromeos'::text, 'unknown'::text]))),
+    CONSTRAINT device_profiles_name_check CHECK (((length(name) >= 1) AND (length(name) <= 64)))
+);
+
 CREATE TABLE external_identities (
     issuer text NOT NULL,
     subject text NOT NULL,
@@ -397,7 +411,13 @@ CREATE TABLE sessions (
     session_id text DEFAULT ''::text NOT NULL,
     created_at bigint DEFAULT 0 NOT NULL,
     auth_kind text DEFAULT 'local'::text NOT NULL,
-    CONSTRAINT sessions_auth_kind_check CHECK ((auth_kind = ANY (ARRAY['local'::text, 'oidc'::text])))
+    client_channel text,
+    client_browser text,
+    client_platform text,
+    CONSTRAINT sessions_auth_kind_check CHECK ((auth_kind = ANY (ARRAY['local'::text, 'oidc'::text]))),
+    CONSTRAINT sessions_client_browser_check CHECK ((client_browser = ANY (ARRAY['chrome'::text, 'edge'::text, 'firefox'::text, 'safari'::text, 'opera'::text, 'samsung_internet'::text, 'unknown'::text]))),
+    CONSTRAINT sessions_client_channel_check CHECK ((client_channel = ANY (ARRAY['browser'::text, 'native'::text]))),
+    CONSTRAINT sessions_client_platform_check CHECK ((client_platform = ANY (ARRAY['windows'::text, 'macos'::text, 'ios'::text, 'android'::text, 'linux'::text, 'chromeos'::text, 'unknown'::text])))
 );
 
 CREATE TABLE snapshot_items (
@@ -582,6 +602,9 @@ ALTER TABLE ONLY completion_successors
 
 ALTER TABLE ONLY dependency_rules
     ADD CONSTRAINT dependency_rules_pkey PRIMARY KEY (occurrence_id);
+
+ALTER TABLE ONLY device_profiles
+    ADD CONSTRAINT device_profiles_pkey PRIMARY KEY (account_id, device_id);
 
 ALTER TABLE ONLY external_identities
     ADD CONSTRAINT external_identities_issuer_account_id_key UNIQUE (issuer, account_id);
@@ -901,6 +924,9 @@ ALTER TABLE ONLY default_templates
 ALTER TABLE ONLY dependency_rules
     ADD CONSTRAINT dependency_rules_occurrence_id_fkey FOREIGN KEY (occurrence_id) REFERENCES task_occurrences(id);
 
+ALTER TABLE ONLY device_profiles
+    ADD CONSTRAINT device_profiles_account_id_fkey FOREIGN KEY (account_id) REFERENCES accounts(id);
+
 ALTER TABLE ONLY external_identities
     ADD CONSTRAINT external_identities_account_id_fkey FOREIGN KEY (account_id) REFERENCES accounts(id);
 
@@ -1117,4 +1143,4 @@ ALTER TABLE ONLY timer_sessions
 
 
 INSERT INTO sync_clock(id,revision,resource_count) VALUES(1,0,0);
-INSERT INTO atlas_schema(version) VALUES(1004);
+INSERT INTO atlas_schema(version) VALUES(1005);

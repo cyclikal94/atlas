@@ -1,17 +1,28 @@
 use super::*;
+use atlas_core::devices::{Capacity, ClientLabel, Continuity, Ordered, SESSION_LIMIT};
 use atlas_core::error::ErrorCode;
 use sqlx::{Any, Transaction};
 
 /// Returns the issued session and its `session_id` (BE-Q19): every caller but
 /// `activation::activate` discards the ID, which exists so `activate` can report it without a
-/// second read.
+/// second read. `client` is the caller's label for this sign-in (BE-Q25, `labels::client`); it is
+/// stored with the session and as the device's latest label, in the same transaction.
+/// `ordered` is the caller's hold on the account's membership ordering point
+/// (`devices::order_membership`, BE-Q25); its time is the session's creation time.
+/// `continuity` is `Replaces` only for a caller that verified, and is consuming, a member of
+/// `device` live at that time (`Ordered::replacing`: a grant being activated, a handoff being
+/// exchanged); every other caller passes `Unknown`, so a forgotten device's old profile is dropped
+/// before the new session lists it.
 pub(super) async fn issue(
     tx: &mut Transaction<'_, Any>,
-    account: &str,
+    ordered: &Ordered,
     device: &str,
     kind: &str,
+    client: &ClientLabel,
+    continuity: &Continuity,
 ) -> Result<(SessionResponse, String), ApiError> {
-    let created = now();
+    let account = ordered.account();
+    let created = ordered.now();
     sqlx::query("DELETE FROM sessions WHERE account_id=$1 AND expires_at<=$2")
         .bind(account)
         .bind(created)
@@ -21,12 +32,15 @@ pub(super) async fn issue(
         .bind(account)
         .fetch_one(&mut **tx)
         .await?;
-    ensure_api(count < 32, ErrorCode::DeviceCapacity)?;
+    ensure_api(count < SESSION_LIMIT, ErrorCode::DeviceCapacity)?;
+    atlas_core::devices::record_client(tx, ordered, device, client, continuity).await?;
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let session_id = Uuid::new_v4().to_string();
     let expires_at = created + 86400;
-    sqlx::query("INSERT INTO sessions(token_hash,account_id,device_id,expires_at,session_id,created_at,auth_kind) VALUES ($1,$2,$3,$4,$5,$6,$7)")
-        .bind(digest(&token)).bind(account).bind(device).bind(expires_at).bind(&session_id).bind(created).bind(kind).execute(&mut **tx).await?;
+    sqlx::query("INSERT INTO sessions(token_hash,account_id,device_id,expires_at,session_id,created_at,auth_kind,client_channel,client_browser,client_platform) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)")
+        .bind(digest(&token)).bind(account).bind(device).bind(expires_at).bind(&session_id).bind(created).bind(kind)
+        .bind(client.channel.as_str()).bind(client.browser.map(|b| b.as_str())).bind(client.platform.as_str())
+        .execute(&mut **tx).await?;
     Ok((
         SessionResponse {
             access_token: token,
@@ -48,12 +62,18 @@ pub(super) async fn list(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (account, _) = identity(&app, &headers).await?;
     let current = digest(&browser::credential(&app, &headers)?);
-    let rows = sqlx::query("SELECT session_id,device_id,created_at,expires_at,auth_kind,token_hash FROM sessions WHERE account_id=$1 AND expires_at>$2 ORDER BY created_at,session_id").bind(account).bind(now()).fetch_all(&app.store.pool).await?;
+    // One statement after the account's membership ordering point: the rows listed are exactly the
+    // rows `issue` counts after its expiry sweep, so `session_capacity.used` is the enforced count
+    // as of this read, and the names follow the device listing's lifetime (BE-Q25).
+    let rows = app.store.sessions(&account, now).await?;
+    let session_capacity = Capacity::of(Some(SESSION_LIMIT), rows.len() as i64);
     let mut sessions = Vec::new();
     for row in rows {
-        sessions.push(json!({"id":row.get::<String,_>(0),"device_id":row.get::<String,_>(1),"created_at":timestamp(row.get(2))?,"expires_at":timestamp(row.get(3))?,"authentication":row.get::<String,_>(4),"current":row.get::<String,_>(5)==current}));
+        sessions.push(json!({"id":row.id,"device_id":row.device_id,"created_at":timestamp(row.created_at)?,"expires_at":timestamp(row.expires_at)?,"authentication":row.authentication,"current":row.token_hash==current,"client":row.client,"device_name":row.device_name}));
     }
-    Ok(Json(json!({"sessions":sessions})))
+    Ok(Json(
+        json!({"sessions":sessions,"session_capacity":session_capacity}),
+    ))
 }
 /// Exactly one header of this name, or `None` when absent. Repeats are ambiguous, so refused.
 fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>, ApiError> {
@@ -112,14 +132,18 @@ pub(super) async fn revoke(
         ));
     }
     hook!(app.store, "session_delete.after_identity");
+    // A removal of a member, so it takes the account's membership ordering point (BE-Q25).
+    let mut tx = app.store.pool.begin().await?;
+    atlas_core::devices::order_membership(&mut tx, &account, &now).await?;
     let removed: Option<String> = sqlx::query_scalar(
         "DELETE FROM sessions WHERE session_id=$1 AND account_id=$2 RETURNING token_hash",
     )
     .bind(id)
-    .bind(account)
-    .fetch_optional(&app.store.pool)
+    .bind(&account)
+    .fetch_optional(&mut *tx)
     .await?;
     ensure_api(removed.is_some(), ErrorCode::NotFound)?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -183,6 +207,8 @@ pub(super) async fn change_password(
             .execute(&mut *tx)
             .await?;
     ensure_api(result.rows_affected() == 1, ErrorCode::Conflict)?;
+    // Revoking every member but registrations and subscriptions is a membership change (BE-Q25).
+    atlas_core::devices::order_membership(&mut tx, &account, &now).await?;
     sqlx::query("DELETE FROM native_handoffs WHERE account_id=$1")
         .bind(&account)
         .execute(&mut *tx)
@@ -214,6 +240,7 @@ pub async fn reset_password(store: &Store, username: &str, password_hash: &str) 
             .fetch_optional(&mut *tx)
             .await?
             .ok_or_else(|| anyhow!("account not found"))?;
+    atlas_core::devices::order_membership(&mut tx, &account, &now).await?;
     sqlx::query("DELETE FROM native_handoffs WHERE account_id=$1")
         .bind(&account)
         .execute(&mut *tx)
@@ -279,6 +306,7 @@ pub(super) async fn unlink_oidc(
         .execute(&mut *tx)
         .await?;
     ensure_api(result.rows_affected() == 1, ErrorCode::NotFound)?;
+    atlas_core::devices::order_membership(&mut tx, &account, &now).await?;
     sqlx::query("DELETE FROM native_handoffs WHERE account_id=$1")
         .bind(&account)
         .execute(&mut *tx)
@@ -303,11 +331,50 @@ pub(super) async fn devices(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (account, current) = identity(&app, &headers).await?;
+    let listing = app.store.devices(&account, now).await?;
     let mut devices = Vec::new();
-    for device in app.store.devices(&account, now()).await? {
-        devices.push(json!({"id":device.id,"last_synced_at":device.last_synced_at.map(timestamp).transpose()?,"active_sessions":device.active_sessions,"current":device.id==current,"state_token":device.state_token,"summary":device.summary}));
+    for device in listing.devices {
+        devices.push(json!({"id":device.id,"last_synced_at":device.last_synced_at.map(timestamp).transpose()?,"active_sessions":device.active_sessions,"current":device.id==current,"state_token":device.state_token,"summary":device.summary,"name":device.name,"client":device.client}));
     }
-    Ok(Json(json!({"devices":devices})))
+    Ok(Json(
+        json!({"devices":devices,"sync_capacity":listing.sync_capacity}),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct DeviceNameUpdate {
+    name: String,
+}
+
+/// `PUT /devices/{device_id}/name` (BE-Q25): name one of the account's listed devices. Any live
+/// session of the account may name any of its devices; the name is display metadata and is not
+/// part of the device's `state_token`.
+pub(super) async fn set_device_name(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(device): Path<String>,
+    body: Result<Json<DeviceNameUpdate>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let (account, _) = identity(&app, &headers).await?;
+    let Json(input) = body.map_err(|_| anyhow!(ErrorCode::MalformedRequest))?;
+    app.store
+        .set_device_name(&account, &device, Some(&input.name), now)
+        .await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `DELETE /devices/{device_id}/name` (BE-Q25): idempotent, including when no name is set.
+pub(super) async fn clear_device_name(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(device): Path<String>,
+) -> Result<Response, ApiError> {
+    let (account, _) = identity(&app, &headers).await?;
+    app.store
+        .set_device_name(&account, &device, None, now)
+        .await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 /// Retire a device only if its approved state still matches the token the user confirmed.
 /// The credential's own session may be among the members; the response carries no `Set-Cookie`

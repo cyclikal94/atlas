@@ -75,6 +75,7 @@ async fn retire(store: &Store, account: &str, device: &str) -> Result<()> {
     let token = store
         .devices(account, 1000)
         .await?
+        .devices
         .into_iter()
         .find(|d| d.id == device)
         .ok_or_else(|| anyhow::anyhow!("device not listed"))?
@@ -172,7 +173,7 @@ async fn main() -> Result<()> {
         let start = Instant::now();
         let devices = store.devices(&account, 1000).await?;
         listing_ms.push(start.elapsed().as_secs_f64() * 1000.);
-        ensure!(devices.len() == 32, "expected 32 listed devices");
+        ensure!(devices.devices.len() == 32, "expected 32 listed devices");
     }
 
     // 3. Unrelated command writers with and without retirements running.

@@ -150,15 +150,17 @@ pub(super) async fn login(
     )?;
     let (mut tx, account_id) =
         authenticate_local(&app, peer, &headers, input.username, input.password).await?;
+    hook!(app.store, "browser_login.before_order");
+    let ordered = atlas_core::devices::order_membership(&mut tx, &account_id, &now).await?;
     let grant = activation::issue_grant(
         &mut tx,
-        &account_id,
+        &ordered,
         &input.device_id,
         "local",
         &input.attempt_challenge,
-        now(),
     )
     .await?;
+    hook!(app.store, "browser_login.before_commit", &mut tx);
     tx.commit().await?;
     Ok(Json(grant))
 }

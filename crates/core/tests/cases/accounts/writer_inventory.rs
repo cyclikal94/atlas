@@ -7,15 +7,36 @@
 //! new writer is ordered against a retirement, to be updated. `activation_grants` (BE-Q19) is now
 //! written by grant issue/redeem/cancel, the three account-wide session revocations, and
 //! retirement's own `cancel_grants`, all inside `begin_serial()`/`begin_retirement()`.
+//!
+//! `device_profiles` (BE-Q25) is not a member: a device's name and label are display metadata and
+//! never part of its `state_token`. It is inventoried anyway because its lifetime is defined by
+//! ordering against a retirement (a rename either commits before it and is deleted with the
+//! device, or runs after it and finds nothing listed), so each of its writers must stay serialised:
+//! the orphan prune `forget_unlisted` (reached from session issue's `record_client`, grant and
+//! handoff issue and a subscription change), the label upsert, the rename, the retirement's own
+//! cleanup and restore. `every_listing_writer_forgets_unlisted_profiles_first` below separately
+//! requires every statement that can give a device a live member to run after that prune.
+//!
+//! BE-Q25 revision 2: serialisation alone does not keep a profile's lifetime right, because the
+//! removals that do not take `begin_serial()` (sign-out, sync registration, the aged-registration
+//! sweep) and the public listings could still interleave with a decision that a device is listed.
+//! Every membership change and every profile write now holds the account's membership ordering
+//! point (`devices::order_membership`), and the listings take it shared
+//! (`Store::begin_membership_read`). `every_membership_change_holds_the_account_ordering_point`
+//! and `every_profile_reader_reads_its_time_after_the_ordering_point` check that structure; they
+//! are architectural alarms, and the concurrency itself is proved by the scheduled tests in
+//! `device_names.rs` and the server's `labels.rs`.
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const TABLES: [&str; 6] = [
+const TABLES: [&str; 7] = [
     "sessions",
     "native_handoffs",
     "notification_subscriptions",
     "activation_grants",
     "sync_devices",
+    // Not a member; see the module comment.
+    "device_profiles",
     // The retirement's generic identity delete interpolates a fixed table name.
     "{table}",
 ];
@@ -189,6 +210,61 @@ fn inventory() -> Vec<Entry> {
             Serial,
             None,
         ),
+        // --- BE-Q25: device names and labels
+        entry(
+            "core/src/devices.rs",
+            "forget_unlisted",
+            "DELETE FROM",
+            "device_profiles",
+            2,
+            Serial,
+            None,
+        ),
+        entry(
+            "core/src/devices.rs",
+            "record_client",
+            "INSERT INTO",
+            "device_profiles",
+            1,
+            Serial,
+            None,
+        ),
+        entry(
+            "core/src/devices.rs",
+            "set_name_once",
+            "INSERT INTO",
+            "device_profiles",
+            1,
+            Serial,
+            None,
+        ),
+        entry(
+            "core/src/devices.rs",
+            "set_name_once",
+            "UPDATE",
+            "device_profiles",
+            1,
+            Serial,
+            None,
+        ),
+        entry(
+            "core/src/devices.rs",
+            "retire_members",
+            "DELETE FROM",
+            "device_profiles",
+            1,
+            Serial,
+            None,
+        ),
+        entry(
+            "core/src/storage/mod.rs",
+            "prepare_restored_database",
+            "DELETE FROM",
+            "device_profiles",
+            1,
+            Serial,
+            None,
+        ),
         // --- notification subscriptions (set, replace, remove)
         entry(
             "core/src/calendars/reminders.rs",
@@ -281,7 +357,7 @@ fn inventory() -> Vec<Entry> {
             "sync_devices",
             1,
             Own,
-            Some("UPDATE accounts SET access_epoch=access_epoch"),
+            Some("order_membership("),
         ),
         entry(
             "core/src/sync.rs",
@@ -290,17 +366,18 @@ fn inventory() -> Vec<Entry> {
             "sync_devices",
             1,
             Own,
-            Some("UPDATE accounts SET access_epoch=access_epoch"),
+            Some("order_membership("),
         ),
-        // --- the two session revocations that take no lock beyond their own row
+        // --- the two session revocations outside begin_serial(): BE-Q25 revision 2 made each its
+        // own transaction holding the account's membership ordering point (formerly autocommit)
         entry(
             "server/src/lib.rs",
             "logout",
             "DELETE FROM",
             "sessions",
             1,
-            RowLock,
-            None,
+            Own,
+            Some("order_membership("),
         ),
         entry(
             "server/src/sessions.rs",
@@ -308,8 +385,8 @@ fn inventory() -> Vec<Entry> {
             "DELETE FROM",
             "sessions",
             1,
-            RowLock,
-            None,
+            Own,
+            Some("order_membership("),
         ),
         // --- everything else in the server runs inside begin_serial()
         entry(
@@ -419,11 +496,19 @@ fn inventory() -> Vec<Entry> {
 /// `TRANSACTION_PRODUCING_HELPERS` below. `activation::issue_grant` takes a `Transaction` rather
 /// than opening one, exactly like `sessions::issue`, so it belongs here: its own signature is not
 /// evidence that whoever calls it acquired `begin_serial()` first (R5).
-const TRANSACTION_HELPERS: [(&str, &str); 4] = [
+const TRANSACTION_HELPERS: [(&str, &str); 6] = [
     ("server/src/sessions.rs", "sessions::issue("),
     ("core/src/devices.rs", "Self::retire_members("),
     ("core/src/devices.rs", "Self::delete_identities("),
     ("server/src/activation.rs", "activation::issue_grant("),
+    // BE-Q25: takes `sessions::issue`'s transaction.
+    ("core/src/devices.rs", "devices::record_client("),
+    // BE-Q25 revision 1: the orphan prune, which grant/handoff issue and a subscription change call
+    // with their own transaction. (Revision 2: a sync registration also calls it, unqualified and
+    // outside begin_serial(), holding the account's membership ordering point instead; its
+    // `&Ordered` parameter and `every_membership_change_holds_the_account_ordering_point` cover
+    // that caller.)
+    ("core/src/devices.rs", "devices::forget_unlisted("),
 ];
 
 /// Helpers that acquire `begin_serial()`/`begin_retirement()` themselves and hand the open
@@ -795,47 +880,97 @@ fn every_member_writer_is_listed_with_its_coordination() {
     );
 }
 
-#[test]
-fn each_writer_still_has_the_ordering_it_is_listed_with() {
-    let files = sources();
+/// The check behind `each_writer_still_has_the_ordering_it_is_listed_with`, pulled out so a
+/// negative control can run it against a mutated in-memory copy of the sources (BE-Q25).
+fn check_writer_ordering(files: &[(String, String)]) -> Result<(), String> {
     for e in inventory() {
         let source = &files
             .iter()
             .find(|(file, _)| file == e.file)
-            .unwrap_or_else(|| panic!("{} is not a source file", e.file))
+            .ok_or_else(|| format!("{} is not a source file", e.file))?
             .1;
         let function = functions(source)
             .into_iter()
             .map(|(_, f)| f)
             .find(|f| f.name == e.function)
-            .unwrap_or_else(|| panic!("no function {} in {}", e.function, e.file));
+            .ok_or_else(|| format!("no function {} in {}", e.function, e.file))?;
         let signature_end = function.text.find('{').unwrap_or(function.text.len());
         let takes_transaction = function.text[..signature_end].contains("Transaction<");
         let serial =
             calls(&function.text, "begin_serial(") || calls(&function.text, "begin_retirement(");
         match e.coordination {
-            Serial => assert!(
-                serial || takes_transaction,
-                "{}::{} is listed as running inside begin_serial() but does not",
-                e.file,
-                e.function
-            ),
-            RowLock | Own => assert!(
-                !serial,
-                "{}::{} is listed as ordered by its own lock but now runs inside begin_serial(); \
-                 update the table",
-                e.file, e.function
-            ),
+            Serial if !(serial || takes_transaction) => {
+                return Err(format!(
+                    "{}::{} is listed as running inside begin_serial() but does not",
+                    e.file, e.function
+                ));
+            }
+            RowLock | Own if serial => {
+                return Err(format!(
+                    "{}::{} is listed as ordered by its own lock but now runs inside \
+                     begin_serial(); update the table",
+                    e.file, e.function
+                ));
+            }
+            _ => {}
         }
-        if let Some(needs) = e.needs {
-            assert!(
-                function.text.contains(needs),
+        if let Some(needs) = e.needs
+            && !function.text.contains(needs)
+        {
+            return Err(format!(
                 "{}::{} lost the ordering point `{needs}` its coordination relies on",
-                e.file,
-                e.function
-            );
+                e.file, e.function
+            ));
         }
     }
+    Ok(())
+}
+
+#[test]
+fn each_writer_still_has_the_ordering_it_is_listed_with() {
+    if let Err(message) = check_writer_ordering(&sources()) {
+        panic!("{message}");
+    }
+}
+
+/// BE-Q25 negative control (mutation M7): a rename whose transaction is no longer `begin_serial()`
+/// would not be ordered against a retirement, so the guard must fail on it, including when the
+/// old call survives only in a comment.
+#[test]
+fn guard_fails_when_a_rename_bypasses_begin_serial() {
+    for replacement in [
+        "self.pool.begin()",
+        "/* previously self.begin_serial() */ self.pool.begin()",
+    ] {
+        let files = mutate_function(
+            &sources(),
+            "core/src/devices.rs",
+            "set_name_once",
+            "self.begin_serial()",
+            replacement,
+        );
+        assert!(
+            check_writer_ordering(&files).is_err(),
+            "the guard passed even though set_name_once opens {replacement}"
+        );
+    }
+}
+
+/// BE-Q25: `record_client` takes a transaction, so the guard must also reject a caller of it that
+/// is not itself serialised (here: a call moved into the unserialised `revoke` handler).
+#[test]
+fn guard_fails_when_record_client_is_reached_outside_begin_serial() {
+    let files = mutate_function(
+        &sources(),
+        "server/src/sessions.rs",
+        "revoke",
+        "hook!(app.store, \"session_delete.after_identity\");",
+        "atlas_core::devices::record_client(todo!(), &account, &id, todo!(), 0).await?;",
+    );
+    assert!(
+        check_transaction_helpers_reached_only_from_serialised_writers(&files).is_err(),
+        "the guard passed even though record_client is called from the unserialised revoke"
+    );
 }
 
 /// The actual check behind `transaction_helpers_are_only_reached_from_serialised_writers`,
@@ -1095,4 +1230,864 @@ fn guard_fails_when_authenticate_local_hides_begin_serial_after_a_quote_char_lit
          inside a string that follows a quote char literal, exactly the review's independent \
          reproduction of R5's second round"
     );
+}
+
+/// BE-Q25 revision 1 (R1/R2, family `device-profile-membership-boundary`): every statement that can
+/// give a device a live member, with the call that must precede it in the same function. That call
+/// drops the profiles of unlisted devices (`forget_unlisted`, or `record_client`, which starts with
+/// it), so a forgotten device is listed again unnamed whichever transition lists it.
+///
+/// Revision 2 (Review 2 R1B): `sync_once`'s registration insert is listed too. Revision 1 exempted
+/// it on the claim that the authenticating session keeps the device listed, but authentication is
+/// an earlier, separate read: the session can be signed out, and a listing can see the device
+/// absent, before the registration commits. It now prunes, holding the ordering point.
+const LISTING_WRITERS: [(&str, &str, &str, &str); 7] = [
+    (
+        "server/src/sessions.rs",
+        "issue",
+        "INSERT INTO sessions",
+        "record_client(",
+    ),
+    (
+        "server/src/activation.rs",
+        "issue_grant",
+        "INSERT INTO activation_grants",
+        "forget_unlisted(",
+    ),
+    (
+        "server/src/oidc.rs",
+        "callback",
+        "INSERT INTO native_handoffs",
+        "forget_unlisted(",
+    ),
+    (
+        "core/src/calendars/reminders.rs",
+        "reminder_command",
+        "INSERT INTO notification_subscriptions",
+        "forget_unlisted(",
+    ),
+    // Re-enabling a subscription, or moving it to another device ID, also lists a device.
+    (
+        "core/src/calendars/reminders.rs",
+        "reminder_command",
+        "UPDATE notification_subscriptions SET device_id",
+        "forget_unlisted(",
+    ),
+    (
+        "core/src/devices.rs",
+        "record_client",
+        "INSERT INTO device_profiles",
+        "forget_unlisted(",
+    ),
+    (
+        "core/src/sync.rs",
+        "sync_once",
+        "INSERT INTO sync_devices",
+        "forget_unlisted(",
+    ),
+];
+
+/// Member tables whose insert lists a device.
+const LISTING_TABLES: [&str; 5] = [
+    "sessions",
+    "native_handoffs",
+    "notification_subscriptions",
+    "activation_grants",
+    "sync_devices",
+];
+
+fn check_listing_writers(files: &[(String, String)]) -> Result<(), String> {
+    // Completeness: a new insert into a member table must be classified here.
+    for ((file, function, verb, table), _) in discovered(files) {
+        if verb == "INSERT INTO"
+            && LISTING_TABLES.contains(&table.as_str())
+            && !LISTING_WRITERS.iter().any(|(f, n, statement, _)| {
+                *f == file && *n == function && statement.ends_with(&table)
+            })
+        {
+            return Err(format!(
+                "{file}::{function} inserts into {table}, which lists a device: it must call \
+                 forget_unlisted first and be added to LISTING_WRITERS"
+            ));
+        }
+    }
+    for (file, name, statement, prune) in LISTING_WRITERS {
+        let source = &files
+            .iter()
+            .find(|(f, _)| f == file)
+            .ok_or_else(|| format!("{file} is not a source file"))?
+            .1;
+        let function = functions(source)
+            .into_iter()
+            .map(|(_, f)| f)
+            .find(|f| f.name == name)
+            .ok_or_else(|| format!("no function {name} in {file}"))?;
+        let at = function
+            .text
+            .find(statement)
+            .ok_or_else(|| format!("{file}::{name} no longer contains `{statement}`"))?;
+        // `mask_non_code` keeps byte offsets, so a call hidden in a comment or string is not found
+        // and the executable call's position compares directly with the statement's.
+        let pruned = mask_non_code(&function.text).find(prune);
+        if pruned.is_none_or(|p| p > at) {
+            return Err(format!(
+                "{file}::{name} runs `{statement}` without first calling `{prune}`: a forgotten \
+                 device could be listed again with its old name"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn every_listing_writer_forgets_unlisted_profiles_first() {
+    if let Err(message) = check_listing_writers(&sources()) {
+        panic!("{message}");
+    }
+}
+
+/// Negative controls for the check above: the grant insert without its prune (the R1 defect),
+/// the prune retained only in a comment, the handoff insert running before its prune, and an
+/// unclassified new insert into a member table.
+#[test]
+fn guard_fails_when_a_listing_writer_skips_the_prune() {
+    let prune = "atlas_core::devices::forget_unlisted(tx, ordered, &Continuity::Unknown).await?;";
+    let cases = [
+        mutate_function(
+            &sources(),
+            "server/src/activation.rs",
+            "issue_grant",
+            prune,
+            "",
+        ),
+        mutate_function(
+            &sources(),
+            "server/src/activation.rs",
+            "issue_grant",
+            prune,
+            "/* atlas_core::devices::forget_unlisted(tx, ordered, &Continuity::Unknown) */",
+        ),
+        mutate_function(
+            &sources(),
+            "server/src/oidc.rs",
+            "callback",
+            "atlas_core::devices::forget_unlisted(&mut tx, &ordered, &Continuity::Unknown).await?;",
+            "",
+        ),
+        // Review 2 R1B: the registration insert without its prune.
+        mutate_function(
+            &sources(),
+            "core/src/sync.rs",
+            "sync_once",
+            "forget_unlisted(&mut tx, &ordered, &Continuity::Unknown).await?;",
+            "",
+        ),
+        mutate_function(
+            &sources(),
+            "server/src/sessions.rs",
+            "revoke",
+            "hook!(app.store, \"session_delete.after_identity\");",
+            "sqlx::query(\"INSERT INTO sessions(token_hash) VALUES ($1)\");",
+        ),
+    ];
+    let expected = [
+        "issue_grant runs `INSERT INTO activation_grants` without",
+        "issue_grant runs `INSERT INTO activation_grants` without",
+        "callback runs `INSERT INTO native_handoffs` without",
+        "sync_once runs `INSERT INTO sync_devices` without",
+        "revoke inserts into sessions",
+    ];
+    for (files, expected) in cases.iter().zip(expected) {
+        let message = check_listing_writers(files).expect_err(expected);
+        assert!(message.contains(expected), "{message}");
+    }
+    // The handoff insert moved ahead of the prune.
+    let mut files = sources();
+    let entry = files
+        .iter_mut()
+        .find(|(f, _)| f == "server/src/oidc.rs")
+        .unwrap();
+    let prune =
+        "atlas_core::devices::forget_unlisted(&mut tx, &ordered, &Continuity::Unknown).await?;";
+    assert_eq!(entry.1.matches(prune).count(), 1);
+    entry.1 = entry.1.replacen(prune, "", 1);
+    let close = entry
+        .1
+        .find("tx.commit().await?;\n        let mut destination")
+        .unwrap();
+    entry.1.insert_str(close, prune);
+    let message = check_listing_writers(&files).expect_err("prune after the handoff insert");
+    assert!(
+        message.contains("callback runs `INSERT INTO native_handoffs` without"),
+        "{message}"
+    );
+}
+
+/// How a statement that changes an account's device membership, or a device profile, holds the
+/// account's membership ordering point (BE-Q25 revision 2, Review 2 R1).
+#[derive(Clone, Copy)]
+enum Held {
+    /// The function itself calls `order_membership(` before every such statement.
+    Takes,
+    /// The function takes `&Ordered`, which only `order_membership` makes, so its caller held the
+    /// point to call it.
+    Given,
+    /// A transaction helper, reached only from these functions, each of which holds the point
+    /// before the call (or is itself a `Reached` helper).
+    Reached(&'static [&'static str]),
+    /// Not a change of membership; the reason.
+    Exempt(&'static str),
+}
+use Held::*;
+
+/// Every `(file, function, verb, table)` of the inventory above, with how it holds the point.
+const MEMBERSHIP_ORDER: [(&str, &str, &str, &str, Held); 43] = [
+    (
+        "server/src/activation.rs",
+        "issue_grant",
+        "DELETE FROM",
+        "activation_grants",
+        Given,
+    ),
+    (
+        "server/src/activation.rs",
+        "issue_grant",
+        "INSERT INTO",
+        "activation_grants",
+        Given,
+    ),
+    (
+        "server/src/activation.rs",
+        "activate",
+        "UPDATE",
+        "activation_grants",
+        Takes,
+    ),
+    (
+        "server/src/activation.rs",
+        "activate_cancel",
+        "UPDATE",
+        "activation_grants",
+        Takes,
+    ),
+    (
+        "server/src/activation.rs",
+        "activate_cancel",
+        "DELETE FROM",
+        "sessions",
+        Takes,
+    ),
+    (
+        "server/src/sessions.rs",
+        "change_password",
+        "UPDATE",
+        "activation_grants",
+        Takes,
+    ),
+    (
+        "server/src/sessions.rs",
+        "change_password",
+        "DELETE FROM",
+        "native_handoffs",
+        Takes,
+    ),
+    (
+        "server/src/sessions.rs",
+        "change_password",
+        "DELETE FROM",
+        "sessions",
+        Takes,
+    ),
+    (
+        "server/src/sessions.rs",
+        "reset_password",
+        "UPDATE",
+        "activation_grants",
+        Takes,
+    ),
+    (
+        "server/src/sessions.rs",
+        "reset_password",
+        "DELETE FROM",
+        "native_handoffs",
+        Takes,
+    ),
+    (
+        "server/src/sessions.rs",
+        "reset_password",
+        "DELETE FROM",
+        "sessions",
+        Takes,
+    ),
+    (
+        "server/src/sessions.rs",
+        "unlink_oidc",
+        "UPDATE",
+        "activation_grants",
+        Takes,
+    ),
+    (
+        "server/src/sessions.rs",
+        "unlink_oidc",
+        "DELETE FROM",
+        "native_handoffs",
+        Takes,
+    ),
+    (
+        "server/src/sessions.rs",
+        "unlink_oidc",
+        "DELETE FROM",
+        "sessions",
+        Takes,
+    ),
+    (
+        "server/src/sessions.rs",
+        "revoke",
+        "DELETE FROM",
+        "sessions",
+        Takes,
+    ),
+    (
+        "server/src/sessions.rs",
+        "issue",
+        "DELETE FROM",
+        "sessions",
+        Given,
+    ),
+    (
+        "server/src/sessions.rs",
+        "issue",
+        "INSERT INTO",
+        "sessions",
+        Given,
+    ),
+    (
+        "server/src/lib.rs",
+        "logout",
+        "DELETE FROM",
+        "sessions",
+        Takes,
+    ),
+    (
+        "server/src/oidc.rs",
+        "callback",
+        "DELETE FROM",
+        "native_handoffs",
+        Takes,
+    ),
+    (
+        "server/src/oidc.rs",
+        "callback",
+        "INSERT INTO",
+        "native_handoffs",
+        Takes,
+    ),
+    (
+        "server/src/oidc.rs",
+        "native_exchange",
+        "DELETE FROM",
+        "native_handoffs",
+        Takes,
+    ),
+    (
+        "core/src/devices.rs",
+        "cancel_grants",
+        "UPDATE",
+        "activation_grants",
+        Reached(&["retire_members"]),
+    ),
+    (
+        "core/src/devices.rs",
+        "retire_members",
+        "DELETE FROM",
+        "sync_devices",
+        Reached(&["retire_once"]),
+    ),
+    (
+        "core/src/devices.rs",
+        "retire_members",
+        "UPDATE",
+        "notification_subscriptions",
+        Reached(&["retire_once"]),
+    ),
+    (
+        "core/src/devices.rs",
+        "retire_members",
+        "DELETE FROM",
+        "device_profiles",
+        Reached(&["retire_once"]),
+    ),
+    (
+        "core/src/devices.rs",
+        "delete_identities",
+        "DELETE FROM",
+        "{table}",
+        Reached(&["retire_members"]),
+    ),
+    (
+        "core/src/devices.rs",
+        "revoke_once",
+        "DELETE FROM",
+        "sessions",
+        Takes,
+    ),
+    (
+        "core/src/devices.rs",
+        "forget_unlisted",
+        "DELETE FROM",
+        "device_profiles",
+        Given,
+    ),
+    (
+        "core/src/devices.rs",
+        "record_client",
+        "INSERT INTO",
+        "device_profiles",
+        Given,
+    ),
+    (
+        "core/src/devices.rs",
+        "set_name_once",
+        "INSERT INTO",
+        "device_profiles",
+        Takes,
+    ),
+    (
+        "core/src/devices.rs",
+        "set_name_once",
+        "UPDATE",
+        "device_profiles",
+        Takes,
+    ),
+    (
+        "core/src/calendars/reminders.rs",
+        "reminder_command",
+        "INSERT INTO",
+        "notification_subscriptions",
+        Takes,
+    ),
+    (
+        "core/src/calendars/reminders.rs",
+        "reminder_command",
+        "UPDATE",
+        "notification_subscriptions",
+        Takes,
+    ),
+    (
+        "core/src/sync.rs",
+        "sync_once",
+        "INSERT INTO",
+        "sync_devices",
+        Takes,
+    ),
+    (
+        "core/src/sync.rs",
+        "sync_once",
+        "UPDATE",
+        "sync_devices",
+        Exempt(
+            "refreshes `last_seen` of a registration that exists; lists nothing new, removes nothing",
+        ),
+    ),
+    (
+        "core/src/sync.rs",
+        "collect_expired",
+        "DELETE FROM",
+        "sync_devices",
+        Takes,
+    ),
+    (
+        "core/src/sync.rs",
+        "collect_expired",
+        "DELETE FROM",
+        "native_handoffs",
+        Exempt(
+            "only rows expired at the sweep's time, which no listing at that time or later counts",
+        ),
+    ),
+    (
+        "core/src/sync.rs",
+        "collect_expired",
+        "DELETE FROM",
+        "sessions",
+        Exempt(
+            "only rows expired at the sweep's time, which no listing at that time or later counts",
+        ),
+    ),
+    (
+        "core/src/storage/mod.rs",
+        "prepare_restored_database",
+        "DELETE FROM",
+        "device_profiles",
+        Exempt(
+            "restore preparation with every server stopped: forgets every device and every profile",
+        ),
+    ),
+    (
+        "core/src/storage/mod.rs",
+        "prepare_restored_database",
+        "DELETE FROM",
+        "native_handoffs",
+        Exempt("restore preparation with every server stopped"),
+    ),
+    (
+        "core/src/storage/mod.rs",
+        "prepare_restored_database",
+        "DELETE FROM",
+        "sessions",
+        Exempt("restore preparation with every server stopped"),
+    ),
+    (
+        "core/src/storage/mod.rs",
+        "prepare_restored_database",
+        "DELETE FROM",
+        "sync_devices",
+        Exempt("restore preparation with every server stopped"),
+    ),
+    (
+        "core/src/storage/mod.rs",
+        "prepare_restored_database",
+        "DELETE FROM",
+        "activation_grants",
+        Exempt("restore preparation with every server stopped"),
+    ),
+];
+
+fn function_in(files: &[(String, String)], file: &str, name: &str) -> Result<Function, String> {
+    let source = &files
+        .iter()
+        .find(|(f, _)| f == file)
+        .ok_or_else(|| format!("{file} is not a source file"))?
+        .1;
+    functions(source)
+        .into_iter()
+        .map(|(_, f)| f)
+        .find(|f| f.name == name)
+        .ok_or_else(|| format!("no function {name} in {file}"))
+}
+
+const ORDER_CALL: &str = "order_membership(";
+
+fn check_membership_order(files: &[(String, String)]) -> Result<(), String> {
+    // Completeness, both ways: every member or profile writer is classified here.
+    let found = discovered(files);
+    for (file, function, verb, table) in found.keys() {
+        if !MEMBERSHIP_ORDER
+            .iter()
+            .any(|(f, n, v, t, _)| f == file && n == function && v == verb && t == table)
+        {
+            return Err(format!(
+                "{file}::{function} runs `{verb} {table}` but MEMBERSHIP_ORDER does not say how \
+                 it holds the account's membership ordering point"
+            ));
+        }
+    }
+    for (file, name, verb, table, held) in MEMBERSHIP_ORDER {
+        let key = (
+            file.to_owned(),
+            name.to_owned(),
+            verb.to_owned(),
+            table.to_owned(),
+        );
+        if !found.contains_key(&key) {
+            return Err(format!("{file}::{name} no longer runs `{verb} {table}`"));
+        }
+        let function = function_in(files, file, name)?;
+        let code = mask_non_code(&function.text);
+        match held {
+            Takes => {
+                let statement = format!("{verb} {table}");
+                let first_order = code.find(ORDER_CALL);
+                for (at, _) in function.text.match_indices(&statement) {
+                    if first_order.is_none_or(|order| order > at) {
+                        return Err(format!(
+                            "{file}::{name} runs `{statement}` before calling `{ORDER_CALL}`: a \
+                             removal or a listing could interleave with its membership decision"
+                        ));
+                    }
+                }
+            }
+            Given => {
+                let signature_end = function.text.find('{').unwrap_or(function.text.len());
+                if !function.text[..signature_end].contains("&Ordered") {
+                    return Err(format!(
+                        "{file}::{name} no longer takes `&Ordered`, so nothing proves its caller \
+                         holds the account's membership ordering point"
+                    ));
+                }
+            }
+            Reached(callers) => {
+                let call = format!("::{name}(");
+                let mut sites = 0;
+                for (source_file, source) in files {
+                    let functions = functions(source);
+                    let masked = mask_non_code(source);
+                    for (at, _) in masked.match_indices(&call) {
+                        sites += 1;
+                        let caller = enclosing(&functions, at).ok_or_else(|| {
+                            format!("{source_file}: a call to {name} sits outside any function")
+                        })?;
+                        if !callers.contains(&caller.name.as_str()) {
+                            return Err(format!(
+                                "{source_file}::{} calls {name}, which only {callers:?} may call",
+                                caller.name
+                            ));
+                        }
+                        let caller_reached = MEMBERSHIP_ORDER
+                            .iter()
+                            .any(|(_, n, _, _, h)| *n == caller.name && matches!(h, Reached(_)));
+                        let start = functions
+                            .iter()
+                            .find(|(_, f)| f.name == caller.name && f.text == caller.text)
+                            .map(|(s, _)| *s)
+                            .unwrap();
+                        let ordered_before = mask_non_code(&caller.text)
+                            .find(ORDER_CALL)
+                            .is_some_and(|order| start + order < at);
+                        if !(caller_reached || ordered_before) {
+                            return Err(format!(
+                                "{source_file}::{} calls {name} without first calling \
+                                 `{ORDER_CALL}`",
+                                caller.name
+                            ));
+                        }
+                    }
+                }
+                if sites == 0 {
+                    return Err(format!("{file}::{name} is no longer called"));
+                }
+            }
+            Exempt(reason) => {
+                if reason.is_empty() {
+                    return Err(format!("{file}::{name} is exempt without a reason"));
+                }
+            }
+        }
+    }
+    // The ordering point itself: the account row's no-op update, and the time read after it.
+    let order = function_in(files, "core/src/devices.rs", "order_membership")?;
+    let update = order
+        .text
+        .find("UPDATE accounts SET access_epoch=access_epoch WHERE id=$1")
+        .ok_or("order_membership no longer updates the account row")?;
+    if mask_non_code(&order.text)
+        .find("clock.now()")
+        .is_none_or(|time| time < update)
+    {
+        return Err("order_membership reads its time before taking the account row".into());
+    }
+    Ok(())
+}
+
+#[test]
+fn every_membership_change_holds_the_account_ordering_point() {
+    if let Err(message) = check_membership_order(&sources()) {
+        panic!("{message}");
+    }
+}
+
+/// Negative controls: the review's two routes (sign-out without the point; a sync registration
+/// without it), a handoff insert before the point, the account update gone from the point itself,
+/// a retirement helper called from an unordered function, and an unclassified new writer.
+#[test]
+fn guard_fails_when_a_membership_change_skips_the_ordering_point() {
+    let cases = [
+        (
+            mutate_function(
+                &sources(),
+                "server/src/lib.rs",
+                "logout",
+                "atlas_core::devices::order_membership(&mut tx, &account, &now).await?;",
+                "",
+            ),
+            "logout runs `DELETE FROM sessions` before calling",
+        ),
+        (
+            mutate_function(
+                &sources(),
+                "core/src/sync.rs",
+                "sync_once",
+                "let ordered = order_membership(&mut tx, actor, time).await?;",
+                "/* let ordered = order_membership(&mut tx, actor, time).await?; */",
+            ),
+            "sync_once runs `INSERT INTO sync_devices` before calling",
+        ),
+        (
+            mutate_function(
+                &sources(),
+                "core/src/sync.rs",
+                "collect_expired",
+                "order_membership(&mut tx, &account, &now).await?;",
+                "",
+            ),
+            "collect_expired runs `DELETE FROM sync_devices` before calling",
+        ),
+        (
+            mutate_function(
+                &sources(),
+                "core/src/devices.rs",
+                "order_membership",
+                "UPDATE accounts SET access_epoch=access_epoch WHERE id=$1",
+                "SELECT id FROM accounts WHERE id=$1",
+            ),
+            "order_membership no longer updates the account row",
+        ),
+        (
+            mutate_function(
+                &sources(),
+                "server/src/sessions.rs",
+                "revoke",
+                "hook!(app.store, \"session_delete.after_identity\");",
+                "atlas_core::Store::retire_members(todo!(), todo!(), todo!(), todo!(), 0);",
+            ),
+            "calls retire_members, which only",
+        ),
+        (
+            mutate_function(
+                &sources(),
+                "server/src/sessions.rs",
+                "me",
+                "let (account, _) = identity(&app, &headers).await?;",
+                "let (account, _) = identity(&app, &headers).await?; sqlx::query(\"DELETE FROM sync_devices WHERE account_id=$1\");",
+            ),
+            "me runs `DELETE FROM sync_devices` but MEMBERSHIP_ORDER",
+        ),
+    ];
+    for (files, expected) in cases {
+        let message = check_membership_order(&files).expect_err(expected);
+        assert!(message.contains(expected), "{message}");
+    }
+    // The handoff statements moved ahead of the point (the point stays, later).
+    let order =
+        "let ordered = atlas_core::devices::order_membership(&mut tx, &account, &now).await?;";
+    let late = "tx.commit().await?;\n        let mut destination";
+    let files = mutate_function(&sources(), "server/src/oidc.rs", "callback", order, "");
+    let files = mutate_function(
+        &files,
+        "server/src/oidc.rs",
+        "callback",
+        late,
+        &format!("{order}{late}"),
+    );
+    let message = check_membership_order(&files).expect_err("point after the handoff insert");
+    assert!(
+        message.contains("callback runs `DELETE FROM native_handoffs` before calling"),
+        "{message}"
+    );
+}
+
+/// The reads that show device profiles, each of which must open its transaction with
+/// `begin_membership_read(` and read its time only after it (BE-Q25 revision 2, design-assessment
+/// decision P1: listings participate in the ordering).
+const PROFILE_READERS: [(&str, &str); 2] = [
+    ("core/src/devices.rs", "devices_once"),
+    ("core/src/devices.rs", "sessions_once"),
+];
+
+fn check_profile_readers(files: &[(String, String)]) -> Result<(), String> {
+    for (file, source) in files {
+        for (_, function) in functions(source) {
+            if function.text.contains("JOIN device_profiles")
+                && !PROFILE_READERS
+                    .iter()
+                    .any(|(f, n)| f == file && *n == function.name)
+            {
+                return Err(format!(
+                    "{file}::{} reads device_profiles but is not a PROFILE_READER",
+                    function.name
+                ));
+            }
+        }
+    }
+    for (file, name) in PROFILE_READERS {
+        let function = function_in(files, file, name)?;
+        let code = mask_non_code(&function.text);
+        let begin = code
+            .find("self.begin_membership_read(")
+            .ok_or_else(|| format!("{file}::{name} no longer opens begin_membership_read()"))?;
+        let time = code
+            .find("clock.now()")
+            .ok_or_else(|| format!("{file}::{name} no longer reads its clock"))?;
+        if time < begin {
+            return Err(format!(
+                "{file}::{name} reads its time before taking the ordering point"
+            ));
+        }
+        if code.contains("pool.begin(") {
+            return Err(format!("{file}::{name} opens an unordered transaction"));
+        }
+        let join = function
+            .text
+            .find("JOIN device_profiles")
+            .ok_or_else(|| format!("{file}::{name} no longer reads device_profiles"))?;
+        if join < begin {
+            return Err(format!(
+                "{file}::{name} reads profiles before the ordering point"
+            ));
+        }
+    }
+    let begin = function_in(files, "core/src/devices.rs", "begin_membership_read")?;
+    for needed in ["BEGIN IMMEDIATE", "REPEATABLE READ", "FOR SHARE"] {
+        if !begin.text.contains(needed) {
+            return Err(format!("begin_membership_read no longer uses `{needed}`"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn every_profile_reader_reads_its_time_after_the_ordering_point() {
+    if let Err(message) = check_profile_readers(&sources()) {
+        panic!("{message}");
+    }
+}
+
+#[test]
+fn guard_fails_when_a_profile_reader_skips_the_ordering_point() {
+    let cases = [
+        (
+            mutate_function(
+                &sources(),
+                "core/src/devices.rs",
+                "devices_once",
+                "let mut tx = self.begin_membership_read(actor).await?;",
+                "let mut tx = self.pool.begin().await?;",
+            ),
+            "devices_once no longer opens begin_membership_read()",
+        ),
+        (
+            mutate_function(
+                &sources(),
+                "core/src/devices.rs",
+                "sessions_once",
+                "let mut tx = self.begin_membership_read(actor).await?;\n        let now = clock.now();",
+                "let now = clock.now();\n        let mut tx = self.begin_membership_read(actor).await?;",
+            ),
+            "sessions_once reads its time before taking the ordering point",
+        ),
+        (
+            mutate_function(
+                &sources(),
+                "core/src/devices.rs",
+                "begin_membership_read",
+                "SELECT id FROM accounts WHERE id=$1 FOR SHARE",
+                "SELECT id FROM accounts WHERE id=$1",
+            ),
+            "begin_membership_read no longer uses `FOR SHARE`",
+        ),
+        (
+            mutate_function(
+                &sources(),
+                "server/src/sessions.rs",
+                "me",
+                "let (account, _) = identity(&app, &headers).await?;",
+                "let (account, _) = identity(&app, &headers).await?; sqlx::query(\"SELECT p.name FROM sessions s LEFT JOIN device_profiles p\");",
+            ),
+            "me reads device_profiles but is not a PROFILE_READER",
+        ),
+    ];
+    for (files, expected) in cases {
+        let message = check_profile_readers(&files).expect_err(expected);
+        assert!(message.contains(expected), "{message}");
+    }
 }

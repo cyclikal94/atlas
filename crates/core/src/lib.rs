@@ -55,6 +55,12 @@ impl Store {
     pub fn hooks(&self) -> &hooks::Hooks {
         &self.hooks
     }
+
+    /// Reach `point` inside a caller's transaction (the server's in-transaction hook points), so
+    /// an armed point records its PostgreSQL backend like the store's own points do.
+    pub async fn reach_in(&self, point: &str, tx: &mut Transaction<'_, Any>) -> Result<()> {
+        self.hooks.reach_in(point, tx, self.sqlite).await
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

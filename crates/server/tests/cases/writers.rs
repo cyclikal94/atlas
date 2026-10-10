@@ -2,7 +2,8 @@
 //! paused retirement in both orders, on both engines: session issue (native login), native-handoff
 //! creation (the native OIDC callback) and consumption (the native exchange), password change, and
 //! BE-Q19's activation-grant issue/redeem/cancel (`POST /browser-sessions`, `.../activate` and
-//! `.../activate/cancel`). Subscription set is a core function and is in `atlas-core`'s
+//! `.../activate/cancel`), and BE-Q25's device rename, which writes no member but must still be
+//! ordered against the retirement that deletes its profile. Subscription set is a core function and is in `atlas-core`'s
 //! `retirement_coordination`.
 //!
 //! Every case asserts (i) the ledger row, (ii) the writer's own HTTP result and (iii) the rows that
@@ -666,6 +667,62 @@ async fn password_change(order: Order, caller: Caller, beside: Beside, raise: bo
     Ok(())
 }
 
+// ------------------------------------------------------------------------- device rename (BE-Q25)
+
+/// `PUT /devices/phone/name`, authenticated by the laptop. A name is not a member of the approved
+/// state, so it never makes the retirement stale. Writer first: the rename commits, the retirement
+/// still applies and deletes the profile with the device. Retirement first: the rename waits for
+/// the retirement, then finds the phone no longer listed: `404`, and no profile is recreated.
+async fn rename(order: Order, raise: bool) -> Result<()> {
+    let s = scene(raise).await?;
+    let op = id();
+    let raced = race(&s, order, &op, |s| {
+        spawn_request_with(
+            &s.w.app,
+            "PUT",
+            "devices/phone/name".into(),
+            vec![("authorization".into(), bearer(&s.laptop))],
+            json!({"name":"Kieran's phone"}),
+        )
+    })
+    .await?;
+    let context = format!("rename, {order:?}");
+    assert_retirement(
+        &raced.retirement,
+        StatusCode::OK,
+        "confirmed_applied",
+        &context,
+    );
+    ledger_is(&s.w, &op, "confirmed_applied", &context).await?;
+    match order {
+        Order::WriterFirst => assert_eq!(
+            raced.writer.0,
+            StatusCode::NO_CONTENT,
+            "{context}: {}",
+            raced.writer.2
+        ),
+        Order::RetirementFirst => assert_eq!(
+            (raced.writer.0, raced.writer.2["code"].as_str()),
+            (StatusCode::NOT_FOUND, Some("not_found")),
+            "{context}: {}",
+            raced.writer.2
+        ),
+    }
+    let profiles: Vec<String> = sqlx::query_scalar(
+        "SELECT device_id FROM device_profiles WHERE account_id=$1 ORDER BY device_id",
+    )
+    .bind(&s.w.alice)
+    .fetch_all(&s.w.store.pool)
+    .await?;
+    assert_eq!(
+        profiles,
+        ["laptop"],
+        "{context}: the phone's profile is gone"
+    );
+    assert!(rows(&s.w).await?.sessions.is_empty(), "{context}");
+    Ok(())
+}
+
 // ------------------------------------------------------------------------------------ tests
 
 macro_rules! both_orders {
@@ -712,6 +769,11 @@ both_orders!(
     handoff_consume
 );
 both_orders!(
+    a_rename_first_does_not_stale_the_retirement_and_is_deleted_with_the_device,
+    a_rename_after_the_retirement_finds_nothing_and_writes_nothing,
+    rename
+);
+both_orders!(
     a_password_change_first_supersedes_a_session_only_device,
     a_password_change_by_another_device_after_the_retirement_succeeds,
     |order, raise| password_change(order, Caller::Laptop, Beside::NothingElse, raise)
@@ -741,6 +803,7 @@ async fn every_real_writer_also_passes_at_repeatable_read() -> Result<()> {
         grant_cancel(order, true).await?;
         handoff_create(order, true).await?;
         handoff_consume(order, true).await?;
+        rename(order, true).await?;
         for (caller, beside) in [
             (Caller::Laptop, Beside::NothingElse),
             (Caller::Laptop, Beside::ASubscription),

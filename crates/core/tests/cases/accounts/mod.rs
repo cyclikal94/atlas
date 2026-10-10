@@ -1,5 +1,6 @@
 mod activation_grants;
 mod approved_state;
+mod device_names;
 mod device_quota;
 mod device_retirement;
 mod retirement_coordination;

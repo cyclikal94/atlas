@@ -181,7 +181,17 @@ pub(super) async fn register(
     .map_err(|_| anyhow!(ErrorCode::InternalError))??;
     let mut tx = app.store.begin_serial().await?;
     let account = create_account(&mut tx, &input.token, &input.username, &password).await?;
-    let (session, _) = sessions::issue(&mut tx, &account, &input.device_id, "local").await?;
+    let client = labels::client(&headers, Channel::Native);
+    let ordered = atlas_core::devices::order_membership(&mut tx, &account, &now).await?;
+    let (session, _) = sessions::issue(
+        &mut tx,
+        &ordered,
+        &input.device_id,
+        "local",
+        &client,
+        &Continuity::Unknown,
+    )
+    .await?;
     tx.commit().await?;
     Ok(Json(session))
 }
@@ -248,13 +258,13 @@ pub(super) async fn browser_register(
     .map_err(|_| anyhow!(ErrorCode::InternalError))??;
     let mut tx = app.store.begin_serial().await?;
     let account = create_account(&mut tx, &input.token, &input.username, &password).await?;
+    let ordered = atlas_core::devices::order_membership(&mut tx, &account, &now).await?;
     let grant = activation::issue_grant(
         &mut tx,
-        &account,
+        &ordered,
         &input.device_id,
         "local",
         &input.attempt_challenge,
-        now(),
     )
     .await?;
     tx.commit().await?;

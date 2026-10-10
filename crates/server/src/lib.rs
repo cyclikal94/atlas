@@ -8,6 +8,9 @@ macro_rules! hook {
     ($store:expr, $point:literal) => {
         $store.hooks().reach($point).await
     };
+    ($store:expr, $point:literal, $tx:expr) => {
+        $store.reach_in($point, $tx).await?
+    };
 }
 #[cfg(not(feature = "test-hooks"))]
 macro_rules! hook {
@@ -25,6 +28,7 @@ mod error;
 pub use error::ApiError;
 mod activation;
 mod browser;
+mod labels;
 mod sessions;
 pub use sessions::reset_password;
 mod oidc;
@@ -40,7 +44,10 @@ use argon2::{
     Argon2,
     password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash},
 };
-use atlas_core::{Command, Store};
+use atlas_core::{
+    Command, Store,
+    devices::{Channel, Continuity},
+};
 use axum::{
     Extension, Json, Router,
     extract::Request,
@@ -51,7 +58,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -187,7 +194,17 @@ async fn login(
     )?;
     let (mut tx, account_id) =
         authenticate_local(&app, peer, &headers, input.username, input.password).await?;
-    let (session, _) = sessions::issue(&mut tx, &account_id, &input.device_id, "local").await?;
+    let client = labels::client(&headers, Channel::Native);
+    let ordered = atlas_core::devices::order_membership(&mut tx, &account_id, &now).await?;
+    let (session, _) = sessions::issue(
+        &mut tx,
+        &ordered,
+        &input.device_id,
+        "local",
+        &client,
+        &Continuity::Unknown,
+    )
+    .await?;
     tx.commit().await?;
     Ok(Json(session))
 }
@@ -301,13 +318,20 @@ async fn identity(app: &App, headers: &HeaderMap) -> Result<(String, String), Ap
 /// Deletes the presented credential's own session row and nothing else. No `Set-Cookie` is
 /// sent: the row's deletion already revokes the credential, and a cookie decision made from state
 /// read now but delivered later could clear the cookie of a newer login.
+///
+/// A removal of a member, so the deletion holds the account's membership ordering point (BE-Q25):
+/// a transition that has decided the device is still listed commits first, and one that comes
+/// later sees the session gone.
 async fn logout(State(app): State<App>, headers: HeaderMap) -> Result<Response, ApiError> {
-    identity(&app, &headers).await?;
+    let (account, _) = identity(&app, &headers).await?;
     hook!(app.store, "session_delete.after_identity");
+    let mut tx = app.store.pool.begin().await?;
+    atlas_core::devices::order_membership(&mut tx, &account, &now).await?;
     sqlx::query("DELETE FROM sessions WHERE token_hash=$1")
         .bind(digest(&browser::credential(&app, &headers)?))
-        .execute(&app.store.pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 

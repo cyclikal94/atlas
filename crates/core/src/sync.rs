@@ -1,17 +1,20 @@
 //! Stable row snapshots and authority-filtered, device-aware delta recovery.
 use super::*;
+use crate::devices::{Clock, Continuity, forget_unlisted, order_membership};
 use crate::error::ErrorCode;
 
 impl Store {
     /// Retry SQLite snapshot-to-writer conflicts without changing the read boundary
-    /// inside a transaction. PostgreSQL uses a repeatable-read snapshot.
+    /// inside a transaction. PostgreSQL uses a repeatable-read snapshot. The time is read from
+    /// `time` at the start of every attempt, and again after the account's membership ordering
+    /// point when the attempt registers the device (BE-Q25).
     pub async fn sync(
         &self,
         actor: &str,
         device: &str,
         cursor: Option<&str>,
         limit: usize,
-        now: i64,
+        time: impl Clock,
     ) -> Result<Page> {
         ensure!(
             (1..=200).contains(&limit)
@@ -20,7 +23,10 @@ impl Store {
                 && cursor.is_none_or(|c| c.len() <= 512),
             ErrorCode::InvalidValue
         );
-        retry_unit(device, || self.sync_once(actor, device, cursor, limit, now)).await
+        retry_unit(device, || {
+            self.sync_once(actor, device, cursor, limit, &time)
+        })
+        .await
     }
 
     async fn sync_once(
@@ -29,8 +35,9 @@ impl Store {
         device: &str,
         cursor: Option<&str>,
         limit: usize,
-        now: i64,
+        time: &impl Clock,
     ) -> Result<Page> {
+        let now = time.now();
         let mut tx = if self.sqlite && cursor.is_none() {
             // A new snapshot necessarily writes. Reserve SQLite's writer slot before
             // reading to avoid simultaneous snapshot-to-writer upgrade starvation.
@@ -214,18 +221,28 @@ impl Store {
         .fetch_optional(&mut *tx)
         .await?;
         if last_seen.is_none() {
-            // Serialise the per-account device quota, not every sync request.
-            // A competing REPEATABLE READ transaction retries against the new state.
-            sqlx::query("UPDATE accounts SET access_epoch=access_epoch WHERE id=$1")
-                .bind(actor)
-                .execute(&mut *tx)
-                .await?;
+            // A registration lists the device (BE-Q25), so it is a membership change: it takes the
+            // account's ordering point, which also serialises the per-account device quota (not
+            // every sync request). On PostgreSQL this attempt's REPEATABLE READ snapshot was taken
+            // at its first statement; any membership change committed since then updated the
+            // account row and fails this update with a serialisation error, so the whole attempt
+            // retries with a new snapshot instead of deciding from an old one. On SQLite the update
+            // takes the writer slot, or fails the same way if the snapshot is stale. Earlier
+            // authentication of the request is not evidence the device is still listed.
+            hook!(self, "sync.before_registration_order", &mut tx);
+            let ordered = order_membership(&mut tx, actor, time).await?;
             let count: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM sync_devices WHERE account_id=$1")
                     .bind(actor)
                     .fetch_one(&mut *tx)
                     .await?;
-            ensure!(count < 32, ErrorCode::DeviceCapacity);
+            ensure!(
+                count < crate::devices::SYNC_DEVICE_LIMIT,
+                ErrorCode::DeviceCapacity
+            );
+            // A device whose every member went (signed out, expired, retired) starts unnamed.
+            forget_unlisted(&mut tx, &ordered, &Continuity::Unknown).await?;
+            hook!(self, "sync.before_registration", &mut tx);
             sqlx::query("INSERT INTO sync_devices(account_id,device_id,last_seen,cursor_key) VALUES ($1,$2,$3,$4) ON CONFLICT(account_id,device_id) DO UPDATE SET last_seen=excluded.last_seen")
                 .bind(actor).bind(device).bind(now).bind(sync_cursor::new_key()).execute(&mut *tx).await?;
         } else if last_seen.is_some_and(|last| {
@@ -351,21 +368,38 @@ impl Store {
         }
         loop {
             let mut tx = self.begin_cleanup().await?;
-            let statement = if self.sqlite {
-                "SELECT account_id,device_id FROM sync_devices WHERE last_seen<=$1 ORDER BY last_seen LIMIT 1"
-            } else {
-                "SELECT account_id,device_id FROM sync_devices WHERE last_seen<=$1 ORDER BY last_seen LIMIT 1 FOR UPDATE"
-            };
-            let Some(device) = sqlx::query(sqlx::AssertSqlSafe(statement))
-                .bind(cutoff)
-                .fetch_optional(&mut *tx)
-                .await?
+            // The candidate is found without a lock: removing a registration removes a member, so
+            // the account's membership ordering point comes first (BE-Q25) and the row is locked
+            // and its age re-checked only after it, in the retirement's lock order. A candidate
+            // refreshed or removed meanwhile is simply skipped; it is no longer aged.
+            let Some(candidate) = sqlx::query(
+                "SELECT account_id,device_id FROM sync_devices WHERE last_seen<=$1 ORDER BY last_seen LIMIT 1",
+            )
+            .bind(cutoff)
+            .fetch_optional(&mut *tx)
+            .await?
             else {
                 tx.commit().await?;
                 break;
             };
-            let account: String = device.get(0);
-            let id: String = device.get(1);
+            let account: String = candidate.get(0);
+            let id: String = candidate.get(1);
+            order_membership(&mut tx, &account, &now).await?;
+            let statement = if self.sqlite {
+                "SELECT device_id FROM sync_devices WHERE account_id=$1 AND device_id=$2 AND last_seen<=$3"
+            } else {
+                "SELECT device_id FROM sync_devices WHERE account_id=$1 AND device_id=$2 AND last_seen<=$3 FOR UPDATE"
+            };
+            let aged = sqlx::query(sqlx::AssertSqlSafe(statement))
+                .bind(&account)
+                .bind(&id)
+                .bind(cutoff)
+                .fetch_optional(&mut *tx)
+                .await?;
+            if aged.is_none() {
+                tx.commit().await?;
+                continue;
+            }
             // One device's cursor/ledger retirement is atomic, so it cannot recover
             // from an old cursor against a partly deleted delivery ledger. The
             // ledger is bounded by the installation's resource ceiling.

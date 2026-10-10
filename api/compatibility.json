@@ -1,6 +1,6 @@
 {
-  "api_version": "0.27.0",
-  "contract_sha256": "ba586a03dd10b82590533beaaecdb387524c302c18707a5c8d83a1fd28847900",
+  "api_version": "0.28.0",
+  "contract_sha256": "087ced05e7a731d99b6374bbe0572e40746cec88dad0ce350c7bfe52fbf153fc",
   "behaviour": {
     "activation": {
       "activate": {
@@ -618,6 +618,117 @@
       },
       "unknown_parameter": {
         "code": "malformed_request",
+        "status": 400
+      }
+    },
+    "labels_and_capacity": {
+      "bidi_name": {
+        "code": "invalid_value",
+        "set_cookie": false,
+        "status": 422
+      },
+      "bob_clears_alices_device": {
+        "code": "not_found",
+        "set_cookie": false,
+        "status": 404
+      },
+      "clear_name": {
+        "code": null,
+        "set_cookie": false,
+        "status": 204
+      },
+      "clear_name_again": {
+        "code": null,
+        "set_cookie": false,
+        "status": 204
+      },
+      "devices": {
+        "client": {
+          "browser": null,
+          "channel": "native",
+          "platform": "ios"
+        },
+        "item_members": [
+          "active_sessions",
+          "client",
+          "current",
+          "id",
+          "last_synced_at",
+          "name",
+          "state_token",
+          "summary"
+        ],
+        "name": "Phone",
+        "page_members": [
+          "devices",
+          "sync_capacity"
+        ],
+        "sync_capacity": {
+          "limit": 32,
+          "remaining": 32,
+          "used": 0
+        }
+      },
+      "invalid_name": {
+        "code": "invalid_value",
+        "set_cookie": false,
+        "status": 422
+      },
+      "null_name": {
+        "code": "malformed_request",
+        "set_cookie": false,
+        "status": 400
+      },
+      "other_accounts_device": {
+        "code": "not_found",
+        "set_cookie": false,
+        "status": 404
+      },
+      "sessions": {
+        "client": {
+          "browser": null,
+          "channel": "native",
+          "platform": "ios"
+        },
+        "device_name": "Phone",
+        "item_members": [
+          "authentication",
+          "client",
+          "created_at",
+          "current",
+          "device_id",
+          "device_name",
+          "expires_at",
+          "id"
+        ],
+        "page_members": [
+          "session_capacity",
+          "sessions"
+        ],
+        "session_capacity": {
+          "limit": 32,
+          "remaining": 31,
+          "used": 1
+        }
+      },
+      "set_name": {
+        "code": null,
+        "set_cookie": false,
+        "status": 204
+      },
+      "unauthenticated": {
+        "code": "unauthenticated",
+        "set_cookie": false,
+        "status": 401
+      },
+      "unknown_device": {
+        "code": "not_found",
+        "set_cookie": false,
+        "status": 404
+      },
+      "unknown_member": {
+        "code": "malformed_request",
+        "set_cookie": false,
         "status": 400
       }
     },

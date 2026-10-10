@@ -5,6 +5,7 @@ mod commands;
 mod compatibility;
 mod devices;
 mod integrations;
+mod labels;
 mod oidc;
 mod onboarding;
 mod policy_precondition;

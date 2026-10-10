@@ -11,7 +11,18 @@ CREATE TABLE accounts (
 CREATE TABLE sessions (
  token_hash TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES accounts(id),
  device_id TEXT NOT NULL, expires_at BIGINT NOT NULL
-, session_id TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL DEFAULT 0, auth_kind TEXT NOT NULL DEFAULT 'local' CHECK (auth_kind IN ('local','oidc')));
+, session_id TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL DEFAULT 0, auth_kind TEXT NOT NULL DEFAULT 'local' CHECK (auth_kind IN ('local','oidc')), client_channel TEXT CHECK (client_channel IN ('browser','native')), client_browser TEXT CHECK (client_browser IN ('chrome','edge','firefox','safari','opera','samsung_internet','unknown')), client_platform TEXT CHECK (client_platform IN ('windows','macos','ios','android','linux','chromeos','unknown')));
+
+-- BE-Q25: a device's user-chosen name and the client label of its latest session. Display
+-- metadata, not a member of the approved device state.
+CREATE TABLE device_profiles (
+ account_id TEXT NOT NULL REFERENCES accounts(id), device_id TEXT NOT NULL,
+ name TEXT CHECK (length(name) BETWEEN 1 AND 64),
+ client_channel TEXT CHECK (client_channel IN ('browser','native')),
+ client_browser TEXT CHECK (client_browser IN ('chrome','edge','firefox','safari','opera','samsung_internet','unknown')),
+ client_platform TEXT CHECK (client_platform IN ('windows','macos','ios','android','linux','chromeos','unknown')),
+ updated_at BIGINT NOT NULL, PRIMARY KEY(account_id,device_id)
+);
 
 CREATE TABLE resource_grants (
  resource_id TEXT NOT NULL REFERENCES resources(id), account_id TEXT NOT NULL REFERENCES accounts(id),
@@ -479,4 +490,4 @@ BEGIN
  SELECT NEW.id,ancestor_id,depth+1 FROM resource_ancestors WHERE resource_id=NEW.parent_id;
 END;
 INSERT INTO sync_clock(id,revision,resource_count) VALUES(1,0,0);
-INSERT INTO atlas_schema(version) VALUES(1004);
+INSERT INTO atlas_schema(version) VALUES(1005);

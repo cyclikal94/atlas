@@ -401,17 +401,22 @@ pub(super) async fn callback(
             .execute(&mut *tx)
             .await?;
     }
+    // A handoff or a grant lists the device (BE-Q25): hold the account's membership ordering
+    // point from here to commit, and judge expiry by the time read after it.
+    let ordered = atlas_core::devices::order_membership(&mut tx, &account, &now).await?;
     if let Some(uri) = native {
         sqlx::query("DELETE FROM native_handoffs WHERE expires_at<=$1")
-            .bind(now())
+            .bind(ordered.now())
             .execute(&mut *tx)
             .await?;
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM native_handoffs")
             .fetch_one(&mut *tx)
             .await?;
         ensure_api(count < 1000, ErrorCode::RateLimited)?;
+        // A forgotten device must be listed again unnamed.
+        atlas_core::devices::forget_unlisted(&mut tx, &ordered, &Continuity::Unknown).await?;
         let code = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-        sqlx::query("INSERT INTO native_handoffs(code_hash,account_id,device_id,challenge,expires_at,configuration_hash,redirect_uri) VALUES ($1,$2,$3,$4,$5,$6,$7)").bind(digest(&code)).bind(account).bind(row.get::<String,_>(2)).bind(row.get::<String,_>(5)).bind(now()+60).bind(config.fingerprint()).bind(&uri).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO native_handoffs(code_hash,account_id,device_id,challenge,expires_at,configuration_hash,redirect_uri) VALUES ($1,$2,$3,$4,$5,$6,$7)").bind(digest(&code)).bind(&account).bind(row.get::<String,_>(2)).bind(row.get::<String,_>(5)).bind(ordered.now()+60).bind(config.fingerprint()).bind(&uri).execute(&mut *tx).await?;
         tx.commit().await?;
         let mut destination =
             url::Url::parse(&uri).map_err(|_| anyhow!(ErrorCode::InternalError))?;
@@ -435,11 +440,10 @@ pub(super) async fn callback(
     let attempt_id: String = row.get(7);
     let grant = activation::issue_grant(
         &mut tx,
-        &account,
+        &ordered,
         &row.get::<String, _>(2),
         "oidc",
         &attempt_challenge,
-        now(),
     )
     .await?;
     tx.commit().await?;
@@ -539,16 +543,33 @@ pub(super) async fn native_exchange(
     let challenge =
         PkceCodeChallenge::from_code_verifier_sha256(&PkceCodeVerifier::new(input.code_verifier));
     let mut tx = app.store.begin_serial().await?;
-    let row=sqlx::query("DELETE FROM native_handoffs WHERE code_hash=$1 AND challenge=$2 AND expires_at>$3 AND configuration_hash=$4 RETURNING account_id,device_id,redirect_uri").bind(digest(&input.code)).bind(challenge.as_str()).bind(now()).bind(app.oidc.as_ref().unwrap().fingerprint()).fetch_optional(&mut *tx).await?.ok_or_else(||anyhow!(ErrorCode::Unauthenticated))?;
+    let code_hash = digest(&input.code);
+    // Discovery only: the handoff names the account whose membership ordering point must be held
+    // before the handoff is consumed (BE-Q25). Everything is checked again by the deletion below,
+    // at the time read after that point.
+    let account: String =
+        sqlx::query_scalar("SELECT account_id FROM native_handoffs WHERE code_hash=$1")
+            .bind(&code_hash)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| anyhow!(ErrorCode::Unauthenticated))?;
+    let ordered = atlas_core::devices::order_membership(&mut tx, &account, &now).await?;
+    let row=sqlx::query("DELETE FROM native_handoffs WHERE code_hash=$1 AND challenge=$2 AND expires_at>$3 AND configuration_hash=$4 AND account_id=$5 RETURNING device_id,redirect_uri,expires_at").bind(&code_hash).bind(challenge.as_str()).bind(ordered.now()).bind(app.oidc.as_ref().unwrap().fingerprint()).bind(&account).fetch_optional(&mut *tx).await?.ok_or_else(||anyhow!(ErrorCode::Unauthenticated))?;
     ensure_api(
-        app.native_redirects.contains(&row.get::<String, _>(2)),
+        app.native_redirects.contains(&row.get::<String, _>(1)),
         ErrorCode::Forbidden,
     )?;
+    // The handoff just consumed was a member of the device live at this transaction's time, and
+    // the session replaces it, so the device stays listed and keeps its name (BE-Q25).
+    let device: String = row.get(0);
+    let continuity = ordered.replacing(&device, row.get(2));
     let (session, _) = sessions::issue(
         &mut tx,
-        &row.get::<String, _>(0),
-        &row.get::<String, _>(1),
+        &ordered,
+        &device,
         "oidc",
+        &labels::client(&headers, Channel::Native),
+        &continuity,
     )
     .await?;
     tx.commit().await?;

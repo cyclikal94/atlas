@@ -2164,6 +2164,168 @@ async fn independent_timer_probes() -> Result<Value> {
     Ok(Value::Object(results))
 }
 
+/// BE-Q25: session/device labels, device naming and capacity. Records member names, the label and
+/// capacity values for a fixed `User-Agent`, and the naming statuses; no random identity enters
+/// the transcript.
+async fn labels_and_capacity_probes() -> Result<Value> {
+    use crate::support::http::request;
+    use crate::support::retirement::{Reply, bearer, login, world};
+
+    fn shape(reply: &Reply) -> Value {
+        json!({
+            "status": reply.0.as_u16(),
+            "code": reply.2.get("code"),
+            "set_cookie": reply.1.contains_key("set-cookie"),
+        })
+    }
+    fn names(value: &Value) -> Value {
+        let mut names: Vec<&String> = value.as_object().unwrap().keys().collect();
+        names.sort();
+        json!(names)
+    }
+
+    let w = world(false).await?;
+    let (status, _, signed_in) = request(
+        &w.app,
+        "POST",
+        "sessions",
+        &[(
+            "user-agent",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+        )],
+        json!({"username":"device-alice","password":crate::support::retirement::PASSWORD,"device_id":"phone"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{signed_in}");
+    let auth = bearer(signed_in["access_token"].as_str().unwrap());
+    let bob = bearer(&login(&w.app, "device-bob", "laptop").await);
+    let call = |method: &'static str, path: &'static str, who: String, body: Value| {
+        let app = w.app.clone();
+        async move {
+            let headers: Vec<(&str, &str)> = if who.is_empty() {
+                vec![]
+            } else {
+                vec![("authorization", who.as_str())]
+            };
+            request(&app, method, path, &headers, body).await
+        }
+    };
+    let mut results = serde_json::Map::new();
+    results.insert(
+        "set_name".into(),
+        shape(
+            &call(
+                "PUT",
+                "devices/phone/name",
+                auth.clone(),
+                json!({"name":"Phone"}),
+            )
+            .await,
+        ),
+    );
+    let sessions = call("GET", "sessions", auth.clone(), Value::Null).await;
+    assert_eq!(sessions.0, StatusCode::OK);
+    let session = &sessions.2["sessions"][0];
+    results.insert(
+        "sessions".into(),
+        json!({
+            "page_members": names(&sessions.2),
+            "item_members": names(session),
+            "client": session["client"],
+            "device_name": session["device_name"],
+            "session_capacity": sessions.2["session_capacity"],
+        }),
+    );
+    let devices = call("GET", "devices", auth.clone(), Value::Null).await;
+    assert_eq!(devices.0, StatusCode::OK);
+    let device = &devices.2["devices"][0];
+    results.insert(
+        "devices".into(),
+        json!({
+            "page_members": names(&devices.2),
+            "item_members": names(device),
+            "client": device["client"],
+            "name": device["name"],
+            "sync_capacity": devices.2["sync_capacity"],
+        }),
+    );
+    for (name, method, path, who, body) in [
+        (
+            "clear_name",
+            "DELETE",
+            "devices/phone/name",
+            auth.clone(),
+            Value::Null,
+        ),
+        (
+            "clear_name_again",
+            "DELETE",
+            "devices/phone/name",
+            auth.clone(),
+            Value::Null,
+        ),
+        (
+            "other_accounts_device",
+            "PUT",
+            "devices/laptop/name",
+            auth.clone(),
+            json!({"name":"Mine"}),
+        ),
+        (
+            "unknown_device",
+            "PUT",
+            "devices/unknown/name",
+            auth.clone(),
+            json!({"name":"Mine"}),
+        ),
+        (
+            "invalid_name",
+            "PUT",
+            "devices/phone/name",
+            auth.clone(),
+            json!({"name":" padded"}),
+        ),
+        (
+            "bidi_name",
+            "PUT",
+            "devices/phone/name",
+            auth.clone(),
+            json!({"name":"a\u{202E}b"}),
+        ),
+        (
+            "null_name",
+            "PUT",
+            "devices/phone/name",
+            auth.clone(),
+            json!({"name":null}),
+        ),
+        (
+            "unknown_member",
+            "PUT",
+            "devices/phone/name",
+            auth.clone(),
+            json!({"name":"x","extra":1}),
+        ),
+        (
+            "unauthenticated",
+            "PUT",
+            "devices/phone/name",
+            String::new(),
+            json!({"name":"x"}),
+        ),
+        (
+            "bob_clears_alices_device",
+            "DELETE",
+            "devices/phone/name",
+            bob.clone(),
+            Value::Null,
+        ),
+    ] {
+        results.insert(name.into(), shape(&call(method, path, who, body).await));
+    }
+    Ok(Value::Object(results))
+}
+
 async fn observe(app: &Router) -> Value {
     json!({
         "activation": activation_probes().await.expect("activation-grant protocol probes"),
@@ -2178,6 +2340,7 @@ async fn observe(app: &Router) -> Value {
         "web_push_payload": web_push_payload_probes().await.expect("BE-B4 Declarative Web Push payload probes"),
         "content_and_retirement": content_and_retirement().await.expect("combined protocol probes"),
         "independent_timers": independent_timer_probes().await.expect("BE-B6 independent-timer probes"),
+        "labels_and_capacity": labels_and_capacity_probes().await.expect("BE-Q25 label, naming and capacity probes"),
         "health": probe(app, "/health", &["api_version"]).await,
         "me_unauthenticated": probe(app, "/api/experimental/v1/me", &["request_id"]).await,
         "ready": probe(app, "/ready", &[]).await,

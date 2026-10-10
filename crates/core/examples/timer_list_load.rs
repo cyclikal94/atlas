@@ -6,7 +6,7 @@
 //! 200-row page over 200 distinct occurrences against 200 rows on one occurrence (the access-check
 //! cost); payload bytes; and the query plans and timings with and without the
 //! `timer_account_stopped` history index, so the index is kept on evidence, not on assumption.
-//! `ATLAS_LOAD_MODE=migrate` instead times the `1003 -> 1004` upgrade of a frozen-1003 database
+//! `ATLAS_LOAD_MODE=migrate` instead times the upgrade (`1003 -> 1004` and later steps) of a frozen-1003 database
 //! holding 100k and 1M timer rows, and, on PostgreSQL, the longest a concurrent timer write waits
 //! while the index is built.
 //!
@@ -635,7 +635,9 @@ async fn run_migration() -> Result<()> {
         let version: i64 = sqlx::query_scalar("SELECT version FROM atlas_schema")
             .fetch_one(&store.pool)
             .await?;
-        ensure!(version == 1004);
+        // The chain continues past 1004 (BE-Q25's 1005 adds nullable session columns and an empty
+        // table), so the timing covers every step from 1003 to the current version.
+        ensure!(version >= 1004);
         let running: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM timer_sessions WHERE stopped_at IS NULL AND cancelled=0",
         )
@@ -643,7 +645,7 @@ async fn run_migration() -> Result<()> {
         .await?;
         println!(
             "{}",
-            json!({"engine": engine, "migration": "1003 -> 1004", "timer_rows": rows, "running_rows": running,
+            json!({"engine": engine, "migration": format!("1003 -> {version}"), "timer_rows": rows, "running_rows": running,
             "seed_seconds": round(seed_seconds), "upgrade_seconds": round(migrate_seconds), "longest_concurrent_write_wait_ms": round(longest.as_secs_f64() * 1000.0),
             "unique_index_violated": false})
         );

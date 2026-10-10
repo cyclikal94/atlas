@@ -6,7 +6,8 @@ This document explains ownership and relationships rather than duplicating every
 
 | Tables | Responsibility |
 | --- | --- |
-| `accounts`, `sessions`, `external_identities`, `oidc_flows`, `native_handoffs`, `account_invitations` | Individual accounts, hashed session credentials, explicit provider links and one-use onboarding/authentication state |
+| `accounts`, `sessions`, `external_identities`, `oidc_flows`, `native_handoffs`, `account_invitations` | Individual accounts, hashed session credentials, explicit provider links and one-use onboarding/authentication state. Each session row also holds its coarse client label (`client_channel`, `client_browser`, `client_platform`: nullable, closed values, `NULL` before schema `1005`) |
+| `device_profiles` | Per `(account_id, device_id)` display metadata: the user-chosen `name` (1–64 characters, nullable) and the client label of the device's latest session. Not a member of the approved device state; deleted by a confirmed retirement and restore preparation, and pruned for unlisted devices by the next transaction that can list a device (session, grant or handoff issue, a subscription change or a sync registration), so a forgotten device is listed again unnamed. Every membership change, profile write and device or session listing is ordered at the `accounts` row (see `docs/authentication.md`, *Ordering*) |
 | `resources` | UUID, owner, parent, kind, label, JSON data, independent content/policy versions and archive state |
 | `resource_grants`, `resource_household_grants`, `resource_exclusions`, `resource_ancestors` | Direct/live-household visibility, exclusions and required ancestor visibility |
 | `households`, `household_memberships`, `household_invitations`, `default_templates` | Membership, roles, invitations and creation templates |

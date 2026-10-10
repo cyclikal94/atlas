@@ -479,3 +479,79 @@ async fn oidc_attempt_id_round_trips_reserved_characters() -> anyhow::Result<()>
     let _ = server.await;
     Ok(())
 }
+
+/// BE-Q25: a session from the browser OIDC flow is labelled by the `activate` request that redeems
+/// its grant (the cookie holder), not by the start or callback requests.
+#[tokio::test]
+async fn a_browser_oidc_session_is_labelled_by_its_activation() -> anyhow::Result<()> {
+    let (provider, server) = crate::support::oidc::serve().await?;
+    let (_dir, database) = crate::support::database::database_url().await?;
+    let store = Store::connect(&database).await?;
+    store.migrate().await?;
+    let app = App::new(store.clone())
+        .await?
+        .public_origin("https://atlas.example")?
+        .oidc(&provider.issuer, "atlas-test", None, true)?
+        .router();
+    let (path, cookie, _, verifier) = begin(&app, &provider, "new_subject", None, None).await;
+    let (status, headers, _) = call(
+        &app,
+        "GET",
+        &path,
+        &[
+            ("cookie", &cookie),
+            (
+                "user-agent",
+                "Mozilla/5.0 (Windows NT 10.0) Chrome/129.0.0.0 Safari/537.36",
+            ),
+        ],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let sent = fragment(headers["location"].to_str()?);
+    let (status, headers, activated) = call(
+        &app,
+        "POST",
+        "browser-sessions/activate",
+        &[
+            ("origin", "https://atlas.example"),
+            (
+                "user-agent",
+                "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0",
+            ),
+        ],
+        json!({"grant":sent["atlas_grant"],"verifier":verifier}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{activated}");
+    let cookie = headers["set-cookie"]
+        .to_str()?
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let csrf = activated["csrf_token"].as_str().unwrap();
+    let (status, _, sessions) = call(
+        &app,
+        "GET",
+        "sessions",
+        &[
+            ("cookie", &cookie),
+            ("x-csrf-token", csrf),
+            ("origin", "https://atlas.example"),
+        ],
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{sessions}");
+    let session = &sessions["sessions"][0];
+    assert_eq!(session["authentication"], "oidc");
+    assert_eq!(
+        session["client"],
+        json!({"channel":"browser","browser":"firefox","platform":"linux"})
+    );
+    server.abort();
+    let _ = server.await;
+    Ok(())
+}

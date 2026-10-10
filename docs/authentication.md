@@ -190,10 +190,12 @@ account sessions and pending native handoffs. Re-authenticate with the local pas
 ## Sessions and password recovery
 
 `GET /api/experimental/v1/sessions` lists the current account's active sessions with
-opaque IDs, device labels, creation/expiry times, authentication method and a current
-session flag. No token or token hash is returned. `DELETE /sessions/{id}` revokes only
-that account's selected session. Each account may have up to 32 active sessions;
-expired sessions are collected before admitting a new one.
+opaque IDs, device IDs, each session's client label and its device's name (see
+[session and device labels](#session-and-device-labels)), creation/expiry times,
+authentication method and a current session flag, plus `session_capacity`. No token or
+token hash is returned. `DELETE /sessions/{id}` revokes only that account's selected
+session. Each account may have up to 32 active sessions; expired sessions are collected
+before admitting a new one (see [session and sync capacity](#session-and-sync-capacity)).
 
 `POST /api/experimental/v1/password` takes `current_password` and `new_password`
 (12–1,024 bytes). It verifies and hashes outside the async executor, then atomically
@@ -211,6 +213,151 @@ Schema version 4 migrates existing sessions to opaque IDs and derives creation t
 from their original 24-hour expiry. Stop old server processes before upgrading;
 older versions cannot issue sessions using the new schema. Version 5 adds signup
 invitations, native OIDC handoffs and the corresponding lifecycle rules. Back up first.
+
+## Session and device labels
+
+Since API `0.28.0` (schema `1005`) the server records a coarse **client label** with every
+session it issues, so a person can recognise their sign-ins, and lets them **name** their
+devices. Both are display metadata for the signed-in owner only.
+
+**Client label** (`ClientLabel`: `channel`, `browser`, `platform`). `channel` comes from the
+route, never from a header: `browser` for `POST /browser-sessions/activate` (the only route
+that sets the session cookie) and `native` for the three bearer-issuing routes
+(`POST /sessions`, `POST /registration` and `POST /oidc/native/exchange`). `browser` and
+`platform` are derived from that request's `User-Agent` alone; `browser` is `null` exactly
+when `channel` is `native`. For a browser sign-in the label follows the `activate` request,
+not the earlier login, registration or OIDC request that issued the grant. The header is
+self-reported and trivially changed, so a label is a recognition hint and never identity,
+proof of a device or an input to any security decision. Only the resulting closed values
+are stored: no raw header, browser or OS version, device model, client hint or address, so
+the stored data adds nothing to fingerprinting beyond about fifty coarse combinations of a
+header the browser already sends. A header that is absent, repeated, longer than 512 bytes
+or not printable ASCII gives `unknown`; metadata never blocks or fails a sign-in.
+
+The first matching rule wins, on substrings of the header. Platform: `CrOS` → `chromeos`;
+`Android` → `android`; `iPhone`, `iPad` or `iPod` → `ios`; `Windows` → `windows`;
+`Macintosh` or `Mac OS X` → `macos`; `Linux` or `X11` → `linux`; otherwise `unknown`.
+Browser: `Edg/`, `EdgA/` or `EdgiOS/` → `edge`; `OPR/` → `opera`; `SamsungBrowser/` →
+`samsung_internet`; `Firefox/` or `FxiOS/` → `firefox`; `CriOS/`, `Chrome/` or `Chromium/` →
+`chrome`; `Safari/` together with `Version/` → `safari`; otherwise `unknown`. Known
+limitations: iPadOS in desktop mode reports macOS, Chromium-based browsers that do not
+identify themselves (Brave, Vivaldi) report `chrome`, and any client can send anything. New
+values may be added in a MINOR version; clients treat an unrecognised value as `unknown`.
+
+Each session keeps the label it was issued with, so several sessions on one device can
+differ. A device's `client` in `GET /devices` is the label of its most recently issued
+session, and survives that session's expiry while the device is listed.
+
+**Device name.** `PUT /api/experimental/v1/devices/{device_id}/name` with
+`{"name": "..."}` sets a name and `DELETE` on the same path clears it; both return `204`.
+Any live session of the account may name any of the account's devices, and duplicate names
+are allowed. A device that is not listed for the caller's account (never seen, retired,
+every member expired, or another account's) is `404 not_found` and nothing is written. A
+name is 1–64 Unicode scalar values (so at most 256 UTF-8 bytes) with no leading or trailing
+white space and none of: control characters (C0 and C1), the bidirectional controls U+061C,
+U+200E, U+200F, U+202A–U+202E and U+2066–U+2069, the invisible U+200B, U+2060–U+2064, U+FEFF
+and U+FFF9–U+FFFB, the separators U+2028 and U+2029, or any noncharacter. ZWJ and ZWNJ stay
+allowed for emoji sequences and scripts that need them. A rule violation, or a device ID
+outside 1–100 bytes, is `422 invalid_value`; a body that is not an object with exactly one
+string member `name` (including `null`) is `400 malformed_request`. Nothing is normalised
+or trimmed: the stored and returned value is exactly what was accepted. Text that looks like
+markup is accepted as text; clients must render names as text, never as HTML. Every session
+in `GET /sessions` also carries its device's current name as `device_name`.
+
+A name is identification for the owner's own use, not a secret, but it may be personal (for
+example a person's first name), so it is disclosed only to sessions of the same account and
+is never written to logs. Device IDs are scoped to the account: the same device ID under two
+accounts has two independent names and labels.
+
+**Lifetime.** A device's name and latest label live in `device_profiles` and are visible
+exactly while the device is listed, continuously: once a listing has seen a device absent, the
+device starts unnamed, with no latest label, whenever it is listed again. They are deleted when a
+retirement of the device commits `confirmed_applied` (a stale or superseded retirement keeps
+them), when a restore is prepared, and, for every device of the account that is no longer
+listed, by the next transition that can list a device: each of them first drops the profiles of
+the account's unlisted devices, before it writes the new member. Those transitions are session
+issue (password and registration sign-in, browser activation, native OIDC exchange), browser
+activation-grant issue (password, registration and OIDC), native OIDC handoff issue, a
+notification-subscription change (whose `device_id` is the client's) and a sync registration
+(the first sync of a device, or its first after the registration was removed). A device that has
+been forgotten therefore starts unnamed whichever route lists it again, including while it is
+listed only by a pending sign-in or handoff. Redeeming a grant and exchanging a handoff replace a
+member of the device that is live at the redemption's own time with its session, so that device
+is listed throughout and keeps its name, even if the consumed grant or handoff was its only
+member; a grant or handoff that had already expired by then keeps nothing. A sync request that
+authenticated before its session was signed out still succeeds, and still registers its device,
+but the earlier authentication is not evidence that the device stayed listed: if a listing saw it
+absent in between, it is registered unnamed. A password change or OIDC unlink revokes every
+session but keeps the names of devices that remain listed (for example through their sync
+registration). Sessions and devices from before `1005` have `client: null`, and every device
+starts with `name: null`; nothing is backfilled because no source data exists. The fallback
+wording for a missing label or name ("This browser", "Another device" and similar) is the
+client's.
+
+**Ordering.** A name is not a member of the approved device state and is not part of
+`state_token`, so renaming never makes a retirement confirmation stale. Each account has one
+*membership ordering point*, its account row. Every change to the account's device membership
+holds it from before its first member write to its commit: every member write above, every
+removal (sign-out, revocation with or without an `Idempotency-Key`, grant cancellation including
+the fifth wrong verifier, a password change, an operator reset, an OIDC unlink, a subscription
+change, a retirement and the aged-registration sweep), and every profile write (a rename or clear
+included). Each reads the time it judges liveness by only after taking it, on every retried
+attempt. The `GET /devices` and `GET /sessions` listings take it too, shared, before they read
+their time and snapshot, so they wait for a membership change of the same account in flight and
+it waits for them; listings of other accounts, and other kinds of request, are not held up on
+PostgreSQL. A decision that a device is still listed, and keeps its name, therefore stays true
+until the new member is visible: a removal that commits first is seen by it, a removal that comes
+later finds the new member, and a listing that has seen the device absent read its time before
+the decision did, when the member that would have justified keeping the name had already gone or
+expired. Removing a member never deletes a profile itself: the profile of a device left with no
+member stays until the next transition of the account drops it, and is never shown in between.
+Renaming is therefore totally ordered with retirement and with every membership change: a rename
+either commits before a retirement, which then still applies and deletes the name with the
+device, or runs after it and finds nothing listed (`404`). Expired sessions and handoffs swept
+by maintenance are not ordered this way: they had already stopped being members at the sweep's
+time.
+
+On PostgreSQL the ordering point is a row lock on the account, held to commit; a listing holds it
+in share mode, so it is a REPEATABLE READ snapshot that is no longer `READ ONLY`, and a membership
+change committed after its snapshot started makes it retry. The first sync registration takes it
+inside the sync's REPEATABLE READ transaction, so a removal committed after that snapshot started
+fails the attempt with a serialisation error and it is retried whole with a new snapshot. On
+SQLite the point is the database's single writer slot, which every writer already holds, so a
+listing now holds that slot for its own short transaction too. The order is always
+`begin_serial()` (where used), then the account row, then member rows; nothing takes them in the
+reverse order. One limitation remains: the servers' clocks are assumed to agree, since each
+decision reads its own server's clock.
+
+## Session and sync capacity
+
+Two per-account limits are enforced, and each is reported beside the list it governs as a
+`Capacity` object `{"limit", "used", "remaining"}`. `limit` is the enforced limit, or `null`
+when none is enforced (not produced by this release); `remaining` is `max(limit - used, 0)`,
+and `null` exactly when `limit` is `null`. The limits are fixed by the server, are the same
+for every account and are not configurable; clients must use the reported value and never
+assume one (the design's example of five is not the limit).
+
+- `GET /sessions` → `session_capacity`: live sessions, limit 32. `used` is the number of
+  sessions in the same response, which is exactly what a new sign-in counts after it discards
+  expired sessions; an expired session is counted by neither. A sign-in when `remaining` is
+  `0` fails with `503 device_capacity` (a browser grant stays redeemable until it expires).
+  Signing out, revoking a session, a password change and a retirement free slots when they
+  commit.
+- `GET /devices` → `sync_capacity`: sync registrations, limit 32, from the same snapshot as
+  the device list. `used` counts every registration of the account, including one older than
+  the retention period that cleanup has not yet removed, exactly as a sync from an
+  unregistered device counts them. A device that is already registered needs no new slot; a
+  new device's first sync when `remaining` is `0` fails with `503 device_capacity` until a
+  retirement or the cleanup frees one. A device that only has sessions does not use a sync
+  slot.
+
+There is no limit on devices as such: the list in `GET /devices` can contain devices that
+hold neither a session nor a registration (a pending sign-in, a native handoff or a
+subscription). A count is a reading, not a reservation: another sign-in or registration can
+take the last slot between the read and the client's own request, so a client must still
+handle `device_capacity`. A client that cannot obtain a count (an older server without the
+member, or a failed read) shows capacity as unavailable rather than inventing one; the server
+never returns a partial answer.
 
 ## Dependency advisory assessment
 
@@ -237,6 +384,11 @@ retiring, as an opaque `state_token` and a `summary` (sessions, native handoffs,
 subscriptions, pending sign-ins, whether a sync registration exists) read together from one
 database snapshot, so what a confirmation dialog shows is exactly what the token covers.
 
+Each device also carries its `name` and latest `client` label and the response carries
+`sync_capacity` (see [session and device labels](#session-and-device-labels)). The name and
+label are display metadata, not members of the approved state: they are never part of
+`state_token`, and a `confirmed_applied` retirement deletes them with the device.
+
 The listing set is the union of the same member predicates the token covers, so a device
 that can be retired always offers a token. In particular, a device whose last session has
 gone but which still holds a live native handoff or an active subscription stays listed
@@ -254,7 +406,7 @@ still equals that token, and records the outcome durably in the same transaction
 
 | Outcome | Status | Meaning |
 | --- | --- | --- |
-| `confirmed_applied` | `200` | This operation retired the device: sessions and native handoffs deleted, subscriptions deactivated (secret erased), sync registration, cursors and delivery ledger removed. Content and account-wide command receipts survive. |
+| `confirmed_applied` | `200` | This operation retired the device: sessions and native handoffs deleted, subscriptions deactivated (secret erased), sync registration, cursors and delivery ledger removed, and the device's name and label forgotten. Content and account-wide command receipts survive. |
 | `superseded` | `200` | Nothing was left to retire: every member was already gone. Nothing was changed, and this is **not** a confirmation. |
 | `rejected_stale` | `409 operation_conflict` | The state changed after the user confirmed it (a session, handoff, subscription or registration was added, replaced or partly removed). Nothing was changed. |
 
@@ -286,15 +438,17 @@ revocation credits only a live session row that this call removed.
 Correctness under concurrency does not rest on client checks. The retirement runs in one
 serialised transaction, retried as a unit on `SQLITE_BUSY` or PostgreSQL `40001`/`40P01`
 (exhaustion is `503` with no record and no effect, so the client repeats the identical call).
-It reads the ledger first, orders itself against sync-registration creation with a no-op
-update of the account row, then re-reads every member, `FOR UPDATE` on PostgreSQL, so each row
+It reads the ledger first, takes the account's membership ordering point (a no-op update of
+the account row, see *Ordering* above), which orders it against sync-registration creation and
+every other membership change, then re-reads every member, `FOR UPDATE` on PostgreSQL, so each row
 it compares is locked until commit; on SQLite the write lock taken by the first statement
 already excludes every writer. It then deletes, deactivates and cancels exactly the locked
 identities, asserting each statement's rows-affected: any discrepancy means a writer escaped
 the protocol, so the transaction rolls back with no record and the request fails `500`. A
 removal by another cause is never credited to the retirement (or to a keyed revocation). The
 transaction runs at PostgreSQL's default `READ COMMITTED`. Every writer of a member row must
-either run inside `begin_serial()` or be ordered by its own row lock; a test lists every such
+either run inside `begin_serial()` or be ordered by its own lock (the account row, or the
+member row itself for the maintenance sweeps of expired rows); a test lists every such
 statement and fails when one is added or moved (see [testing](testing.md)).
 
 Ledger rows are kept indefinitely, like receipts: an expiry would silently turn a confirmed

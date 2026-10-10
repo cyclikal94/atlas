@@ -2,6 +2,7 @@
 use anyhow::Result;
 use atlas_core::{devices::valid_state_token, operations::Outcome};
 
+use crate::support::database::postgres;
 use crate::support::devices::{
     FAR, add_grant, add_handoff, add_registration, add_session, add_subscription, expected_token,
     id, ledger_rows, populate, snapshot,
@@ -22,7 +23,7 @@ async fn listing_offers_the_independently_computed_token() -> Result<()> {
     populate(&s, &a, "phone").await?;
     add_session(&s, &a, "tablet", FAR).await?;
     add_registration(&s, &a, "watch").await?;
-    let listed = s.devices(&a, NOW).await?;
+    let listed = s.devices(&a, NOW).await?.devices;
     assert_eq!(
         listed.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
         ["phone", "tablet", "watch"]
@@ -64,6 +65,7 @@ async fn listed_token(s: &atlas_core::Store, a: &str, device: &str) -> Result<St
     let token = s
         .devices(a, NOW)
         .await?
+        .devices
         .into_iter()
         .find(|d| d.id == device)
         .expect("device is listed")
@@ -268,7 +270,7 @@ async fn any_live_member_alone_lists_the_device_with_its_token() -> Result<()> {
         .execute(&s.pool)
         .await?;
 
-    let listed = s.devices(&a, NOW).await?;
+    let listed = s.devices(&a, NOW).await?.devices;
     assert_eq!(
         listed.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
         [
@@ -345,7 +347,7 @@ async fn a_device_left_with_one_member(left: Left) -> Result<()> {
         .bind(&session)
         .execute(&s.pool)
         .await?;
-    let listed = s.devices(&a, NOW).await?;
+    let listed = s.devices(&a, NOW).await?.devices;
     assert_eq!(
         listed.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
         [PHONE],
@@ -392,7 +394,7 @@ async fn a_device_left_with_one_member(left: Left) -> Result<()> {
         "{left:?}: Alice's token is not Bob's state"
     );
     assert_eq!(snapshot(&s, &b, PHONE).await?, bob_before);
-    let bob_listed = s.devices(&b, NOW).await?;
+    let bob_listed = s.devices(&b, NOW).await?.devices;
     assert_eq!(bob_listed.len(), 1);
     assert_eq!(
         bob_listed[0].state_token,
@@ -417,7 +419,7 @@ async fn a_device_left_with_one_member(left: Left) -> Result<()> {
         }
     }
     assert!(
-        s.devices(&a, NOW).await?.is_empty(),
+        s.devices(&a, NOW).await?.devices.is_empty(),
         "nothing live remains, so nothing is listed"
     );
     assert_eq!(
@@ -476,6 +478,12 @@ async fn a_device_left_with_only_a_subscription_can_still_be_retired() -> Result
 }
 
 /// N4: nothing committed after the listing's first read reaches its summary or its token.
+///
+/// BE-Q25 revision 2 adaptation (SQLite only): the listing now holds SQLite's writer slot for its
+/// whole transaction (`begin_membership_read`), so a write cannot commit while it is between its
+/// reads; the write is started there and commits after the listing. On PostgreSQL the listing
+/// holds only a share lock on the account row, which this direct insert does not take, so the
+/// write commits between the reads exactly as before. The assertions are unchanged.
 #[tokio::test]
 async fn listing_is_one_snapshot() -> Result<()> {
     let (_d, s) = fixture().await?;
@@ -489,15 +497,24 @@ async fn listing_is_one_snapshot() -> Result<()> {
         tokio::spawn(async move { s.devices(&a, NOW).await })
     };
     gate.reached().await;
-    // Committed while the listing is between its reads.
-    add_subscription(&s, &a, "phone").await?;
-    gate.release();
-    let listed = reader.await??;
+    // Started while the listing is between its reads (and committed there on PostgreSQL).
+    let writer = {
+        let (s, a) = (s.clone(), a.clone());
+        tokio::spawn(async move { add_subscription(&s, &a, "phone").await })
+    };
+    if postgres() {
+        writer.await??;
+        gate.release();
+    } else {
+        gate.release();
+        writer.await??;
+    }
+    let listed = reader.await??.devices;
     let phone = &listed[0];
     assert_eq!(phone.summary.notification_subscriptions, 0);
     assert_eq!(phone.state_token, before);
     // The next listing sees it.
-    let after = s.devices(&a, NOW).await?;
+    let after = s.devices(&a, NOW).await?.devices;
     assert_eq!(after[0].summary.notification_subscriptions, 1);
     assert_ne!(after[0].state_token, before);
     Ok(())

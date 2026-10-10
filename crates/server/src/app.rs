@@ -189,6 +189,10 @@ impl App {
                 delete(sessions::forget_device),
             )
             .route(
+                "/api/experimental/v1/devices/{device_id}/name",
+                put(sessions::set_device_name).delete(sessions::clear_device_name),
+            )
+            .route(
                 "/api/experimental/v1/oidc/identities",
                 delete(sessions::unlink_oidc),
             )

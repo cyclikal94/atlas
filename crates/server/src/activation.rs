@@ -3,6 +3,7 @@
 //! See `docs/authentication.md` and `account-lifecycle-matrix.md` §3.5 for the protocol this
 //! implements; `atlas_core::devices` owns the grant's membership in the approved device state.
 use super::*;
+use atlas_core::devices::{Continuity, Ordered, order_membership};
 use atlas_core::error::ErrorCode;
 use openidconnect::{PkceCodeChallenge, PkceCodeVerifier};
 use sqlx::{Any, Transaction};
@@ -39,18 +40,24 @@ pub(super) struct BrowserGrant {
     pub(super) account_id: String,
 }
 
-/// Issue a grant for `account`/`device`/`auth_kind`, storing the caller-supplied
+/// Issue a grant for the ordered account's `device`/`auth_kind`, storing the caller-supplied
 /// `attempt_challenge` verbatim as `challenge_hash` (it is already `S256(verifier)`). Must run
 /// inside the caller's own `begin_serial()` transaction so the grant commits atomically with
-/// whatever authenticated or created the account — mirrors `sessions::issue`'s contract exactly.
+/// whatever authenticated or created the account — mirrors `sessions::issue`'s contract exactly,
+/// including holding the account's membership ordering point (`ordered`, BE-Q25), whose time the
+/// grant is issued at.
 pub(super) async fn issue_grant(
     tx: &mut Transaction<'_, Any>,
-    account: &str,
+    ordered: &Ordered,
     device: &str,
     auth_kind: &str,
     challenge_hash: &str,
-    now: i64,
 ) -> Result<BrowserGrant, ApiError> {
+    let account = ordered.account();
+    let now = ordered.now();
+    // A pending grant lists its device (BE-Q25): a device that was forgotten must be listed again
+    // unnamed, so drop unlisted devices' profiles before the grant exists.
+    atlas_core::devices::forget_unlisted(tx, ordered, &Continuity::Unknown).await?;
     // Terminal and unredeemed-expired rows are retained 48h as activate/cancel evidence, then
     // swept, mirroring the `oidc_flows` pattern; an `issued`, unexpired row never matches.
     sqlx::query(
@@ -104,12 +111,14 @@ pub(super) struct Activate {
 /// expires — `begin_serial()`'s existing global serialisation (the same `sync_clock` ordering
 /// point every other approved-state writer uses) is what makes two concurrent calls against the
 /// same grant resolve to exactly one winner, with no extra locking needed here. `now` is read
-/// only after that serialisation is acquired, never before: a request queued behind a
-/// connection-pool or lock wait must judge expiry by the time it actually runs, not by a value
-/// captured while still waiting, or a request that sat queued past the grant's expiry could still
-/// redeem it. The redemption write re-asserts the same expiry condition (`activation_grants`'s
-/// `state='issued'` alone is not enough), so the guarantee holds even if a future caller ever
-/// reads `now` earlier again.
+/// only after that serialisation and the grant account's membership ordering point (BE-Q25) are
+/// acquired, never before: a request queued behind a connection-pool or lock wait must judge
+/// expiry by the time it actually runs, not by a value captured while still waiting, or a request
+/// that sat queued past the grant's expiry could still redeem it. The same time decides whether
+/// the redeemed grant was live and so whether the device keeps its name, and is the session's
+/// creation time. The redemption write re-asserts the same expiry condition
+/// (`activation_grants`'s `state='issued'` alone is not enough), so the guarantee holds even if a
+/// future caller ever reads `now` earlier again.
 pub(super) async fn activate(
     State(app): State<App>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
@@ -132,7 +141,6 @@ pub(super) async fn activate(
     let grant_hash = digest(&input.grant);
     hook!(app.store, "activate.before_begin");
     let mut tx = app.store.begin_serial().await?;
-    let now = now();
     let row = sqlx::query(
         "SELECT account_id,device_id,auth_kind,challenge_hash,state,failed_verifiers,expires_at FROM activation_grants WHERE grant_hash=$1",
     )
@@ -140,6 +148,12 @@ pub(super) async fn activate(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| anyhow!(ErrorCode::Unauthenticated))?;
+    let account: String = row.get(0);
+    // Every outcome below can change the grant's membership (redeemed, or cancelled on the fifth
+    // wrong verifier). Only `begin_serial()` writers change a grant row, so the row read above is
+    // still current.
+    let ordered = order_membership(&mut tx, &account, &now).await?;
+    let now = ordered.now();
     let state: String = row.get(4);
     let expires_at: i64 = row.get(6);
     ensure_api(
@@ -162,10 +176,15 @@ pub(super) async fn activate(
         tx.commit().await?;
         return Err(anyhow!(ErrorCode::Unauthenticated).into());
     }
-    let account: String = row.get(0);
     let device: String = row.get(1);
     let auth_kind: String = row.get(2);
-    let (session, session_id) = sessions::issue(&mut tx, &account, &device, &auth_kind).await?;
+    // The label follows this request, the one that receives the cookie, not the sign-in that
+    // issued the grant (BE-Q25). The grant just verified is a member of the device live at `now`,
+    // which the new session replaces, so the device stays listed and keeps its name.
+    let client = labels::client(&headers, Channel::Browser);
+    let continuity = ordered.replacing(&device, expires_at);
+    let (session, session_id) =
+        sessions::issue(&mut tx, &ordered, &device, &auth_kind, &client, &continuity).await?;
     // Re-check `expires_at>now` here as well as above: this is the write that actually creates a
     // session, so it — not only the earlier read — must enforce the approved expiry condition.
     let redeemed = sqlx::query("UPDATE activation_grants SET state='redeemed',session_id=$1,redeemed_at=$2 WHERE grant_hash=$3 AND state='issued' AND expires_at>$4")
@@ -207,13 +226,21 @@ pub(super) async fn activate_cancel(
             .as_str()
             .to_owned();
     let mut tx = app.store.begin_serial().await?;
-    let now = now();
     let row = sqlx::query(
         "SELECT account_id,state,session_id FROM activation_grants WHERE challenge_hash=$1",
     )
     .bind(&challenge_hash)
     .fetch_optional(&mut *tx)
     .await?;
+    // Cancelling an issued grant or revoking its session removes a member (BE-Q25).
+    let now = match &row {
+        Some(row) if row.get::<String, _>(1) != "cancelled" => {
+            order_membership(&mut tx, &row.get::<String, _>(0), &now)
+                .await?
+                .now()
+        }
+        _ => now(),
+    };
     let result = match row {
         None => "unknown",
         Some(row) => match row.get::<String, _>(1).as_str() {

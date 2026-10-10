@@ -133,6 +133,15 @@ impl Store {
             touched.insert(id.clone());
         }
         let before = Self::calendar_before(&mut tx, &touched).await?;
+        // A subscription change adds or removes a member of a device (BE-Q25): every effect below
+        // holds the account's membership ordering point.
+        let ordered = match command {
+            ReminderCommand::SetSubscription { .. }
+            | ReminderCommand::RemoveSubscription { .. } => {
+                Some(crate::devices::order_membership(&mut tx, actor, &super::unix_now).await?)
+            }
+            ReminderCommand::SetRule { .. } => None,
+        };
         match command {
             ReminderCommand::SetRule {
                 id,
@@ -217,6 +226,19 @@ impl Store {
                     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notification_subscriptions WHERE account_id=$1 AND active=1 AND id<>$2").bind(actor).bind(id).fetch_one(&mut *tx).await?;
                     ensure!(count < 16, ErrorCode::SliceCapacity);
                 }
+                // An active subscription lists its device, and `device_id` is the client's
+                // (BE-Q25): drop unlisted devices' profiles first, so a forgotten device is listed
+                // again unnamed. A move or disable can also leave the previous device unlisted;
+                // its profile then goes at the next transition that lists a device.
+                let ordered = ordered
+                    .as_ref()
+                    .ok_or_else(|| anyhow!(ErrorCode::InternalError))?;
+                crate::devices::forget_unlisted(
+                    &mut tx,
+                    ordered,
+                    &crate::devices::Continuity::Unknown,
+                )
+                .await?;
                 let existing = sqlx::query(
                     "SELECT account_id,version FROM notification_subscriptions WHERE id=$1",
                 )

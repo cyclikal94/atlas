@@ -1,9 +1,11 @@
-//! N1: the additive `1000 -> 1004` upgrade chain and the reset error for anything it cannot walk.
+//! N1: the additive `1000 -> 1005` upgrade chain and the reset error for anything it cannot walk.
 //!
-//! Every legacy baseline is rooted on a *frozen*, genuine `1003` schema captured from the
-//! `1003` release (`tests/fixtures/schema_1003_*.sql`), never on the current schema. Deriving a
-//! legacy database from the current schema by dropping objects would silently carry whatever the
-//! current step creates (here the `1004` timer indexes) and could not prove the step's `DROP`.
+//! Every legacy baseline is rooted on a *frozen*, genuine schema captured from a release
+//! (`tests/fixtures/schema_100N_*.sql`), never on the current schema. Deriving a legacy database
+//! from the current schema by dropping objects would silently carry whatever the current step
+//! creates (the `1004` timer indexes, the `1005` session labels and device profiles) and could not
+//! prove a step's `DROP`. `1000`–`1003` are rooted on the frozen `1003` schema and `1004` on the
+//! frozen `1004` schema (BE-Q25).
 use std::collections::BTreeMap;
 
 use anyhow::Result;
@@ -13,6 +15,10 @@ use crate::support::devices::{FAR, add_session, id};
 
 const FROZEN_1003_SQLITE: &str = include_str!("../../fixtures/schema_1003_sqlite.sql");
 const FROZEN_1003_POSTGRES: &str = include_str!("../../fixtures/schema_1003_postgres.sql");
+const FROZEN_1004_SQLITE: &str = include_str!("../../fixtures/schema_1004_sqlite.sql");
+const FROZEN_1004_POSTGRES: &str = include_str!("../../fixtures/schema_1004_postgres.sql");
+/// The version `migrate()` ends at.
+const CURRENT: i64 = 1005;
 
 async fn version(store: &Store) -> Result<Vec<i64>> {
     Ok(
@@ -45,6 +51,21 @@ async fn baseline_1003(url: &str) -> Result<Store> {
     .execute(&store.pool)
     .await?;
     assert_eq!(version(&store).await?, [1003]);
+    Ok(store)
+}
+
+/// A database exactly as the `1004` release left it (BE-B6's per-occurrence timer indexes present,
+/// BE-Q25's session labels and device profiles absent).
+async fn baseline_1004(url: &str) -> Result<Store> {
+    let store = Store::connect(url).await?;
+    sqlx::raw_sql(if crate::support::database::postgres() {
+        FROZEN_1004_POSTGRES
+    } else {
+        FROZEN_1004_SQLITE
+    })
+    .execute(&store.pool)
+    .await?;
+    assert_eq!(version(&store).await?, [1004]);
     Ok(store)
 }
 
@@ -165,10 +186,9 @@ async fn index_names(store: &Store, table: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Every table's rows as one canonical string, keyed by table name (`atlas_schema` excluded: its
-/// version is what an upgrade legitimately changes). Two databases, or one before and after an
-/// upgrade, hold identical rows exactly when the maps are equal.
-async fn row_digests(store: &Store) -> Result<BTreeMap<String, String>> {
+/// Every table's columns in declaration order, keyed by table name (`atlas_schema` excluded: its
+/// version is what an upgrade legitimately changes).
+async fn columns(store: &Store) -> Result<BTreeMap<String, Vec<String>>> {
     let tables: Vec<String> = if crate::support::database::postgres() {
         sqlx::query_scalar(
             "SELECT table_name::text FROM information_schema.tables WHERE table_schema=current_schema() AND table_type='BASE TABLE' AND table_name<>'atlas_schema' ORDER BY 1",
@@ -182,32 +202,62 @@ async fn row_digests(store: &Store) -> Result<BTreeMap<String, String>> {
         .fetch_all(&store.pool)
         .await?
     };
-    let mut digests = BTreeMap::new();
+    let mut columns = BTreeMap::new();
     for table in tables {
-        let rows: String = if crate::support::database::postgres() {
-            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-                "SELECT COALESCE(string_agg(t::text, E'\\n' ORDER BY t::text),'') FROM \"{table}\" t"
-            )))
-            .fetch_one(&store.pool)
-            .await?
+        let names: Vec<String> = sqlx::query_scalar(if crate::support::database::postgres() {
+            "SELECT column_name::text FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=$1 ORDER BY ordinal_position"
         } else {
-            let columns: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-                "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
-            )))
-            .fetch_all(&store.pool)
-            .await?;
-            let row = columns
-                .iter()
-                .map(|c| format!("quote(\"{c}\")"))
-                .collect::<Vec<_>>()
-                .join("||'|'||");
-            sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-                "SELECT COALESCE(group_concat(r, char(10)),'') FROM (SELECT {row} AS r FROM \"{table}\" ORDER BY r)"
-            )))
-            .fetch_one(&store.pool)
-            .await?
-        };
-        digests.insert(table, rows);
+            "SELECT name FROM pragma_table_info($1) ORDER BY cid"
+        })
+        .bind(&table)
+        .fetch_all(&store.pool)
+        .await?;
+        columns.insert(table, names);
+    }
+    Ok(columns)
+}
+
+/// Every table's rows as one canonical string, keyed by table name (`atlas_schema` excluded: its
+/// version is what an upgrade legitimately changes). Two databases, or one before and after an
+/// upgrade, hold identical rows exactly when the maps are equal.
+async fn row_digests(store: &Store) -> Result<BTreeMap<String, String>> {
+    row_digests_over(store, &columns(store).await?).await
+}
+
+/// The rows of exactly the given tables and columns. Comparing an upgraded database over the
+/// columns it had *before* the upgrade proves every pre-existing value is unchanged while the
+/// step may add nullable columns; what those new columns hold is asserted separately.
+async fn row_digests_over(
+    store: &Store,
+    columns: &BTreeMap<String, Vec<String>>,
+) -> Result<BTreeMap<String, String>> {
+    let mut digests = BTreeMap::new();
+    for (table, names) in columns {
+        let row = names
+            .iter()
+            .map(|c| {
+                if crate::support::database::postgres() {
+                    format!("quote_nullable(\"{c}\"::text)")
+                } else {
+                    format!("quote(\"{c}\")")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("||'|'||");
+        let rows: String = sqlx::query_scalar(sqlx::AssertSqlSafe(
+            if crate::support::database::postgres() {
+                format!(
+                    "SELECT COALESCE(string_agg(r, E'\\n' ORDER BY r),'') FROM (SELECT {row} AS r FROM \"{table}\") t"
+                )
+            } else {
+                format!(
+                    "SELECT COALESCE(group_concat(r, char(10)),'') FROM (SELECT {row} AS r FROM \"{table}\" ORDER BY r)"
+                )
+            },
+        ))
+        .fetch_one(&store.pool)
+        .await?;
+        digests.insert(table.clone(), rows);
     }
     Ok(digests)
 }
@@ -404,10 +454,11 @@ async fn the_frozen_1003_baseline_is_the_account_wide_schema() -> Result<()> {
 }
 
 #[tokio::test]
-async fn a_1003_database_upgrades_to_1004_in_place() -> Result<()> {
+async fn a_1003_database_upgrades_to_1004_and_1005_in_place() -> Result<()> {
     let (_dir, url) = crate::support::database::database_url().await?;
     let store = baseline_1003(&url).await?;
     let seed = seed(&store, true).await?;
+    let old_columns = columns(&store).await?;
     let before = row_digests(&store).await?;
     for table in [
         "timer_sessions",
@@ -426,25 +477,25 @@ async fn a_1003_database_upgrades_to_1004_in_place() -> Result<()> {
     assert_eq!(timer_rows(&store, &seed.account).await?, 4);
 
     store.migrate().await?;
-    assert_eq!(version(&store).await?, [1004]);
+    assert_eq!(version(&store).await?, [CURRENT]);
     assert_eq!(
-        row_digests(&store).await?,
+        row_digests_over(&store, &old_columns).await?,
         before,
-        "the step rewrites no row of any table"
+        "the steps rewrite no row of any table"
     );
 
     // A second migrate is a no-op, and so is a restart through a new connection.
     store.migrate().await?;
     let restarted = Store::connect(&url).await?;
     restarted.migrate().await?;
-    assert_eq!(version(&restarted).await?, [1004]);
-    assert_eq!(row_digests(&restarted).await?, before);
+    assert_eq!(version(&restarted).await?, [CURRENT]);
+    assert_eq!(row_digests_over(&restarted, &old_columns).await?, before);
 
     // Whole-database index parity with a fresh baseline: nothing else drifted.
     let (_fresh_dir, fresh_url) = crate::support::database::database_url().await?;
     let fresh = Store::connect(&fresh_url).await?;
     fresh.migrate().await?;
-    assert_eq!(version(&fresh).await?, [1004]);
+    assert_eq!(version(&fresh).await?, [CURRENT]);
     assert_eq!(indexes(&store, None).await?, indexes(&fresh, None).await?);
     for table in [
         "timer_sessions",
@@ -459,16 +510,16 @@ async fn a_1003_database_upgrades_to_1004_in_place() -> Result<()> {
 }
 
 #[tokio::test]
-async fn a_fresh_database_records_1004_and_restarts() -> Result<()> {
+async fn a_fresh_database_records_the_current_version_and_restarts() -> Result<()> {
     let (_dir, url) = crate::support::database::database_url().await?;
     let fresh = Store::connect(&url).await?;
     fresh.migrate().await?;
-    assert_eq!(version(&fresh).await?, [1004]);
+    assert_eq!(version(&fresh).await?, [CURRENT]);
     // Restarted twice: the fresh-database-bricked-on-restart regression must not reproduce.
     for _ in 0..2 {
         let restarted = Store::connect(&url).await?;
         restarted.migrate().await?;
-        assert_eq!(version(&restarted).await?, [1004]);
+        assert_eq!(version(&restarted).await?, [CURRENT]);
     }
     let names = index_names(&fresh, "timer_sessions").await?;
     assert!(names.contains(&"timer_active_account_occurrence".to_string()));
@@ -484,16 +535,18 @@ async fn a_1000_database_upgrades_in_place() -> Result<()> {
     assert!(!table_exists(&store, "activation_grants").await?);
     let seed = seed(&store, false).await?;
     let session = add_session(&store, &seed.account, "phone", FAR).await?;
+    let old_columns = columns(&store).await?;
     let before = row_digests(&store).await?;
 
     store.migrate().await?;
-    assert_eq!(version(&store).await?, [1004]);
+    assert_eq!(version(&store).await?, [CURRENT]);
     assert!(table_exists(&store, "operation_outcomes").await?);
     assert!(table_exists(&store, "activation_grants").await?);
     assert!(table_exists(&store, "people_request_history").await?);
     assert!(table_exists(&store, "household_invitation_history").await?);
+    assert!(table_exists(&store, "device_profiles").await?);
     // Existing rows are untouched.
-    let after = row_digests(&store).await?;
+    let after = row_digests_over(&store, &old_columns).await?;
     for (table, rows) in &before {
         assert_eq!(&after[table], rows, "{table} rows are preserved");
     }
@@ -506,7 +559,7 @@ async fn a_1000_database_upgrades_in_place() -> Result<()> {
 
     // Idempotent restart, and the upgraded database is usable for the new feature.
     store.migrate().await?;
-    assert_eq!(version(&store).await?, [1004]);
+    assert_eq!(version(&store).await?, [CURRENT]);
     let outcome = store
         .revoke_session(&seed.account, &session, &id(), 1000)
         .await?;
@@ -517,7 +570,7 @@ async fn a_1000_database_upgrades_in_place() -> Result<()> {
     let (_fresh_dir, fresh_url) = crate::support::database::database_url().await?;
     let fresh = Store::connect(&fresh_url).await?;
     fresh.migrate().await?;
-    assert_eq!(version(&fresh).await?, [1004]);
+    assert_eq!(version(&fresh).await?, [CURRENT]);
     for table in [
         "operation_outcomes",
         "activation_grants",
@@ -525,6 +578,8 @@ async fn a_1000_database_upgrades_in_place() -> Result<()> {
         "people_request_history",
         "household_invitation_history",
         "timer_sessions",
+        "sessions",
+        "device_profiles",
     ] {
         assert_eq!(
             shape(&fresh, table).await?,
@@ -543,14 +598,16 @@ async fn a_1001_database_upgrades_in_place() -> Result<()> {
     assert!(!table_exists(&store, "activation_grants").await?);
     let seed = seed(&store, false).await?;
     let session = add_session(&store, &seed.account, "phone", FAR).await?;
+    let old_columns = columns(&store).await?;
     let before = row_digests(&store).await?;
 
     store.migrate().await?;
-    assert_eq!(version(&store).await?, [1004]);
+    assert_eq!(version(&store).await?, [CURRENT]);
     assert!(table_exists(&store, "activation_grants").await?);
     assert!(table_exists(&store, "people_request_history").await?);
     assert!(table_exists(&store, "household_invitation_history").await?);
-    let after = row_digests(&store).await?;
+    assert!(table_exists(&store, "device_profiles").await?);
+    let after = row_digests_over(&store, &old_columns).await?;
     for (table, rows) in &before {
         assert_eq!(&after[table], rows, "{table} rows are preserved");
     }
@@ -565,7 +622,7 @@ async fn a_1001_database_upgrades_in_place() -> Result<()> {
         .bind(id()).bind(id()).bind(&seed.account).bind("grant-only-device").bind(id())
         .execute(&store.pool)
         .await?;
-    let devices = store.devices(&seed.account, 0).await?;
+    let devices = store.devices(&seed.account, 0).await?.devices;
     let grant_only = devices
         .iter()
         .find(|d| d.id == "grant-only-device")
@@ -574,13 +631,19 @@ async fn a_1001_database_upgrades_in_place() -> Result<()> {
 
     // Idempotent restart.
     store.migrate().await?;
-    assert_eq!(version(&store).await?, [1004]);
+    assert_eq!(version(&store).await?, [CURRENT]);
     assert_timer_indexes_replaced(&store, &seed).await?;
 
     let (_fresh_dir, fresh_url) = crate::support::database::database_url().await?;
     let fresh = Store::connect(&fresh_url).await?;
     fresh.migrate().await?;
-    for table in ["activation_grants", "oidc_flows", "timer_sessions"] {
+    for table in [
+        "activation_grants",
+        "oidc_flows",
+        "timer_sessions",
+        "sessions",
+        "device_profiles",
+    ] {
         assert_eq!(
             shape(&fresh, table).await?,
             shape(&store, table).await?,
@@ -593,7 +656,7 @@ async fn a_1001_database_upgrades_in_place() -> Result<()> {
 /// BE-Q16: a request/invitation already pending at migration time must appear in the new
 /// durable history tables immediately via the backfill, not only from the next transition.
 #[tokio::test]
-async fn a_1002_database_upgrades_to_1003_and_1004_in_place() -> Result<()> {
+async fn a_1002_database_upgrades_to_1003_1004_and_1005_in_place() -> Result<()> {
     let (_dir, url) = crate::support::database::database_url().await?;
     let store = baseline_1002(&url).await?;
     assert!(!table_exists(&store, "people_request_history").await?);
@@ -617,13 +680,14 @@ async fn a_1002_database_upgrades_to_1003_and_1004_in_place() -> Result<()> {
         .bind(&invitation).bind(&household).bind(&sender).bind(&recipient)
         .execute(&store.pool)
         .await?;
+    let old_columns = columns(&store).await?;
     let before = row_digests(&store).await?;
 
     store.migrate().await?;
-    assert_eq!(version(&store).await?, [1004]);
+    assert_eq!(version(&store).await?, [CURRENT]);
     assert!(table_exists(&store, "people_request_history").await?);
     assert!(table_exists(&store, "household_invitation_history").await?);
-    let after = row_digests(&store).await?;
+    let after = row_digests_over(&store, &old_columns).await?;
     for (table, rows) in &before {
         assert_eq!(&after[table], rows, "{table} rows are preserved");
     }
@@ -646,7 +710,7 @@ async fn a_1002_database_upgrades_to_1003_and_1004_in_place() -> Result<()> {
 
     // Idempotent restart.
     store.migrate().await?;
-    assert_eq!(version(&store).await?, [1004]);
+    assert_eq!(version(&store).await?, [CURRENT]);
     assert_timer_indexes_replaced(&store, &seed).await?;
     Ok(())
 }
@@ -660,8 +724,8 @@ async fn versions_the_chain_cannot_walk_keep_the_reset_error() -> Result<()> {
     store
         .add_account(&account, &format!("u{}", account.replace('-', "")), "x")
         .await?;
-    // 1004 is the current version, so the first version past it is the first unsupported one.
-    for unsupported in [1_i64, 999, 1005, 2000] {
+    // The first version past the current one is the first unsupported one.
+    for unsupported in [1_i64, 999, CURRENT + 1, 2000] {
         sqlx::query("UPDATE atlas_schema SET version=$1")
             .bind(unsupported)
             .execute(&store.pool)
@@ -678,7 +742,8 @@ async fn versions_the_chain_cannot_walk_keep_the_reset_error() -> Result<()> {
     // surviving row is left at the current version (matching this store's actual, already-walked
     // shape), so the final `migrate()` below is a genuine no-op rather than re-running a step
     // against tables the fresh connection above already created.
-    sqlx::query("UPDATE atlas_schema SET version=1004")
+    sqlx::query("UPDATE atlas_schema SET version=$1")
+        .bind(CURRENT)
         .execute(&store.pool)
         .await?;
     sqlx::query("INSERT INTO atlas_schema(version) VALUES (1000)")
@@ -712,7 +777,7 @@ async fn two_processes_upgrading_at_once_both_succeed() -> Result<()> {
     let (a, b) = tokio::join!(first.migrate(), second.migrate());
     a?;
     b?;
-    assert_eq!(version(&first).await?, [1004]);
+    assert_eq!(version(&first).await?, [CURRENT]);
     assert!(table_exists(&first, "operation_outcomes").await?);
     assert!(table_exists(&first, "activation_grants").await?);
     assert!(table_exists(&first, "people_request_history").await?);
@@ -727,7 +792,7 @@ async fn two_processes_upgrading_from_1001_at_once_both_succeed() -> Result<()> 
     let (a, b) = tokio::join!(first.migrate(), second.migrate());
     a?;
     b?;
-    assert_eq!(version(&first).await?, [1004]);
+    assert_eq!(version(&first).await?, [CURRENT]);
     assert!(table_exists(&first, "activation_grants").await?);
     assert!(table_exists(&first, "people_request_history").await?);
     Ok(())
@@ -741,7 +806,7 @@ async fn two_processes_upgrading_from_1002_at_once_both_succeed() -> Result<()> 
     let (a, b) = tokio::join!(first.migrate(), second.migrate());
     a?;
     b?;
-    assert_eq!(version(&first).await?, [1004]);
+    assert_eq!(version(&first).await?, [CURRENT]);
     assert!(table_exists(&first, "people_request_history").await?);
     assert!(table_exists(&first, "household_invitation_history").await?);
     Ok(())
@@ -752,13 +817,176 @@ async fn two_processes_upgrading_from_1003_at_once_both_succeed() -> Result<()> 
     let (_dir, url) = crate::support::database::database_url().await?;
     let first = baseline_1003(&url).await?;
     let seed = seed(&first, true).await?;
+    let old_columns = columns(&first).await?;
     let before = row_digests(&first).await?;
     let second = Store::connect(&url).await?;
     let (a, b) = tokio::join!(first.migrate(), second.migrate());
     a?;
     b?;
-    assert_eq!(version(&first).await?, [1004]);
-    assert_eq!(row_digests(&first).await?, before);
+    assert_eq!(version(&first).await?, [CURRENT]);
+    assert_eq!(row_digests_over(&first, &old_columns).await?, before);
     assert_timer_indexes_replaced(&first, &seed).await?;
+    Ok(())
+}
+
+// ------------------------------------------------------------------------- 1004 -> 1005 (BE-Q25)
+
+async fn check_violation(store: &Store, statement: &str) {
+    let error = sqlx::query(sqlx::AssertSqlSafe(statement.to_owned()))
+        .execute(&store.pool)
+        .await
+        .expect_err(statement);
+    assert!(
+        error
+            .as_database_error()
+            .is_some_and(|e| e.is_check_violation()),
+        "{statement}: {error}"
+    );
+}
+
+/// The negative control for the `1005` cases: the frozen `1004` schema has neither the session
+/// label columns nor `device_profiles`.
+#[tokio::test]
+async fn the_frozen_1004_baseline_has_no_labels_or_profiles() -> Result<()> {
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let store = baseline_1004(&url).await?;
+    assert!(!table_exists(&store, "device_profiles").await?);
+    let sessions = &columns(&store).await?["sessions"];
+    assert!(
+        !sessions.iter().any(|c| c.starts_with("client_")),
+        "{sessions:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_1004_database_upgrades_to_1005_in_place() -> Result<()> {
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let store = baseline_1004(&url).await?;
+    let seed = seed(&store, true).await?;
+    let live = add_session(&store, &seed.account, "phone", FAR).await?;
+    add_session(&store, &seed.account, "laptop", 1).await?;
+    add_session(&store, &seed.other, "phone", FAR).await?;
+    let old_columns = columns(&store).await?;
+    let before = row_digests(&store).await?;
+    for table in ["sessions", "timer_sessions", "receipts", "accounts"] {
+        assert!(!before[table].is_empty(), "{table} is seeded");
+    }
+
+    store.migrate().await?;
+    assert_eq!(version(&store).await?, [1005]);
+    assert_eq!(
+        row_digests_over(&store, &old_columns).await?,
+        before,
+        "the step rewrites no existing value"
+    );
+    // Legacy sessions carry no label (nothing to backfill from), and no profile exists.
+    let labelled: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE client_channel IS NOT NULL OR client_browser IS NOT NULL OR client_platform IS NOT NULL")
+        .fetch_one(&store.pool)
+        .await?;
+    assert_eq!(labelled, 0);
+    let profiles: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM device_profiles")
+        .fetch_one(&store.pool)
+        .await?;
+    assert_eq!(profiles, 0);
+    let listing = store.devices(&seed.account, 1000).await?;
+    let phone = listing
+        .devices
+        .iter()
+        .find(|d| d.id == "phone")
+        .expect("the legacy session's device is listed");
+    assert_eq!((phone.name.as_deref(), phone.client), (None, None));
+    assert_eq!(phone.summary.sessions, 1);
+
+    // Idempotent, also through a restarted connection.
+    store.migrate().await?;
+    let restarted = Store::connect(&url).await?;
+    restarted.migrate().await?;
+    assert_eq!(version(&restarted).await?, [1005]);
+    assert_eq!(row_digests_over(&restarted, &old_columns).await?, before);
+
+    // The upgraded shape is exactly a fresh database's.
+    let (_fresh_dir, fresh_url) = crate::support::database::database_url().await?;
+    let fresh = Store::connect(&fresh_url).await?;
+    fresh.migrate().await?;
+    assert_eq!(indexes(&store, None).await?, indexes(&fresh, None).await?);
+    for table in ["sessions", "device_profiles"] {
+        assert_eq!(
+            shape(&fresh, table).await?,
+            shape(&store, table).await?,
+            "upgrade and baseline agree on {table}"
+        );
+    }
+    assert_eq!(
+        columns(&fresh).await?,
+        columns(&store).await?,
+        "every table has the same columns in the same order"
+    );
+
+    // The database refuses values the writer never produces, on the upgraded and fresh shapes.
+    for db in [&store, &fresh] {
+        let account = if std::ptr::eq(db, &store) {
+            seed.account.clone()
+        } else {
+            let account = id();
+            db.add_account(&account, &format!("u{}", account.replace('-', "")), "x")
+                .await?;
+            add_session(db, &account, "phone", FAR).await?;
+            account
+        };
+        for statement in [
+            format!(
+                "INSERT INTO device_profiles(account_id,device_id,name,updated_at) VALUES ('{account}','d','',1)"
+            ),
+            format!(
+                "INSERT INTO device_profiles(account_id,device_id,name,updated_at) VALUES ('{account}','d','{}',1)",
+                "x".repeat(65)
+            ),
+            format!(
+                "INSERT INTO device_profiles(account_id,device_id,client_channel,updated_at) VALUES ('{account}','d','tv',1)"
+            ),
+            format!(
+                "INSERT INTO device_profiles(account_id,device_id,client_browser,updated_at) VALUES ('{account}','d','netscape',1)"
+            ),
+            format!(
+                "INSERT INTO device_profiles(account_id,device_id,client_platform,updated_at) VALUES ('{account}','d','beos',1)"
+            ),
+            "UPDATE sessions SET client_channel='tv'".to_owned(),
+            "UPDATE sessions SET client_browser='netscape'".to_owned(),
+            "UPDATE sessions SET client_platform='beos'".to_owned(),
+        ] {
+            check_violation(db, &statement).await;
+        }
+        // 64 characters of a multi-byte script are within the bound.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO device_profiles(account_id,device_id,name,client_channel,client_browser,client_platform,updated_at) VALUES ('{account}','d','{}','browser','samsung_internet','chromeos',1)",
+            "\u{e9}".repeat(64)
+        )))
+        .execute(&db.pool)
+        .await?;
+    }
+    let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE session_id=$1")
+        .bind(&live)
+        .fetch_one(&store.pool)
+        .await?;
+    assert_eq!(kept, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn two_processes_upgrading_from_1004_at_once_both_succeed() -> Result<()> {
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let first = baseline_1004(&url).await?;
+    let seed = seed(&first, true).await?;
+    add_session(&first, &seed.account, "phone", FAR).await?;
+    let old_columns = columns(&first).await?;
+    let before = row_digests(&first).await?;
+    let second = Store::connect(&url).await?;
+    let (a, b) = tokio::join!(first.migrate(), second.migrate());
+    a?;
+    b?;
+    assert_eq!(version(&first).await?, [1005]);
+    assert!(table_exists(&first, "device_profiles").await?);
+    assert_eq!(row_digests_over(&first, &old_columns).await?, before);
     Ok(())
 }

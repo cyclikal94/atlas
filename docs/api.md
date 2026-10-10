@@ -119,6 +119,22 @@ applies. See [tasks](tasks.md#dependencies-timers-and-recurrence). The compatibi
 baseline gains a probe group for the second-occurrence start, both row shapes, redaction
 and the rejected inputs.
 
+`0.28.0` makes sessions and devices recognisable and reports capacity (BE-Q25). It adds
+required members to four strict responses, which is why it is a MINOR advance: a validator
+built from an earlier contract rejects them. `SessionSummary` gains `client` (a
+`ClientLabel`, or `null` for a session issued before this version) and `device_name`;
+`Sessions` gains `session_capacity`; `Device` gains `name` and `client`; `Devices` gains
+`sync_capacity` (both `Capacity`). Two operations are added on
+`/devices/{device_id}/name`: `PUT` (`setDeviceName`, body `DeviceNameUpdate`) and `DELETE`
+(`clearDeviceName`), each `204`. New schemas: `ClientLabel`, `Capacity`, `DeviceName` and
+`DeviceNameUpdate`. No existing member, status or route changes, the enforced limits are
+unchanged (32 live sessions and 32 sync registrations per account, now shared constants
+with the reads that report them), and a name is not part of `state_token`. It needs
+database schema `1005`. A client must treat an absent member (an older server) as capacity
+unavailable and a label it does not recognise as `unknown`, and must render names as text.
+See [authentication](authentication.md#session-and-device-labels). The compatibility
+baseline gains a `labels_and_capacity` probe group.
+
 Mutations require an account-scoped UUID `Idempotency-Key` and explicit version
 preconditions where defined. Commands that replace existing authored text also carry the
 resource's sharing revision (`expected_policy_version`), so a write cannot commit under
@@ -149,7 +165,7 @@ statuses and [sync](sync.md) for client recovery.
 `GET /health` returns the version of the API contract the running server was built with:
 
 ```json
-{"status": "ok", "api_version": "0.27.0"}
+{"status": "ok", "api_version": "0.28.0"}
 ```
 
 `api_version` is exactly `info.version` in [the contract](../api/openapi.json), read from

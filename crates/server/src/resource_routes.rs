@@ -76,6 +76,7 @@ pub(crate) async fn sync(
         input.cursor.as_ref().is_none_or(|c| c.len() <= 512),
         ErrorCode::InvalidValue,
     )?;
+    hook!(app.store, "sync_route.after_identity");
     Ok(Json(
         app.store
             .sync(
@@ -83,7 +84,7 @@ pub(crate) async fn sync(
                 &device,
                 input.cursor.as_deref(),
                 input.limit.unwrap_or(50),
-                now(),
+                now,
             )
             .await?,
     ))
