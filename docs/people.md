@@ -64,9 +64,13 @@ detail "Shared with" rail, without the owner-only `GET /policies/{id}`:
 
 | Read | Returns |
 | --- | --- |
-| `GET /people/summaries?scope=&archived=&after=&limit=` | `PersonSummaryPage`: one page (1–100 rows, default 50) of the caller's visible people in ascending id order, the caller's primary household as `home` (or `null`) and `next_after` |
+| `GET /people/summaries?scope=&archived=&after=&limit=` | `PersonSummaryPage`: one page (1–100 rows, default 50) of the caller's visible people in ascending id order and `next_after` |
 | `GET /people/{id}/summary` | `PersonSummaryDetail`: one visible person's `PersonSummary` and its `SharedWith` rail |
-| `GET /people/{id}/field-audiences?archived=&after=&limit=` | `FieldAudiencePage`: the person's fields the caller can see, each with its `AudienceSummary` |
+| `GET /people/{id}/field-audiences?archived=&after=&limit=` | `FieldAudiencePage`: the person's fields the caller can see, each with its own sharing (`audience`) and who can actually see it (`effective`) |
+
+Every response also carries the caller's primary household as `home` (or `null`) and
+the caller's `preferences_version`, both from the response's own snapshot (see
+freshness below).
 
 A merged person's old id resolves to the canonical person, as on `GET /people/{id}`. A
 person the caller cannot see and an id that names nothing are the same `404 not_found`.
@@ -80,7 +84,16 @@ an account that did not create it, and unlinking keeps the transferred owner, so
 cannot answer the question. `create_person` records its caller; `reference_account`
 records its caller when it creates the referenced account's identity and nothing when the
 identity already exists; link, merge, unlink, rename and archive never change the record.
-`added_by_you` is `yes`, `no` (never naming who) or `unknown`. No earlier record proves
+`added_by_you` is evaluated over the person **and every person merged into it**: linking a
+person to an account that already has a profile merges the linked person into that
+profile, and neither that nor any other merge erases the relationship. It is `yes` when the
+caller added any of them, `no` (never naming who) when every one of them is known to have
+been added by another account, and otherwise `unknown`. `shared_with_me` uses the same
+rule, and list, detail and filters agree. Each person keeps exactly its own record (an
+archived merged person, listed with `archived=true`, reports its own); nothing is copied
+onto the canonical person or overwritten. The only extra thing a reader can infer is that
+some merged person predates attribution (`unknown` rather than `no`), never who, which or
+how many. No earlier record proves
 who created an existing person (ownership may have moved, unlink deletes the link, and
 receipts hold digests only), so the `1005 → 1006` upgrade records nobody and every older
 person is `unknown`: make no attribution claim for it. Attribution grants no access and
@@ -99,6 +112,19 @@ reader can see it. `member_count` is a household's size, not how many members ca
 person. `your_access` is `owner`, `edit` or `view` exactly as `can_edit`; a person linked
 to another account is `view` for everyone but that account, even with an editable grant.
 
+**Fields: sharing versus who can see it.** A field is visible only to someone who can also
+see its person, so a field's own sharing is an upper bound on its audience, not the
+audience. `FieldAudience.audience` describes the field's own sharing under the rules above:
+for a field, `disclosure: "complete"` means only that the caller owns that configuration.
+`FieldAudience.effective` says who can actually see it. It is `complete` only when the
+caller owns both the field and its person, and so may already read both policies:
+`account_count` is the other accounts that can see the field now and `limited_count` the
+accounts its own sharing reaches (a direct grant or a member of a granted household, not
+excluded and not the owner) that cannot, because they cannot see the person. Otherwise it is
+`partial` with both counts `null`, always, including for the owner of a field on someone
+else's person: that person's audience belongs to its owner, and the response neither
+confirms nor denies that it narrows the field's.
+
 **Filters.** `scope` is evaluated in the database over the caller's whole visible set,
 then paginated, so following `next_after` to the end is complete at each read:
 
@@ -115,15 +141,35 @@ changes while a client pages may be missed or appear newly; re-read after change
 
 **Consistency and freshness.** Each call reads one database snapshot (PostgreSQL
 `REPEATABLE READ`; SQLite's first read fixes the WAL snapshot), so a row's audience,
-versions and field count belong together. Revocation applies to the next call: the person
-leaves every scope and the `{id}` reads return `404`. A summary is identity-bound display
-data, never an access grant, and is online-only: it is not part of `/sync` and is
-`Cache-Control: private, no-store`. Re-read when a synced projection's `version` or
-`policy_version` differs from the summary's, when a projection is removed, after a receipt
-for a people, sharing, policy or household command, after reconnecting or
-re-authenticating, and when `GET /households` versions change. Keep pages per account and
-access epoch, do not persist them, drop a late response for another identity, and show a
-summary as unavailable offline rather than showing an old one.
+versions, field count, `home` and `preferences_version` belong together. Revocation
+applies to the next call: the person leaves every scope and the `{id}` reads return `404`.
+A summary is identity-bound display data, never an access grant, and is online-only: it is
+not part of `/sync` and is `Cache-Control: private, no-store`. It is as fresh as its
+snapshot and no fresher. Its inputs, and how a client learns that one changed:
+
+| Input | Change signal |
+| --- | --- |
+| The person's label, archive, linkage, owner, attribution (merges) and sharing | The synced person projection's `version`/`policy_version` changes, or it is removed |
+| `field_count` and field audiences | Any synced field projection of that person is added, changed or removed |
+| `owner.person` | The synced projection of the owner's linked person changes, appears or is removed |
+| Household names, versions, sizes and the caller's memberships | `GET /households` versions or membership |
+| The primary household (`home`, every `in_home`) | `preferences_version` (`GET /defaults` and every summary response). A change, from any device, publishes nothing to `/sync` |
+
+A client re-reads the summaries it shows on any change to **any** synced person or field
+projection (not only the listed rows), after any command receipt, after reconnecting or
+re-authenticating, when `GET /households` or `preferences_version` changes, and, while a
+summary is shown online, at least every 60 seconds and whenever the view becomes visible
+again, because household and primary household changes made by another device or member
+publish nothing to this device. A summary shown online may therefore be up to that
+interval behind such a change; never present it as live.
+
+Responses can arrive out of order. For each account, access epoch and query, apply only
+the response to the latest request; an invalidation supersedes every earlier request, and
+a traversal that is invalidated restarts from its first page instead of mixing pages. Never
+apply a response whose `preferences_version` is lower than one already applied in the same
+epoch, nor replace a row with one whose `version` or `policy_version` is lower. Drop every
+late response for another identity or epoch, keep pages in memory only, and show a summary
+as unavailable offline rather than showing an old one.
 
 A household member's view of a person shared with their primary household:
 
@@ -141,7 +187,14 @@ The same caller's rail, and In Home for a caller with no primary household:
 
 <!-- experimental-schema: PersonSummaryPage -->
 ```json
-{"items": [], "next_after": null, "home": null}
+{"items": [], "next_after": null, "home": null, "preferences_version": 2}
+```
+
+The owner of a field and its person, where one Home member cannot see the person:
+
+<!-- experimental-schema: FieldAudience -->
+```json
+{"id": "3c2b1a09-8f7e-4d6c-9b5a-4f3e2d1c0b9a", "version": 1, "policy_version": 1, "archived": false, "owner_is_you": true, "your_access": "owner", "audience": {"disclosure": "complete", "in_home": true, "households": [{"id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d", "can_edit": false, "you_are_member": true, "name": "Atlas Home", "version": 3, "member_count": 3}], "your_direct_grant": null, "direct_grant_count": 0, "excluded_count": 0}, "effective": {"disclosure": "complete", "account_count": 1, "limited_count": 1}}
 ```
 
 ## Merge privacy and offline identities

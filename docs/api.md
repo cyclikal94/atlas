@@ -144,9 +144,14 @@ byte-for-byte as before. It adds three authenticated reads, `GET /people/summari
 schemas: `PersonSummaryPage`, `PersonSummary`, `SummaryOwner`, `SummaryPersonRef`,
 `AudienceSummary`, `HouseholdAudience`, `SummaryDirectGrant`, `PeopleHome`,
 `PersonSummaryDetail`, `SharedWith`, `SharedHousehold`, `SharedMember`,
-`SummaryAccountGrant`, `SummaryAccountRef`, `FieldAudiencePage` and `FieldAudience`. A
-reader who does not own a person always receives a `partial` summary that discloses
-nothing about access the reader does not hold. It needs database schema `1006`, which
+`SummaryAccountGrant`, `SummaryAccountRef`, `FieldAudiencePage`, `FieldAudience` and
+`FieldEffectiveAccess`. A reader who does not own a person always receives a `partial`
+summary that discloses nothing about access the reader does not hold. `added_by_you`
+covers every person merged into a person, so linking into an existing profile keeps it. A
+field's `audience` is its own sharing and its `effective` access is complete only for a
+reader who owns the field and its person. Every response carries `home` and the reader's
+`preferences_version`, and the descriptions state the online freshness and response
+ordering rules. It needs database schema `1006`, which
 adds the original-creator record behind `added_by_you`; people created earlier read
 `unknown`. A client must call these reads only once the server reports `0.29.0` or later,
 and must not probe `GET /policies/{id}` for people it does not own. See

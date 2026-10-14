@@ -1448,10 +1448,19 @@ async fn s14_a_merged_id_resolves_and_each_person_keeps_its_own_attribution() ->
         d.summary.id, target,
         "the old id resolves to the canonical person"
     );
+    // Revision 1 (R1) adaptation: the canonical keeps its own (absent) row, but the viewer-relative
+    // value now covers the merged person too, which A added. Before revision 1 this asserted
+    // `Unknown` (canonical-only semantics), which contradicted "linkage does not erase a proven
+    // Added by you relationship".
     assert_eq!(
         d.summary.added_by_you,
-        AddedBy::Unknown,
-        "the canonical keeps its own"
+        AddedBy::Yes,
+        "A added a person merged into the canonical"
+    );
+    assert_eq!(
+        attributions(&s).await?,
+        [(source.clone(), a.clone())],
+        "the canonical keeps its own (absent) row; nothing is copied"
     );
     assert_eq!(d.summary.field_count, 1, "the field moved with the merge");
     let fields = s
@@ -1605,6 +1614,508 @@ async fn s16_one_page_is_read_from_one_snapshot() -> Result<()> {
             "{seen:?}"
         );
     }
+    Ok(())
+}
+
+// S18 -----------------------------------------------------------------------------------------
+// Revision 1, R1: linking into an existing canonical person merges the linked person into it. The
+// creator's proven relationship survives through the canonical id, in list, detail and filters.
+
+async fn merge(s: &Store, actor: &str, source: &str, target: &str, name: &str) -> Result<()> {
+    let preview = s.merge_preview(actor, source, target).await?;
+    s.people_command(
+        actor,
+        &id(),
+        &PeopleCommand::Merge {
+            source_id: source.into(),
+            target_id: target.into(),
+            preview_token: preview.token,
+            name: name.into(),
+        },
+        NOW,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn attributions(s: &Store) -> Result<Vec<(String, String)>> {
+    Ok(
+        sqlx::query_as("SELECT person_id,added_by FROM person_attributions ORDER BY person_id")
+            .fetch_all(&s.pool)
+            .await?,
+    )
+}
+
+#[tokio::test]
+async fn s18_linking_into_an_existing_canonical_person_keeps_who_added_it() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (a, b, c, d) = (
+        account(&s).await?,
+        account(&s).await?,
+        account(&s).await?,
+        account(&s).await?,
+    );
+    // B references C's account: C's canonical person, owned by C, added by B.
+    let canonical = reference(&s, &b, &c).await?;
+    let source = create_person(&s, &a, "Creator profile", Policy::default()).await?;
+    assert_eq!(row(&s, &a, &source).await?.added_by_you, AddedBy::Yes);
+    let recorded = attributions(&s).await?;
+    link(&s, &a, &c, &source).await?;
+
+    // A's old id resolves to C's canonical person, which A is known to have added (a merged
+    // person), and so is excluded from A's Shared with me in every read.
+    let d_a = detail(&s, &a, &source).await?;
+    assert_eq!(
+        d_a.summary.id, canonical,
+        "the link merged into the canonical"
+    );
+    assert_eq!(d_a.summary.added_by_you, AddedBy::Yes);
+    let r = row(&s, &a, &canonical).await?;
+    assert_eq!(r, d_a.summary, "list and detail agree");
+    assert_eq!(scopes_of(&s, &a, &canonical).await?, [PeopleScope::All]);
+    // B created the canonical person itself: also yes, also not Shared with me.
+    assert_eq!(row(&s, &b, &canonical).await?.added_by_you, AddedBy::Yes);
+    assert!(
+        !ids(&s, &b, PeopleScope::SharedWithMe)
+            .await?
+            .contains(&canonical)
+    );
+    // The owner added neither, and both are known: no.
+    assert_eq!(row(&s, &c, &canonical).await?.added_by_you, AddedBy::No);
+    // Nothing was rewritten or invented: each person keeps exactly its own row.
+    assert_eq!(attributions(&s).await?, recorded);
+    // Attribution grants nothing: A can see the canonical only through its merged grant, and
+    // cannot rename the subject's name.
+    assert_eq!(r.your_access, Access::View);
+
+    // Positive control: with no canonical person for D, the link keeps A's person itself.
+    let control = create_person(&s, &a, "Link control", Policy::default()).await?;
+    link(&s, &a, &d, &control).await?;
+    let r = row(&s, &a, &control).await?;
+    assert_eq!(
+        (r.id.as_str(), r.added_by_you),
+        (control.as_str(), AddedBy::Yes)
+    );
+    assert!(
+        !ids(&s, &a, PeopleScope::SharedWithMe)
+            .await?
+            .contains(&control)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn s19_merged_people_combine_known_and_unknown_attribution_through_alias_chains() -> Result<()>
+{
+    let (_dir, s) = fixture().await?;
+    let (a, b, c, e) = (
+        account(&s).await?,
+        account(&s).await?,
+        account(&s).await?,
+        account(&s).await?,
+    );
+    let home = household(&s, &c, "Home").await?;
+    join(&s, &c, &e, &home).await?;
+    // A merges two of its own people; the target predates attribution (unknown).
+    let first = create_person(&s, &a, "Robin", Policy::default()).await?;
+    let legacy = create_person(&s, &a, "Robin", Policy::default()).await?;
+    forget_attribution(&s, &legacy).await?;
+    merge(&s, &a, &first, &legacy, "Robin").await?;
+    assert_eq!(row(&s, &a, &legacy).await?.added_by_you, AddedBy::Yes);
+
+    // B references C (canonical added by B), then A links the merged person to C. The chain
+    // first -> legacy -> canonical is flattened onto the canonical person.
+    let canonical = reference(&s, &b, &c).await?;
+    replace_policy(
+        &s,
+        &c,
+        &canonical,
+        policy(
+            vec![account_grant(&b, false), home_grant(&home, false)],
+            &[],
+        ),
+    )
+    .await?;
+    link(&s, &a, &c, &legacy).await?;
+    for old in [&first, &legacy] {
+        let d = detail(&s, &a, old).await?;
+        assert_eq!(d.summary.id, canonical);
+        assert_eq!(
+            d.summary.added_by_you,
+            AddedBy::Yes,
+            "through the alias chain"
+        );
+    }
+    assert_eq!(scopes_of(&s, &a, &canonical).await?, [PeopleScope::All]);
+    assert_eq!(row(&s, &b, &canonical).await?.added_by_you, AddedBy::Yes);
+    // C and a Home member E added nothing, but one merged person's creator is unknown, so
+    // nothing proves they did not: unknown, not no. E still finds it under Shared with me.
+    assert_eq!(
+        row(&s, &c, &canonical).await?.added_by_you,
+        AddedBy::Unknown
+    );
+    assert_eq!(
+        row(&s, &e, &canonical).await?.added_by_you,
+        AddedBy::Unknown
+    );
+    assert!(
+        ids(&s, &e, PeopleScope::SharedWithMe)
+            .await?
+            .contains(&canonical)
+    );
+    // The archived aliases keep their own attribution only.
+    let aliases = traverse(&s, &a, PeopleScope::All, true, 50).await?;
+    let by_id: BTreeMap<_, _> = aliases
+        .iter()
+        .map(|p| (p.id.clone(), p.added_by_you))
+        .collect();
+    assert_eq!(by_id.get(&first), Some(&AddedBy::Yes));
+    assert_eq!(by_id.get(&legacy), Some(&AddedBy::Unknown));
+    // A reserved alias (an id proposed when referencing) is not a person and changes nothing.
+    let reserved = s
+        .people_command(
+            &e,
+            &id(),
+            &PeopleCommand::ReferenceAccount {
+                account_id: c.clone(),
+                person_id: id(),
+            },
+            NOW,
+        )
+        .await?
+        .person_id;
+    assert_eq!(reserved, canonical);
+    assert_eq!(
+        row(&s, &e, &canonical).await?.added_by_you,
+        AddedBy::Unknown
+    );
+    Ok(())
+}
+
+// S20 -----------------------------------------------------------------------------------------
+// Revision 1, R2: a field's own sharing is not who can see it. Effective access is complete only
+// for a viewer who owns the field and its person; it follows the person's narrowing, restoration,
+// household joins/leaves and exclusions.
+
+async fn field_view(
+    s: &Store,
+    viewer: &str,
+    person: &str,
+    field: &str,
+) -> Result<atlas_core::people::FieldAudience> {
+    Ok(s.person_field_audiences(viewer, person, false, None, 100)
+        .await?
+        .items
+        .into_iter()
+        .find(|f| f.id == field)
+        .unwrap_or_else(|| panic!("{field} is not listed for {viewer}")))
+}
+
+fn effective(f: &atlas_core::people::FieldAudience) -> (Disclosure, Option<i64>, Option<i64>) {
+    (
+        f.effective.disclosure,
+        f.effective.account_count,
+        f.effective.limited_count,
+    )
+}
+
+#[tokio::test]
+async fn s20_effective_field_access_follows_the_persons_audience_for_its_owner() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (a, b, c, d) = (
+        account(&s).await?,
+        account(&s).await?,
+        account(&s).await?,
+        account(&s).await?,
+    );
+    let home = household(&s, &a, "Home").await?;
+    join(&s, &a, &b, &home).await?;
+    join(&s, &a, &c, &home).await?;
+    let p = create_person(&s, &a, "Robin", policy(vec![home_grant(&home, false)], &[])).await?;
+    let f = create_field(
+        &s,
+        &a,
+        &p,
+        Some(policy(vec![home_grant(&home, false)], &[])),
+    )
+    .await?;
+    let complete = |seen, limited| (Disclosure::Complete, Some(seen), Some(limited));
+    assert_eq!(
+        effective(&field_view(&s, &a, &p, &f).await?),
+        complete(2, 0)
+    );
+
+    // The person excludes C: C still holds the field's Home grant but cannot see the field.
+    replace_policy(&s, &a, &p, policy(vec![home_grant(&home, false)], &[&c])).await?;
+    let v = field_view(&s, &a, &p, &f).await?;
+    assert_eq!(effective(&v), complete(1, 1));
+    assert_eq!(
+        (v.audience.disclosure, v.audience.excluded_count),
+        (Disclosure::Complete, Some(0)),
+        "the field's own sharing is unchanged"
+    );
+    assert!(
+        s.person_field_audiences(&c, &p, false, None, 100)
+            .await
+            .is_err()
+    );
+    // Restoring the person's audience restores the field's.
+    replace_policy(&s, &a, &p, policy(vec![home_grant(&home, false)], &[])).await?;
+    assert_eq!(
+        effective(&field_view(&s, &a, &p, &f).await?),
+        complete(2, 0)
+    );
+    // A member who joins Home sees both; one who leaves no longer counts at all.
+    join(&s, &a, &d, &home).await?;
+    assert_eq!(
+        effective(&field_view(&s, &a, &p, &f).await?),
+        complete(3, 0)
+    );
+    leave(&s, &c, &home).await?;
+    assert_eq!(
+        effective(&field_view(&s, &a, &p, &f).await?),
+        complete(2, 0)
+    );
+    // A person shared directly with D only (not Home): B is limited by the person.
+    replace_policy(&s, &a, &p, policy(vec![account_grant(&d, false)], &[])).await?;
+    assert_eq!(
+        effective(&field_view(&s, &a, &p, &f).await?),
+        complete(1, 1)
+    );
+    // A field exclusion is the field's own configuration, not a person limitation.
+    replace_policy(&s, &a, &p, policy(vec![home_grant(&home, false)], &[])).await?;
+    replace_policy(&s, &a, &f, policy(vec![home_grant(&home, false)], &[&b])).await?;
+    let v = field_view(&s, &a, &p, &f).await?;
+    assert_eq!(effective(&v), complete(1, 0));
+    assert_eq!(v.audience.excluded_count, Some(1));
+    // A private field: only its owner.
+    let private = create_field(&s, &a, &p, Some(Policy::default())).await?;
+    assert_eq!(
+        effective(&field_view(&s, &a, &p, &private).await?),
+        complete(0, 0)
+    );
+    // Non-owners of the field are partial, with nothing counted.
+    assert_eq!(
+        effective(&field_view(&s, &a, &p, &f).await?).0,
+        Disclosure::Complete
+    );
+    assert_eq!(
+        effective(&field_view(&s, &d, &p, &f).await?),
+        (Disclosure::Partial, None, None)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn s21_a_field_owner_cannot_learn_another_owners_person_audience() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (a, b, c) = (account(&s).await?, account(&s).await?, account(&s).await?);
+    let home = household(&s, &a, "Home").await?;
+    join(&s, &a, &b, &home).await?;
+    // C owns the person, shared directly with A and B; A writes a field shared with Home.
+    let p = create_person(
+        &s,
+        &c,
+        "Parent",
+        policy(
+            vec![account_grant(&a, false), account_grant(&b, false)],
+            &[],
+        ),
+    )
+    .await?;
+    let f = create_field(
+        &s,
+        &a,
+        &p,
+        Some(policy(vec![home_grant(&home, false)], &[])),
+    )
+    .await?;
+    let shared = serde_json::to_value(s.person_field_audiences(&a, &p, false, None, 100).await?)?;
+    let v = field_view(&s, &a, &p, &f).await?;
+    assert_eq!(
+        effective(&v),
+        (Disclosure::Partial, None, None),
+        "C's person audience is C's to know"
+    );
+    assert_eq!(
+        v.audience.disclosure,
+        Disclosure::Complete,
+        "A's own sharing"
+    );
+    // C narrows the person, removing B: B loses the field, and A's view says nothing about it.
+    replace_policy(&s, &c, &p, policy(vec![account_grant(&a, false)], &[])).await?;
+    assert!(
+        s.person_field_audiences(&b, &p, false, None, 100)
+            .await
+            .is_err()
+    );
+    let narrowed = serde_json::to_value(s.person_field_audiences(&a, &p, false, None, 100).await?)?;
+    assert_eq!(
+        narrowed, shared,
+        "partial whether or not the person narrows it"
+    );
+    replace_policy(
+        &s,
+        &c,
+        &p,
+        policy(
+            vec![account_grant(&a, false), account_grant(&b, false)],
+            &[],
+        ),
+    )
+    .await?;
+    assert_eq!(field_view(&s, &b, &p, &f).await?.id, f);
+    assert_eq!(
+        serde_json::to_value(s.person_field_audiences(&a, &p, false, None, 100).await?)?,
+        shared
+    );
+    Ok(())
+}
+
+// S22 -----------------------------------------------------------------------------------------
+// Revision 1, R3: a primary household change publishes no resource change. Every summary response
+// carries the viewer's `preferences_version` from its own snapshot, so a client can recognise an
+// older response, including a delayed one for the same account and epoch.
+
+#[tokio::test]
+async fn s22_primary_household_changes_are_visible_through_preferences_version() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (a, b) = (account(&s).await?, account(&s).await?);
+    let home = household(&s, &a, "Home").await?;
+    let second = household(&s, &a, "Second").await?;
+    join(&s, &a, &b, &home).await?;
+    join(&s, &a, &b, &second).await?;
+    let p = create_person(&s, &a, "Robin", policy(vec![home_grant(&home, false)], &[])).await?;
+    let f = create_field(
+        &s,
+        &a,
+        &p,
+        Some(policy(vec![home_grant(&home, false)], &[])),
+    )
+    .await?;
+    let before = s.defaults(&b).await?.preferences_version;
+    let page = s
+        .people_summaries(&b, PeopleScope::All, false, None, 50)
+        .await?;
+    let rail = detail(&s, &b, &p).await?;
+    let fields = s.person_field_audiences(&b, &p, false, None, 50).await?;
+    assert_eq!(
+        (
+            page.preferences_version,
+            rail.preferences_version,
+            fields.preferences_version
+        ),
+        (before, before, before)
+    );
+    assert_eq!(
+        rail.home.as_ref().map(|h| h.id.as_str()),
+        Some(home.as_str())
+    );
+    assert_eq!(
+        fields.home.as_ref().map(|h| h.id.as_str()),
+        Some(home.as_str())
+    );
+    assert!(rail.summary.audience.in_home && fields.items[0].audience.in_home);
+    let projection = s.person_detail(&b, &p).await?.person;
+    let households = s.households(&b).await?;
+
+    // B changes its primary household (from any device): nothing B has synced changes.
+    manage(
+        &s,
+        &b,
+        M::SetPrimaryHousehold {
+            household_id: Some(second.clone()),
+            expected_version: before,
+        },
+    )
+    .await?;
+    assert_eq!(s.person_detail(&b, &p).await?.person, projection);
+    assert_eq!(
+        s.households(&b)
+            .await?
+            .into_iter()
+            .map(|h| (h.id, h.version))
+            .collect::<Vec<_>>(),
+        households
+            .into_iter()
+            .map(|h| (h.id, h.version))
+            .collect::<Vec<_>>()
+    );
+    let after = s.defaults(&b).await?.preferences_version;
+    assert!(after > before);
+    let rail = detail(&s, &b, &p).await?;
+    let fields = s.person_field_audiences(&b, &p, false, None, 50).await?;
+    let page = s
+        .people_summaries(&b, PeopleScope::All, false, None, 50)
+        .await?;
+    for (version, home_id) in [
+        (page.preferences_version, page.home.map(|h| h.id)),
+        (rail.preferences_version, rail.home.map(|h| h.id)),
+        (fields.preferences_version, fields.home.map(|h| h.id)),
+    ] {
+        assert_eq!((version, home_id), (after, Some(second.clone())));
+    }
+    assert!(!rail.summary.audience.in_home);
+    assert!(
+        !fields
+            .items
+            .iter()
+            .find(|x| x.id == f)
+            .unwrap()
+            .audience
+            .in_home
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn s22_a_delayed_response_carries_its_older_versions() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (a, b) = (account(&s).await?, account(&s).await?);
+    let home = household(&s, &a, "Home").await?;
+    let second = household(&s, &a, "Second").await?;
+    join(&s, &a, &b, &home).await?;
+    join(&s, &a, &b, &second).await?;
+    let p = create_person(&s, &a, "Robin", policy(vec![home_grant(&home, false)], &[])).await?;
+    let before = s.defaults(&b).await?.preferences_version;
+
+    // B's read pauses after its id query, in the same account and access epoch throughout.
+    let mut gate = s.hooks().arm(POINT);
+    let read = {
+        let (s, b) = (s.clone(), b.clone());
+        tokio::spawn(async move {
+            s.people_summaries(&b, PeopleScope::All, false, None, 50)
+                .await
+        })
+    };
+    gate.reached().await;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        manage(
+            &s,
+            &b,
+            M::SetPrimaryHousehold {
+                household_id: Some(second.clone()),
+                expected_version: before,
+            },
+        )
+        .await?;
+        replace_policy(&s, &a, &p, policy(vec![home_grant(&home, true)], &[])).await
+    })
+    .await
+    .expect("the writers were blocked by the paused reader")?;
+    // A later request completes first.
+    let fresh = s
+        .people_summaries(&b, PeopleScope::All, false, None, 50)
+        .await?;
+    gate.release();
+    let delayed = read.await??;
+    // The delayed response is the pre-change state; its versions say so.
+    assert_eq!(delayed.preferences_version, before);
+    assert!(fresh.preferences_version > delayed.preferences_version);
+    assert!(delayed.items[0].audience.in_home && !fresh.items[0].audience.in_home);
+    assert!(fresh.items[0].policy_version > delayed.items[0].policy_version);
+    assert_eq!(delayed.home.map(|h| h.id), Some(home));
+    assert_eq!(fresh.home.map(|h| h.id), Some(second));
     Ok(())
 }
 

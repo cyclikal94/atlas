@@ -1,6 +1,6 @@
 {
   "api_version": "0.29.0",
-  "contract_sha256": "0a5b5ebccd2dc9a93cc32a889bafe3fc9f82286c840e4ca161913032c5a70803",
+  "contract_sha256": "8501e7b0001731b34fc477bc6feff5e9d6189205b41794d1691d44ed7804d46a",
   "behaviour": {
     "activation": {
       "activate": {
@@ -821,7 +821,8 @@
               "your_access": "view"
             }
           ],
-          "next_after": null
+          "next_after": null,
+          "preferences_version": 1
         },
         "cache_control": "private, no-store",
         "status": 200
@@ -837,6 +838,13 @@
       },
       "member_detail": {
         "body": {
+          "home": {
+            "id": "HOME",
+            "member_count": 2,
+            "name": "Home",
+            "version": 3
+          },
+          "preferences_version": 2,
           "shared_with": {
             "accounts": [],
             "disclosure": "partial",
@@ -900,8 +908,15 @@
       },
       "member_field_audiences": {
         "body": {
+          "home": {
+            "id": "HOME",
+            "member_count": 2,
+            "name": "Home",
+            "version": 3
+          },
           "items": [],
-          "next_after": null
+          "next_after": null,
+          "preferences_version": 2
         },
         "cache_control": "private, no-store",
         "status": 200
@@ -951,7 +966,8 @@
               "your_access": "view"
             }
           ],
-          "next_after": null
+          "next_after": null,
+          "preferences_version": 2
         },
         "cache_control": "private, no-store",
         "status": 200
@@ -960,7 +976,8 @@
         "body": {
           "home": null,
           "items": [],
-          "next_after": null
+          "next_after": null,
+          "preferences_version": 1
         },
         "cache_control": "private, no-store",
         "status": 200
@@ -976,6 +993,13 @@
       },
       "owner_detail": {
         "body": {
+          "home": {
+            "id": "HOME",
+            "member_count": 2,
+            "name": "Home",
+            "version": 3
+          },
+          "preferences_version": 2,
           "shared_with": {
             "accounts": [
               {
@@ -1125,7 +1149,8 @@
               "your_access": "owner"
             }
           ],
-          "next_after": null
+          "next_after": null,
+          "preferences_version": 2
         },
         "cache_control": "private, no-store",
         "status": 200

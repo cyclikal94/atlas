@@ -184,6 +184,58 @@ def run(call, accounts, tokens):
     examples['no_primary_household'] = call('GET', V1 + '/people/summaries?scope=in_home', bob)
     _set_primary(call, bob, home)
 
+    # Revision 1, R3: every summary response carries the reader's preferences_version, which a
+    # primary household change advances although it publishes no resource change. (Bob has left
+    # Away above, so the change uses a third household.)
+    third = _household(call, tokens, 'Summary Third', 'bob', accounts['bob'])
+    _set_primary(call, bob, third)
+    preferences = call('GET', V1 + '/defaults', bob)['preferences_version']
+    for path in ('/people/summaries', f'/people/{wide}/summary', f'/people/{wide}/field-audiences'):
+        reply = call('GET', V1 + path, bob)
+        assert (reply['preferences_version'], reply['home']['id']) == (preferences, third), (path, reply)
+    _set_primary(call, bob, home)
+    assert call('GET', V1 + '/people/summaries', bob)['preferences_version'] > preferences
+
+    # Revision 1, R2: effective field access follows the person's audience for the owner of both,
+    # and stays partial for anyone else.
+    def effective(token):
+        return call('GET', f'{V1}/people/{wide}/field-audiences', token)['items'][0]['effective']
+
+    def replace(person, grants, exclude=()):
+        version = call('GET', f'{V1}/policies/{person}', alice)['version']
+        _manage(call, alice, {'kind': 'replace_policy', 'id': person, 'expected_version': version,
+                'policy': {'grants': grants, 'exclude_accounts': list(exclude)}})
+    complete = lambda seen, limited: {'disclosure': 'complete', 'account_count': seen, 'limited_count': limited}
+    assert effective(alice) == complete(1, 0)
+    assert effective(bob) == {'disclosure': 'partial', 'account_count': None, 'limited_count': None}
+    wide_grants = [in_home, {'kind': 'account', 'id': accounts['carol'], 'edit': False}]
+    replace(wide, wide_grants, [accounts['bob']])
+    assert effective(alice) == complete(0, 1)
+    call('GET', f'{V1}/people/{wide}/field-audiences', bob, expected=404)
+    replace(wide, wide_grants)
+    assert effective(alice) == complete(1, 0)
+
+    # Revision 1, R1: bob links a person he added to carol, who already has a profile (linked):
+    # it merges into that profile, and bob is still known to have added it.
+    # A private person is an ordinary (offline-capable) command, not an access command.
+    added = str(uuid.uuid4())
+    call('POST', V1 + '/commands', bob, {'commands': [
+        {'kind': 'create_person', 'id': added, 'name': 'Summary Linked',
+         'initial_policy': {'grants': [], 'exclude_accounts': []}}]}, str(uuid.uuid4()))
+    request = str(uuid.uuid4())
+    version = call('GET', f'{V1}/people/{added}', bob)['person']['version']
+    call('POST', V1 + '/people-commands', bob, {'command': {'kind': 'request_link', 'id': request,
+         'person_id': added, 'account_id': accounts['carol'], 'expected_version': version}},
+         str(uuid.uuid4()))
+    call('POST', V1 + '/people-commands', carol, {'command': {'kind': 'respond_request',
+         'id': request, 'accept': True}}, str(uuid.uuid4()))
+    merged = call('GET', f'{V1}/people/{added}/summary', bob)['summary']
+    assert (merged['id'], merged['added_by_you']) == (linked, 'yes'), merged
+    assert linked not in _ids(call, bob, 'shared_with_me')
+    assert _row(call, bob, linked) == merged
+    assert _row(call, alice, linked)['added_by_you'] == 'yes'
+    assert _row(call, carol, linked)['added_by_you'] == 'no'
+
     names = {accounts['alice']: 'ALICE', accounts['bob']: 'BOB', accounts['carol']: 'CAROL',
              home: 'HOME', away: 'AWAY', wide: 'WIDE_PERSON', linked: 'LINKED_PERSON'}
     for item in wide_view['fields']['items']:

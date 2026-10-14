@@ -43,10 +43,12 @@ impl PeopleScope {
             Self::InHome => {
                 "EXISTS(SELECT 1 FROM resource_household_grants hh JOIN accounts va ON va.id=$1 AND hh.household_id=va.primary_household_id JOIN household_memberships vm ON vm.household_id=hh.household_id AND vm.account_id=$1 WHERE hh.resource_id=r.id)"
             }
-            // Owned rows and rows known to have been added by the viewer are excluded. Unknown
-            // attribution is not known to be the viewer's, so another owner's row stays.
+            // Owned rows and rows known to have been added by the viewer are excluded: the viewer
+            // added the person itself or a person merged into it (linking into an existing
+            // canonical person merges). Unknown attribution is not known to be the viewer's, so
+            // another owner's row stays.
             Self::SharedWithMe => {
-                "r.owner_id<>$1 AND NOT EXISTS(SELECT 1 FROM person_attributions pa WHERE pa.person_id=r.id AND pa.added_by=$1)"
+                "r.owner_id<>$1 AND NOT EXISTS(SELECT 1 FROM person_attributions pa WHERE pa.person_id=r.id AND pa.added_by=$1) AND NOT EXISTS(SELECT 1 FROM person_aliases al JOIN person_attributions apa ON apa.person_id=al.source_id WHERE al.canonical_id=r.id AND apa.added_by=$1)"
             }
             Self::NotLinked => {
                 "NOT EXISTS(SELECT 1 FROM person_accounts pl WHERE pl.person_id=r.id)"
@@ -158,6 +160,10 @@ pub struct PersonSummaryPage {
     pub next_after: Option<String>,
     /// The viewer's primary household, or `None` when there is none (In Home is then empty).
     pub home: Option<PeopleHome>,
+    /// The viewer's `preferences_version` (as in `GET /defaults`) in the same snapshot. A primary
+    /// household change publishes no resource change, so this is how a client learns that
+    /// `home` and every `in_home` it holds are older than the current preferences.
+    pub preferences_version: i64,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -200,6 +206,24 @@ pub struct SharedWith {
 pub struct PersonSummaryDetail {
     pub summary: PersonSummary,
     pub shared_with: SharedWith,
+    pub home: Option<PeopleHome>,
+    pub preferences_version: i64,
+}
+
+/// Who can actually see a field. A field is visible only to someone who can also see its person,
+/// so the field's own sharing (`FieldAudience::audience`) is an upper bound, not the audience.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct EffectiveAccess {
+    /// `complete` only when the viewer owns both the field and its person, and so may already
+    /// read both policies. Otherwise `partial`: the person's sharing may narrow who sees the field
+    /// and this response neither confirms nor denies that it does.
+    pub disclosure: Disclosure,
+    /// Complete only: other accounts that can see the field now.
+    pub account_count: Option<i64>,
+    /// Complete only: accounts the field's own sharing reaches (a direct grant, or a member of a
+    /// granted household, not excluded and not the owner) that cannot see it because they cannot
+    /// see the person.
+    pub limited_count: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -210,13 +234,18 @@ pub struct FieldAudience {
     pub archived: bool,
     pub owner_is_you: bool,
     pub your_access: Access,
+    /// The field's own sharing. For a field, `disclosure: complete` describes only this
+    /// configuration; `effective` says who can actually see the field.
     pub audience: AudienceSummary,
+    pub effective: EffectiveAccess,
 }
 
 #[derive(Debug, Serialize)]
 pub struct FieldAudiencePage {
     pub items: Vec<FieldAudience>,
     pub next_after: Option<String>,
+    pub home: Option<PeopleHome>,
+    pub preferences_version: i64,
 }
 
 /// One household grant as stored, before disclosure.
@@ -395,9 +424,19 @@ async fn projections(
 }
 
 impl Store {
-    /// The viewer's primary household, if the viewer still belongs to it.
-    async fn people_home(tx: &mut Transaction<'_, Any>, actor: &str) -> Result<Option<PeopleHome>> {
-        Ok(sqlx::query("SELECT h.id,h.name,h.version,(SELECT COUNT(*) FROM household_memberships c WHERE c.household_id=h.id) FROM accounts a JOIN households h ON h.id=a.primary_household_id JOIN household_memberships m ON m.household_id=h.id AND m.account_id=a.id WHERE a.id=$1")
+    /// The viewer's primary household, if the viewer still belongs to it, and the viewer's
+    /// `preferences_version`, which every primary household change increments.
+    async fn people_context(
+        tx: &mut Transaction<'_, Any>,
+        actor: &str,
+    ) -> Result<(Option<PeopleHome>, i64)> {
+        let preferences_version =
+            sqlx::query_scalar("SELECT preferences_version FROM accounts WHERE id=$1")
+                .bind(actor)
+                .fetch_optional(&mut **tx)
+                .await?
+                .ok_or_else(|| anyhow!(ErrorCode::Unauthenticated))?;
+        let home = sqlx::query("SELECT h.id,h.name,h.version,(SELECT COUNT(*) FROM household_memberships c WHERE c.household_id=h.id) FROM accounts a JOIN households h ON h.id=a.primary_household_id JOIN household_memberships m ON m.household_id=h.id AND m.account_id=a.id WHERE a.id=$1")
             .bind(actor)
             .fetch_optional(&mut **tx)
             .await?
@@ -406,7 +445,8 @@ impl Store {
                 name: r.get(1),
                 version: r.get(2),
                 member_count: r.get(3),
-            }))
+            });
+        Ok((home, preferences_version))
     }
 
     /// The raw audience of each id, each statement once per page.
@@ -541,16 +581,22 @@ impl Store {
         {
             links.insert(r.get::<String, _>(0), r.get::<String, _>(1));
         }
-        let mut added = BTreeMap::new();
+        // Attribution of each person and of every person merged into it (merging flattens alias
+        // chains, so every merged person names its current canonical id). Reserved aliases are
+        // not people and carry nothing.
+        let mut added: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
         for r in rows_in(
             tx,
-            "SELECT person_id,added_by FROM person_attributions WHERE person_id IN ({ids})",
+            "SELECT c.person_id,pa.added_by FROM (SELECT id AS person_id,id AS member FROM resources WHERE id IN ({ids}) UNION ALL SELECT al.canonical_id,al.source_id FROM person_aliases al JOIN resources m ON m.id=al.source_id AND m.kind='person' WHERE al.canonical_id IN ({ids})) c LEFT JOIN person_attributions pa ON pa.person_id=c.member",
             None,
             &keys,
         )
         .await?
         {
-            added.insert(r.get::<String, _>(0), r.get::<String, _>(1));
+            added
+                .entry(r.get::<String, _>(0))
+                .or_default()
+                .push(r.get::<Option<String>, _>(1));
         }
         let owners: BTreeSet<String> = raw.values().map(|e| e.owner_id.clone()).collect();
         let owner_people = Self::owner_people(tx, actor, &owners).await?;
@@ -589,11 +635,7 @@ impl Store {
                         you: owned,
                         person: owner_people.get(&audience.owner_id).cloned(),
                     },
-                    added_by_you: match added.get(id) {
-                        Some(a) if a == actor => AddedBy::Yes,
-                        Some(_) => AddedBy::No,
-                        None => AddedBy::Unknown,
-                    },
+                    added_by_you: added_by(actor, added.get(id).map(Vec::as_slice)),
                     your_access: access(owned, p.can_edit),
                     field_count: fields.get(id).copied().unwrap_or(0),
                     audience: disclose(owned, home, &audience),
@@ -628,7 +670,7 @@ impl Store {
             .fetch_all(&mut *tx)
             .await?;
         hook!(self, "people_summary.between_reads", &mut tx);
-        let home = Self::people_home(&mut tx, actor).await?;
+        let (home, preferences_version) = Self::people_context(&mut tx, actor).await?;
         let items = Self::summaries_in(&mut tx, actor, &ids, home.as_ref().map(|h| h.id.as_str()))
             .await?
             .into_iter()
@@ -641,6 +683,7 @@ impl Store {
                 .then(|| ids.last().cloned())
                 .flatten(),
             home,
+            preferences_version,
         })
     }
 
@@ -651,7 +694,7 @@ impl Store {
         Self::epoch(&mut tx, actor).await?;
         let canonical = Self::canonical_person(&mut tx, id).await?;
         Self::task_resource(&mut tx, actor, &canonical, "person", false).await?;
-        let home = Self::people_home(&mut tx, actor).await?;
+        let (home, preferences_version) = Self::people_context(&mut tx, actor).await?;
         let (summary, raw) = Self::summaries_in(
             &mut tx,
             actor,
@@ -690,6 +733,8 @@ impl Store {
         Ok(PersonSummaryDetail {
             summary,
             shared_with,
+            home,
+            preferences_version,
         })
     }
 
@@ -719,12 +764,29 @@ impl Store {
             .bind(i64::from(limit))
             .fetch_all(&mut *tx)
             .await?;
-        let home = Self::people_home(&mut tx, actor).await?;
+        let (home, preferences_version) = Self::people_context(&mut tx, actor).await?;
+        let owns_person =
+            sqlx::query_scalar::<_, String>("SELECT owner_id FROM resources WHERE id=$1")
+                .bind(&canonical)
+                .fetch_one(&mut *tx)
+                .await?
+                == actor;
         let mut items = Vec::with_capacity(ids.len());
         if !ids.is_empty() {
             let mut projected = projections(&mut tx, actor, &ids, "field").await?;
             let keys: Vec<&str> = ids.iter().map(String::as_str).collect();
             let mut raw = Self::raw_audiences(&mut tx, actor, &keys).await?;
+            // Effective access is computed only when the viewer owns the person too: then both
+            // policies are already the viewer's to read. Never for anyone else's person.
+            let both: Vec<&str> = if owns_person {
+                keys.iter()
+                    .copied()
+                    .filter(|id| raw.get(*id).is_some_and(|e| e.owner_id == actor))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let mut effective = Self::effective_counts(&mut tx, &both).await?;
             for id in &ids {
                 let p = projected
                     .remove(id)
@@ -743,6 +805,18 @@ impl Store {
                     owner_is_you: owned,
                     your_access: access(owned, p.can_edit),
                     audience: disclose(owned, home.as_ref().map(|h| h.id.as_str()), &audience),
+                    effective: match effective.remove(id) {
+                        Some((seen, limited)) => EffectiveAccess {
+                            disclosure: Disclosure::Complete,
+                            account_count: Some(seen),
+                            limited_count: Some(limited),
+                        },
+                        None => EffectiveAccess {
+                            disclosure: Disclosure::Partial,
+                            account_count: None,
+                            limited_count: None,
+                        },
+                    },
                 });
             }
         }
@@ -752,7 +826,51 @@ impl Store {
             next_after: (ids.len() == usize::from(limit))
                 .then(|| ids.last().cloned())
                 .flatten(),
+            home,
+            preferences_version,
         })
+    }
+
+    /// For each field in `ids` (each owned, with its person, by the viewer): how many accounts its
+    /// own sharing reaches that can see it now, and how many it reaches that cannot, because they
+    /// cannot see the person. Owner and excluded accounts are not counted. Visibility is the
+    /// production rule (`policy::VISIBLE`) evaluated for each such account, in one statement.
+    async fn effective_counts(
+        tx: &mut Transaction<'_, Any>,
+        ids: &[&str],
+    ) -> Result<BTreeMap<String, (i64, i64)>> {
+        let mut counts: BTreeMap<String, (i64, i64)> =
+            ids.iter().map(|id| ((*id).to_owned(), (0, 0))).collect();
+        let sql = format!(
+            "SELECT r.id,CASE WHEN {} THEN 1 ELSE 0 END FROM (SELECT resource_id,account_id FROM resource_grants WHERE resource_id IN ({{ids}}) UNION SELECT hg.resource_id,hm.account_id FROM resource_household_grants hg JOIN household_memberships hm ON hm.household_id=hg.household_id WHERE hg.resource_id IN ({{ids}})) c JOIN resources r ON r.id=c.resource_id LEFT JOIN resource_grants g ON g.resource_id=r.id AND g.account_id=c.account_id WHERE c.account_id<>r.owner_id AND NOT EXISTS(SELECT 1 FROM resource_exclusions ex WHERE ex.resource_id=r.id AND ex.account_id=c.account_id)",
+            policy::visible_to("c.account_id")
+        );
+        for r in rows_in(tx, &sql, None, ids).await? {
+            let entry = counts
+                .get_mut(&r.get::<String, _>(0))
+                .ok_or_else(|| anyhow!(ErrorCode::InternalError))?;
+            if r.get::<i64, _>(1) == 1 {
+                entry.0 += 1;
+            } else {
+                entry.1 += 1;
+            }
+        }
+        Ok(counts)
+    }
+}
+
+/// Whether the viewer is known to have added a person, from the attribution of the person and of
+/// every person merged into it (`None` = no attribution row). `yes` when any of them was added by
+/// the viewer: linkage and merging do not erase that. `no` only when every one of them is known to
+/// have been added by another account. Otherwise nothing proves either way: `unknown`.
+fn added_by(actor: &str, constituents: Option<&[Option<String>]>) -> AddedBy {
+    let constituents = constituents.unwrap_or_default();
+    if constituents.iter().flatten().any(|a| a == actor) {
+        AddedBy::Yes
+    } else if !constituents.is_empty() && constituents.iter().all(Option::is_some) {
+        AddedBy::No
+    } else {
+        AddedBy::Unknown
     }
 }
 

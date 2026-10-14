@@ -52,6 +52,12 @@ pub struct SharingSnapshot {
 // Each query is built only from these repository-owned fragments; user values bind.
 pub(super) const COLUMNS: &str = "r.id,r.kind,r.parent_id,r.label,r.value,r.version,r.policy_version AS policy_version,CASE WHEN EXISTS(SELECT 1 FROM person_accounts pa WHERE pa.person_id=r.id AND pa.account_id<>$1) THEN 0 WHEN r.owner_id=$1 OR COALESCE(g.can_edit,0)=1 OR EXISTS(SELECT 1 FROM resource_household_grants hg JOIN household_memberships hm ON hm.household_id=hg.household_id WHERE hg.resource_id=r.id AND hm.account_id=$1 AND hg.can_edit=1) THEN 1 ELSE 0 END AS editable,r.archived";
 pub(super) const VISIBLE: &str = "NOT (r.owner_id=$1 AND EXISTS(SELECT 1 FROM frozen_owner_visibility f WHERE f.resource_id=r.id)) AND (r.owner_id=$1 OR ((g.account_id=$1 OR EXISTS(SELECT 1 FROM resource_household_grants hg JOIN household_memberships hm ON hm.household_id=hg.household_id WHERE hg.resource_id=r.id AND hm.account_id=$1)) AND NOT EXISTS(SELECT 1 FROM resource_exclusions x WHERE x.resource_id=r.id AND x.account_id=$1))) AND NOT EXISTS(SELECT 1 FROM resource_ancestors a JOIN resources p ON p.id=a.ancestor_id WHERE a.resource_id=r.id AND NOT (p.owner_id=$1 OR ((EXISTS(SELECT 1 FROM resource_grants pg WHERE pg.resource_id=p.id AND pg.account_id=$1) OR EXISTS(SELECT 1 FROM resource_household_grants phg JOIN household_memberships phm ON phm.household_id=phg.household_id WHERE phg.resource_id=p.id AND phm.account_id=$1)) AND NOT EXISTS(SELECT 1 FROM resource_exclusions px WHERE px.resource_id=p.id AND px.account_id=$1))))";
+/// [`VISIBLE`] for the account named by the SQL expression `account` instead of the reader `$1`,
+/// so a statement can apply the production visibility rule to other accounts. `account` must be
+/// repository-owned SQL, never a request value.
+pub(super) fn visible_to(account: &str) -> String {
+    VISIBLE.replace("$1", account)
+}
 
 impl Projection {
     /// Fail-closed precondition for a content write: the caller must present the policy

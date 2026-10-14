@@ -8,7 +8,11 @@
 //! The instance holds at most 10,000 resources and 100 accounts, so the seed stays inside both:
 //! 1,600 people with five fields each (9,600 resources), 40 accounts in three households, 38
 //! people linked to accounts, every kind of grant, exclusions and half the people without an
-//! attribution row. Rows are written by raw SQL in one transaction; the reads under test are the
+//! attribution row. Revision 1 adds 200 archived people merged into active ones (aliases, with
+//! and without attribution, some added by the viewer), which the `shared_with_me` filter and
+//! `added_by_you` now read, and one viewer-owned person with 99 fields shared with Home, whose
+//! `person_field_audiences` page computes effective access for every Home member (9,900
+//! resources in all). Rows are written by raw SQL in one transaction; the reads under test are the
 //! real ones. Uses a disposable SQLite file, or a fresh schema in the disposable PostgreSQL
 //! database named by ATLAS_TEST_POSTGRES_URL; it never touches an existing schema.
 //! `ATLAS_LOAD_ITERATIONS` (default 30) sets the timed first-page reads per filter and size.
@@ -24,6 +28,8 @@ use uuid::Uuid;
 const PEOPLE: usize = 1_600;
 const FIELDS: usize = 5;
 const OTHERS: usize = 38;
+const ALIASES: usize = 200;
+const WIDE_FIELDS: usize = 99;
 const SCOPES: [(PeopleScope, &str); 4] = [
     (PeopleScope::All, "all"),
     (PeopleScope::InHome, "in_home"),
@@ -68,6 +74,8 @@ async fn connect() -> Result<(Store, &'static str, Option<tempfile::TempDir>)> {
 
 struct Seeded {
     viewer: String,
+    /// The viewer's person with `WIDE_FIELDS` fields.
+    wide: String,
 }
 
 /// The viewer V and owner A share Home (V's primary household, with 20 others) and Second; A
@@ -226,12 +234,106 @@ async fn seed(store: &Store) -> Result<Seeded> {
             }
         }
     }
+    // Merged people: archived aliases of the first ALIASES active people, as merging leaves them
+    // (the alias row archived, a `person_aliases` row to the canonical person). Alias `n` is
+    // attributed to the viewer when n % 4 == 0, to the owner when n % 4 == 1, and to nobody
+    // otherwise.
+    let canonical: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM resources WHERE kind='person' ORDER BY id LIMIT $1")
+            .bind(ALIASES as i64)
+            .fetch_all(&mut *tx)
+            .await?;
+    for (n, target) in canonical.iter().enumerate() {
+        let alias = id();
+        sqlx::query("INSERT INTO resources(id,owner_id,kind,label,value,archived) VALUES ($1,$2,'person',$3,'',1)")
+            .bind(&alias)
+            .bind(&owner)
+            .bind(format!("Merged {n}"))
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO person_aliases VALUES ($1,$2)")
+            .bind(&alias)
+            .bind(target)
+            .execute(&mut *tx)
+            .await?;
+        let creator = match n % 4 {
+            0 => Some(&viewer),
+            1 => Some(&owner),
+            _ => None,
+        };
+        if let Some(creator) = creator {
+            sqlx::query("INSERT INTO person_attributions(person_id,added_by) VALUES ($1,$2)")
+                .bind(&alias)
+                .bind(creator)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    // The viewer's wide person: shared with Home but excluding five members, so their field
+    // grants are limited by the person; every field is shared with Home, every third also
+    // directly with a Third member who cannot see the person, every fifth excludes a member.
+    let wide = id();
+    sqlx::query(
+        "INSERT INTO resources(id,owner_id,kind,label,value) VALUES ($1,$2,'person','Wide','')",
+    )
+    .bind(&wide)
+    .bind(&viewer)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("INSERT INTO resource_household_grants VALUES ($1,$2,0)")
+        .bind(&wide)
+        .bind(&home)
+        .execute(&mut *tx)
+        .await?;
+    for other in &others[..5] {
+        sqlx::query("INSERT INTO resource_exclusions VALUES ($1,$2)")
+            .bind(&wide)
+            .bind(other)
+            .execute(&mut *tx)
+            .await?;
+    }
+    for f in 0..WIDE_FIELDS {
+        let field = id();
+        sqlx::query("INSERT INTO resources(id,owner_id,parent_id,kind,label,value) VALUES ($1,$2,$3,'field','Note',$4)")
+            .bind(&field)
+            .bind(&viewer)
+            .bind(&wide)
+            .bind(r#"{"kind":"text","text":"x"}"#)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO resource_household_grants VALUES ($1,$2,0)")
+            .bind(&field)
+            .bind(&home)
+            .execute(&mut *tx)
+            .await?;
+        if f % 3 == 0 {
+            sqlx::query("INSERT INTO resource_grants VALUES ($1,$2,0)")
+                .bind(&field)
+                .bind(&others[20 + f % 18])
+                .execute(&mut *tx)
+                .await?;
+        }
+        if f % 5 == 0 {
+            sqlx::query("INSERT INTO resource_exclusions VALUES ($1,$2)")
+                .bind(&field)
+                .bind(&others[5 + f % 15])
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    let resources: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM resources")
+        .fetch_one(&mut *tx)
+        .await?;
+    ensure!(
+        resources <= 10_000,
+        "{resources} resources exceed the instance cap"
+    );
     sqlx::query("UPDATE sync_clock SET resource_count=$1 WHERE id=1")
-        .bind((PEOPLE * (FIELDS + 1)) as i64)
+        .bind(resources)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(Seeded { viewer })
+    Ok(Seeded { viewer, wide })
 }
 
 /// Statements issued by one first page, from `pg_stat_statements` (reset first). `None` when the
@@ -251,6 +353,29 @@ async fn statements(
     }
     store
         .people_summaries(viewer, scope, false, None, limit)
+        .await?;
+    let count: i64 = sqlx::query_scalar("SELECT COALESCE(sum(calls),0)::bigint FROM public.pg_stat_statements WHERE query NOT ILIKE '%pg_stat_statements%'")
+        .fetch_one(&store.pool)
+        .await?;
+    Ok(Some(count))
+}
+
+/// Statements issued by one page of the wide person's field audiences, as `statements`.
+async fn field_statements(
+    store: &Store,
+    viewer: &str,
+    person: &str,
+    limit: u16,
+) -> Result<Option<i64>> {
+    if sqlx::query("SELECT count(*) FROM (SELECT public.pg_stat_statements_reset()) r")
+        .execute(&store.pool)
+        .await
+        .is_err()
+    {
+        return Ok(None);
+    }
+    store
+        .person_field_audiences(viewer, person, false, None, limit)
         .await?;
     let count: i64 = sqlx::query_scalar("SELECT COALESCE(sum(calls),0)::bigint FROM public.pg_stat_statements WHERE query NOT ILIKE '%pg_stat_statements%'")
         .fetch_one(&store.pool)
@@ -283,6 +408,7 @@ async fn main() -> Result<()> {
     println!(
         "{}",
         json!({"engine": engine, "people": PEOPLE, "fields_per_person": FIELDS, "accounts": OTHERS + 2,
+               "merged_aliases": ALIASES, "wide_person_fields": WIDE_FIELDS,
                "seed_seconds": round(seed_seconds), "iterations": iterations, "statement_counter": counting})
     );
     let v = seeded.viewer.as_str();
@@ -339,6 +465,51 @@ async fn main() -> Result<()> {
             );
         }
     }
+    // Field audiences of the wide person for its owner: effective access for every recipient.
+    let wide = seeded.wide.as_str();
+    let page = store
+        .person_field_audiences(v, wide, false, None, 100)
+        .await?;
+    ensure!(
+        page.items.len() == WIDE_FIELDS,
+        "the wide person lists every field"
+    );
+    let limited: i64 = page
+        .items
+        .iter()
+        .map(|f| f.effective.limited_count.unwrap_or_default())
+        .sum();
+    ensure!(limited > 0, "the person limits some field recipients");
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = Instant::now();
+        store
+            .person_field_audiences(v, wide, false, None, 100)
+            .await?;
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    let (count, small) = if counting {
+        (
+            field_statements(&store, v, wide, 100).await?,
+            field_statements(&store, v, wide, 1).await?,
+        )
+    } else {
+        (None, None)
+    };
+    if let (Some(full), Some(one)) = (count, small) {
+        ensure!(
+            full == one,
+            "field audiences: {full} statements at 100, {one} at 1"
+        );
+    }
+    println!(
+        "{}",
+        json!({"engine": engine, "read": "person_field_audiences", "limit": 100, "rows": page.items.len(),
+               "limited_total": limited,
+               "page_p50_ms": round(percentile(&mut samples, 0.5)),
+               "page_p95_ms": round(percentile(&mut samples, 0.95)),
+               "statements_per_page": count, "statements_one_row_page": small})
+    );
     if postgres {
         for (scope, name) in SCOPES {
             let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(

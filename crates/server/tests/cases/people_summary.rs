@@ -14,7 +14,7 @@ use atlas_server::{hash_password, now};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 
-use crate::support::http::request;
+use crate::support::http::{command_request, request};
 use crate::support::retirement::{PASSWORD, Reply, World, bearer, id, login, world};
 
 fn contract() -> Value {
@@ -425,7 +425,7 @@ async fn every_body_conforms_to_the_contract_and_the_static_route_wins() -> Resu
     let carol = get(&s, Some(&s.carol_token), "people/summaries?scope=in_home").await;
     assert_eq!(
         carol.2,
-        json!({"items": [], "next_after": null, "home": null})
+        json!({"items": [], "next_after": null, "home": null, "preferences_version": 1})
     );
 
     for token in [&s.alice_token, &s.bob_token] {
@@ -639,5 +639,91 @@ async fn list_people_and_get_person_are_unchanged() -> Result<()> {
             ["linked_account_id", "person"]
         );
     }
+    Ok(())
+}
+
+/// What the first device can read without the summaries: its households, `/me` and the person.
+async fn synced_reads(s: &Scene, token: &str) -> Vec<Value> {
+    let mut bodies = Vec::new();
+    for path in [
+        "households".to_owned(),
+        "me".to_owned(),
+        format!("people/{}", s.shared),
+    ] {
+        bodies.push(get(s, Some(token), &path).await.2);
+    }
+    bodies
+}
+
+/// Revision 1, R3: a primary household change made through another device's session publishes no
+/// resource change, so nothing the first device has synced changes; every summary response it
+/// reads afterwards carries the higher `preferences_version` (equal to `GET /defaults`) and the new
+/// `home`, which is how a client recognises its held summaries as out of date.
+#[tokio::test]
+async fn a_primary_household_change_on_another_device_is_visible_in_every_summary() -> Result<()> {
+    let s = scene().await?;
+    let second = id();
+    s.w.store
+        .management(
+            &s.bob,
+            &id(),
+            &[M::CreateHousehold {
+                id: second.clone(),
+                name: "Second".into(),
+            }],
+            now(),
+        )
+        .await?;
+    let first = Some(s.bob_token.as_str());
+    let summary_paths = routes(&s);
+    let mut before = Vec::new();
+    for path in &summary_paths {
+        let reply = get(&s, first, path).await;
+        assert_eq!(reply.2["home"]["id"], s.home, "{path}");
+        before.push(reply.2);
+    }
+    let defaults = get(&s, first, "defaults").await;
+    let version = defaults.2["preferences_version"].as_i64().unwrap();
+    assert!(before.iter().all(|b| b["preferences_version"] == version));
+    let synced = synced_reads(&s, &s.bob_token).await;
+
+    let other = login(&s.w.app, "device-bob", "tablet").await;
+    let (status, body) = command_request(
+        &s.w.app,
+        "management-commands",
+        Some(&other),
+        Some(&id()),
+        Some(json!({"commands": [{"kind": "set_primary_household", "household_id": second, "expected_version": version}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(
+        synced_reads(&s, &s.bob_token).await,
+        synced,
+        "nothing synced or listed changes"
+    );
+    let after = get(&s, first, "defaults").await.2["preferences_version"]
+        .as_i64()
+        .unwrap();
+    assert!(after > version);
+    for (path, schema) in summary_paths.iter().zip([
+        "PersonSummaryPage",
+        "PersonSummaryDetail",
+        "FieldAudiencePage",
+    ]) {
+        let reply = get(&s, first, path).await;
+        conforms(schema, &reply.2);
+        assert_eq!(reply.2["preferences_version"], after, "{path}");
+        assert_eq!(reply.2["home"]["id"], second, "{path}");
+    }
+    let rail = get(&s, first, &format!("people/{}/summary", s.shared)).await;
+    assert_eq!(rail.2["summary"]["audience"]["in_home"], false);
+    let fields = get(&s, first, &format!("people/{}/field-audiences", s.shared)).await;
+    assert_eq!(fields.2["items"][0]["audience"]["in_home"], false);
+    assert_eq!(
+        fields.2["items"][0]["effective"],
+        json!({"disclosure": "partial", "account_count": null, "limited_count": null})
+    );
     Ok(())
 }

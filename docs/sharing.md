@@ -266,7 +266,9 @@ A direct grant does not override an exclusion or remove a household grant.
 `GET /policies/{id}` refuses anyone but the owner with `403`. To describe who can see a
 person or field to any reader, use the viewer-safe summaries in
 [people](people.md#viewer-safe-summaries): complete for the owner, partial for everyone
-else, and never a `403` for a visible person.
+else, and never a `403` for a visible person. A field's own sharing is not who can see it
+(the person must be visible too); its `effective` access is complete only for the owner of
+both.
 
 Household membership is evaluated live. Joining reveals existing household-shared
 resources. Leaving removes that source of access while preserving independent direct
