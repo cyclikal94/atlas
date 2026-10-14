@@ -833,7 +833,13 @@ impl Store {
         actor: &str,
         ids: &[&str],
     ) -> Result<Vec<String>> {
-        Ok(rows_in(tx, "SELECT r.id FROM resources r WHERE r.id IN ({ids}) AND r.owner_id=$1 AND NOT EXISTS(SELECT 1 FROM resource_ancestors a JOIN resources p ON p.id=a.ancestor_id WHERE a.resource_id=r.id AND p.owner_id<>$1) AND NOT EXISTS(SELECT 1 FROM resource_household_grants hg WHERE (hg.resource_id=r.id OR EXISTS(SELECT 1 FROM resource_ancestors ha WHERE ha.resource_id=r.id AND ha.ancestor_id=hg.resource_id)) AND NOT EXISTS(SELECT 1 FROM household_memberships hm WHERE hm.household_id=hg.household_id AND hm.account_id=$1)) ORDER BY r.id", Some(actor), ids)
+        // The field's own grants and its ancestors' grants are separate clauses so each uses
+        // its primary key: an `OR` across them scans every household grant.
+        let unreadable = "NOT EXISTS(SELECT 1 FROM household_memberships hm WHERE hm.household_id=hg.household_id AND hm.account_id=$1)";
+        let sql = format!(
+            "SELECT r.id FROM resources r WHERE r.id IN ({{ids}}) AND r.owner_id=$1 AND NOT EXISTS(SELECT 1 FROM resource_ancestors a JOIN resources p ON p.id=a.ancestor_id WHERE a.resource_id=r.id AND p.owner_id<>$1) AND NOT EXISTS(SELECT 1 FROM resource_household_grants hg WHERE hg.resource_id=r.id AND {unreadable}) AND NOT EXISTS(SELECT 1 FROM resource_ancestors ha JOIN resource_household_grants hg ON hg.resource_id=ha.ancestor_id WHERE ha.resource_id=r.id AND {unreadable}) ORDER BY r.id"
+        );
+        Ok(rows_in(tx, &sql, Some(actor), ids)
             .await?
             .iter()
             .map(|r| r.get(0))
