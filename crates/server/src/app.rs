@@ -154,6 +154,18 @@ impl App {
             .route("/api/experimental/v1/people", get(people::people))
             .route("/api/experimental/v1/people/{id}", get(people::detail))
             .route(
+                "/api/experimental/v1/people/summaries",
+                get(people::summaries),
+            )
+            .route(
+                "/api/experimental/v1/people/{id}/summary",
+                get(people::summary),
+            )
+            .route(
+                "/api/experimental/v1/people/{id}/field-audiences",
+                get(people::field_audiences),
+            )
+            .route(
                 "/api/experimental/v1/people-commands",
                 post(people::command),
             )

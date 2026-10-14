@@ -3,6 +3,7 @@ use crate::error::ErrorCode;
 mod identity;
 mod merging;
 mod requests;
+mod summary;
 mod workflows;
 use crate::{Projection, Store};
 use anyhow::{Result, ensure};
@@ -10,6 +11,7 @@ pub use merging::RecipientMergePreview;
 pub use requests::{SentPeopleRequest, SentPeopleRequestPage};
 use serde::Serialize;
 use std::collections::BTreeSet;
+pub use summary::*;
 pub use workflows::*;
 
 #[derive(Debug, Serialize)]

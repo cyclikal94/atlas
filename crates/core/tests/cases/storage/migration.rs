@@ -1,11 +1,12 @@
-//! N1: the additive `1000 -> 1005` upgrade chain and the reset error for anything it cannot walk.
+//! N1: the additive `1000 -> 1006` upgrade chain and the reset error for anything it cannot walk.
 //!
 //! Every legacy baseline is rooted on a *frozen*, genuine schema captured from a release
 //! (`tests/fixtures/schema_100N_*.sql`), never on the current schema. Deriving a legacy database
 //! from the current schema by dropping objects would silently carry whatever the current step
-//! creates (the `1004` timer indexes, the `1005` session labels and device profiles) and could not
-//! prove a step's `DROP`. `1000`–`1003` are rooted on the frozen `1003` schema and `1004` on the
-//! frozen `1004` schema (BE-Q25).
+//! creates (the `1004` timer indexes, the `1005` session labels and device profiles, the `1006`
+//! person attributions) and could not prove a step's `DROP`. `1000`–`1003` are rooted on the frozen
+//! `1003` schema, `1004` on the frozen `1004` schema (BE-Q25) and `1005` on the frozen `1005`
+//! schema (BE-PEOPLE-SUMMARY).
 use std::collections::BTreeMap;
 
 use anyhow::Result;
@@ -17,8 +18,10 @@ const FROZEN_1003_SQLITE: &str = include_str!("../../fixtures/schema_1003_sqlite
 const FROZEN_1003_POSTGRES: &str = include_str!("../../fixtures/schema_1003_postgres.sql");
 const FROZEN_1004_SQLITE: &str = include_str!("../../fixtures/schema_1004_sqlite.sql");
 const FROZEN_1004_POSTGRES: &str = include_str!("../../fixtures/schema_1004_postgres.sql");
+const FROZEN_1005_SQLITE: &str = include_str!("../../fixtures/schema_1005_sqlite.sql");
+const FROZEN_1005_POSTGRES: &str = include_str!("../../fixtures/schema_1005_postgres.sql");
 /// The version `migrate()` ends at.
-const CURRENT: i64 = 1005;
+const CURRENT: i64 = 1006;
 
 async fn version(store: &Store) -> Result<Vec<i64>> {
     Ok(
@@ -66,6 +69,21 @@ async fn baseline_1004(url: &str) -> Result<Store> {
     .execute(&store.pool)
     .await?;
     assert_eq!(version(&store).await?, [1004]);
+    Ok(store)
+}
+
+/// A database exactly as the `1005` release left it (BE-Q25's session labels and device profiles
+/// present, BE-PEOPLE-SUMMARY's person attributions absent).
+async fn baseline_1005(url: &str) -> Result<Store> {
+    let store = Store::connect(url).await?;
+    sqlx::raw_sql(if crate::support::database::postgres() {
+        FROZEN_1005_POSTGRES
+    } else {
+        FROZEN_1005_SQLITE
+    })
+    .execute(&store.pool)
+    .await?;
+    assert_eq!(version(&store).await?, [1005]);
     Ok(store)
 }
 
@@ -454,7 +472,7 @@ async fn the_frozen_1003_baseline_is_the_account_wide_schema() -> Result<()> {
 }
 
 #[tokio::test]
-async fn a_1003_database_upgrades_to_1004_and_1005_in_place() -> Result<()> {
+async fn a_1003_database_upgrades_to_1004_1005_and_1006_in_place() -> Result<()> {
     let (_dir, url) = crate::support::database::database_url().await?;
     let store = baseline_1003(&url).await?;
     let seed = seed(&store, true).await?;
@@ -656,7 +674,7 @@ async fn a_1001_database_upgrades_in_place() -> Result<()> {
 /// BE-Q16: a request/invitation already pending at migration time must appear in the new
 /// durable history tables immediately via the backfill, not only from the next transition.
 #[tokio::test]
-async fn a_1002_database_upgrades_to_1003_1004_and_1005_in_place() -> Result<()> {
+async fn a_1002_database_upgrades_to_1003_through_1006_in_place() -> Result<()> {
     let (_dir, url) = crate::support::database::database_url().await?;
     let store = baseline_1002(&url).await?;
     assert!(!table_exists(&store, "people_request_history").await?);
@@ -874,7 +892,7 @@ async fn a_1004_database_upgrades_to_1005_in_place() -> Result<()> {
     }
 
     store.migrate().await?;
-    assert_eq!(version(&store).await?, [1005]);
+    assert_eq!(version(&store).await?, [CURRENT]);
     assert_eq!(
         row_digests_over(&store, &old_columns).await?,
         before,
@@ -902,7 +920,7 @@ async fn a_1004_database_upgrades_to_1005_in_place() -> Result<()> {
     store.migrate().await?;
     let restarted = Store::connect(&url).await?;
     restarted.migrate().await?;
-    assert_eq!(version(&restarted).await?, [1005]);
+    assert_eq!(version(&restarted).await?, [CURRENT]);
     assert_eq!(row_digests_over(&restarted, &old_columns).await?, before);
 
     // The upgraded shape is exactly a fresh database's.
@@ -985,8 +1003,163 @@ async fn two_processes_upgrading_from_1004_at_once_both_succeed() -> Result<()> 
     let (a, b) = tokio::join!(first.migrate(), second.migrate());
     a?;
     b?;
-    assert_eq!(version(&first).await?, [1005]);
+    assert_eq!(version(&first).await?, [CURRENT]);
     assert!(table_exists(&first, "device_profiles").await?);
+    assert_eq!(row_digests_over(&first, &old_columns).await?, before);
+    Ok(())
+}
+
+// ------------------------------------------------------------------- 1005 -> 1006 (BE-PEOPLE-SUMMARY)
+
+/// The negative control for the `1006` cases: the frozen `1005` schema has no attribution table.
+#[tokio::test]
+async fn the_frozen_1005_baseline_has_no_attributions() -> Result<()> {
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let store = baseline_1005(&url).await?;
+    assert!(!table_exists(&store, "person_attributions").await?);
+    assert!(table_exists(&store, "device_profiles").await?, "it is 1005");
+    Ok(())
+}
+
+fn foreign_key_violation(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .is_some_and(|e| e.is_foreign_key_violation())
+}
+
+#[tokio::test]
+async fn a_1005_database_upgrades_to_1006_in_place_without_inventing_attribution() -> Result<()> {
+    use atlas_core::people::{AddedBy, PeopleScope};
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let store = baseline_1005(&url).await?;
+    let seed = seed(&store, true).await?;
+    add_session(&store, &seed.account, "phone", FAR).await?;
+    // A grantee of a pre-1006 person, so unknown attribution is checked for owner and grantee.
+    sqlx::query("INSERT INTO resource_grants(resource_id,account_id,can_edit) VALUES ($1,$2,0)")
+        .bind(&seed.busy)
+        .bind(&seed.other)
+        .execute(&store.pool)
+        .await?;
+    let old_columns = columns(&store).await?;
+    let before = row_digests(&store).await?;
+    for table in [
+        "resources",
+        "resource_grants",
+        "accounts",
+        "people_request_history",
+        "sessions",
+    ] {
+        assert!(!before[table].is_empty(), "{table} is seeded");
+    }
+
+    store.migrate().await?;
+    assert_eq!(version(&store).await?, [1006]);
+    assert_eq!(
+        row_digests_over(&store, &old_columns).await?,
+        before,
+        "the step rewrites no existing value"
+    );
+    // No record proves who created an existing person, so the step records nobody.
+    let attributed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM person_attributions")
+        .fetch_one(&store.pool)
+        .await?;
+    assert_eq!(attributed, 0);
+    let owned = store
+        .people_summaries(&seed.account, PeopleScope::All, false, None, 100)
+        .await?;
+    assert_eq!(owned.items.len(), 2);
+    assert!(
+        owned
+            .items
+            .iter()
+            .all(|p| p.added_by_you == AddedBy::Unknown && p.owner.you)
+    );
+    let shared = store
+        .people_summaries(&seed.other, PeopleScope::SharedWithMe, false, None, 100)
+        .await?;
+    assert_eq!(
+        shared.items.len(),
+        1,
+        "unknown is not known to be the grantee's"
+    );
+    assert_eq!(shared.items[0].id, seed.busy);
+    assert_eq!(shared.items[0].added_by_you, AddedBy::Unknown);
+
+    // Idempotent, also through a restarted connection.
+    store.migrate().await?;
+    let restarted = Store::connect(&url).await?;
+    restarted.migrate().await?;
+    assert_eq!(version(&restarted).await?, [1006]);
+    assert_eq!(row_digests_over(&restarted, &old_columns).await?, before);
+
+    // The upgraded shape is exactly a fresh database's.
+    let (_fresh_dir, fresh_url) = crate::support::database::database_url().await?;
+    let fresh = Store::connect(&fresh_url).await?;
+    fresh.migrate().await?;
+    assert_eq!(indexes(&store, None).await?, indexes(&fresh, None).await?);
+    assert_eq!(
+        shape(&fresh, "person_attributions").await?,
+        shape(&store, "person_attributions").await?
+    );
+    assert_eq!(
+        columns(&fresh).await?,
+        columns(&store).await?,
+        "every table has the same columns in the same order"
+    );
+
+    // Both shapes refuse an attribution to a missing person or account, and a second row.
+    for db in [&store, &fresh] {
+        let account = id();
+        db.add_account(&account, &format!("u{}", account.replace('-', "")), "x")
+            .await?;
+        let person = id();
+        sqlx::query(
+            "INSERT INTO resources(id,owner_id,kind,label,value) VALUES ($1,$2,'person','P','')",
+        )
+        .bind(&person)
+        .bind(&account)
+        .execute(&db.pool)
+        .await?;
+        for (person_id, added_by) in [(id(), account.clone()), (person.clone(), id())] {
+            let error =
+                sqlx::query("INSERT INTO person_attributions(person_id,added_by) VALUES ($1,$2)")
+                    .bind(&person_id)
+                    .bind(&added_by)
+                    .execute(&db.pool)
+                    .await
+                    .expect_err("a dangling attribution");
+            assert!(foreign_key_violation(&error), "{error}");
+        }
+        sqlx::query("INSERT INTO person_attributions(person_id,added_by) VALUES ($1,$2)")
+            .bind(&person)
+            .bind(&account)
+            .execute(&db.pool)
+            .await?;
+        let error =
+            sqlx::query("INSERT INTO person_attributions(person_id,added_by) VALUES ($1,$2)")
+                .bind(&person)
+                .bind(&account)
+                .execute(&db.pool)
+                .await
+                .expect_err("one attribution per person");
+        assert!(unique_violation(&error), "{error}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn two_processes_upgrading_from_1005_at_once_both_succeed() -> Result<()> {
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let first = baseline_1005(&url).await?;
+    seed(&first, true).await?;
+    let old_columns = columns(&first).await?;
+    let before = row_digests(&first).await?;
+    let second = Store::connect(&url).await?;
+    let (a, b) = tokio::join!(first.migrate(), second.migrate());
+    a?;
+    b?;
+    assert_eq!(version(&first).await?, [1006]);
+    assert!(table_exists(&first, "person_attributions").await?);
     assert_eq!(row_digests_over(&first, &old_columns).await?, before);
     Ok(())
 }

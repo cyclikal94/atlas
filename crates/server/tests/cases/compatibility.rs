@@ -2326,6 +2326,207 @@ async fn labels_and_capacity_probes() -> Result<Value> {
     Ok(Value::Object(results))
 }
 
+/// BE-PEOPLE-SUMMARY: the viewer-safe People summaries. Records the owner's complete row and
+/// detail, a household member's partial row and detail for the same person, the empty In Home page
+/// of an account with no primary household, and the parameter, authentication and not-found
+/// statuses. Random identities are replaced by role names before recording.
+async fn people_summary_probes() -> Result<Value> {
+    use crate::support::http::request;
+    use crate::support::retirement::{PASSWORD, Reply, bearer, id, login, world};
+    use atlas_core::households::ManagementCommand as M;
+    use atlas_core::{
+        Command,
+        policy::{Policy, PrincipalGrant},
+    };
+
+    fn redact(value: &Value, names: &BTreeMap<String, &str>) -> Value {
+        match value {
+            Value::String(s) => names
+                .get(s)
+                .map_or_else(|| value.clone(), |name| json!(name)),
+            Value::Array(items) => {
+                // Account ids are random, so lists keyed by account are compared by role name.
+                let mut items: Vec<Value> = items.iter().map(|v| redact(v, names)).collect();
+                items.sort_by_key(|v| v.get("account_id").map(Value::to_string));
+                Value::Array(items)
+            }
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .filter(|(k, _)| k.as_str() != "request_id")
+                    .map(|(k, v)| (k.clone(), redact(v, names)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+    let w = world(false).await?;
+    let now = atlas_server::now();
+    let alice = w.alice.clone();
+    let bob: String = sqlx::query_scalar("SELECT id FROM accounts WHERE username='device-bob'")
+        .fetch_one(&w.store.pool)
+        .await?;
+    let carol = id();
+    w.store
+        .add_account(
+            &carol,
+            "summary-carol",
+            &atlas_server::hash_password(PASSWORD.into()).await?,
+        )
+        .await?;
+    let (home, invitation) = (id(), id());
+    // Fixed person ids, so the listing order (ascending id) is the same in every recording.
+    let shared = "00000000-0000-4000-8000-00000000c0a1".to_owned();
+    let private = "00000000-0000-4000-8000-00000000c0a2".to_owned();
+    w.store
+        .management(
+            &alice,
+            &id(),
+            &[M::CreateHousehold {
+                id: home.clone(),
+                name: "Home".into(),
+            }],
+            now,
+        )
+        .await?;
+    w.store
+        .management(
+            &alice,
+            &id(),
+            &[M::InviteToHousehold {
+                id: invitation.clone(),
+                household_id: home.clone(),
+                recipient_id: bob.clone(),
+                expected_version: 1,
+            }],
+            now,
+        )
+        .await?;
+    w.store
+        .management(
+            &bob,
+            &id(),
+            &[M::RespondToHouseholdInvitation {
+                id: invitation,
+                expected_version: 1,
+                accept: true,
+            }],
+            now,
+        )
+        .await?;
+    w.store
+        .apply(
+            &alice,
+            &id(),
+            &[
+                Command::CreatePerson {
+                    id: shared.clone(),
+                    name: "Morgan".into(),
+                    initial_policy: Some(Policy {
+                        grants: vec![
+                            PrincipalGrant::Household {
+                                id: home.clone(),
+                                edit: false,
+                            },
+                            PrincipalGrant::Account {
+                                id: carol.clone(),
+                                edit: false,
+                            },
+                        ],
+                        exclude_accounts: vec![],
+                    }),
+                },
+                Command::CreatePerson {
+                    id: private.clone(),
+                    name: "Private".into(),
+                    initial_policy: Some(Policy::default()),
+                },
+            ],
+        )
+        .await?;
+    let names: BTreeMap<String, &str> = [
+        (alice.clone(), "ALICE"),
+        (bob.clone(), "BOB"),
+        (carol.clone(), "CAROL"),
+        (home.clone(), "HOME"),
+        (shared.clone(), "SHARED_PERSON"),
+        (private.clone(), "PRIVATE_PERSON"),
+    ]
+    .into_iter()
+    .collect();
+    let tokens = [
+        bearer(&login(&w.app, "device-alice", "phone").await),
+        bearer(&login(&w.app, "device-bob", "laptop").await),
+        bearer(&login(&w.app, "summary-carol", "tablet").await),
+    ];
+    let get = |who: Option<usize>, path: String| {
+        let app = w.app.clone();
+        let auth = who.map(|i| tokens[i].clone());
+        async move {
+            let headers: Vec<(&str, &str)> = auth
+                .as_deref()
+                .map(|a| vec![("authorization", a)])
+                .unwrap_or_default();
+            request(&app, "GET", &path, &headers, Value::Null).await
+        }
+    };
+    let shape = |reply: &Reply| {
+        json!({
+            "status": reply.0.as_u16(),
+            "cache_control": reply.1.get("cache-control").map(|v| v.to_str().unwrap()),
+            "body": redact(&reply.2, &names),
+        })
+    };
+    let mut results = serde_json::Map::new();
+    for (name, who, path) in [
+        ("owner_list", Some(0), "people/summaries".to_owned()),
+        (
+            "member_in_home",
+            Some(1),
+            "people/summaries?scope=in_home".to_owned(),
+        ),
+        (
+            "no_primary_household_in_home",
+            Some(2),
+            "people/summaries?scope=in_home".to_owned(),
+        ),
+        (
+            "direct_grantee_shared_with_me",
+            Some(2),
+            "people/summaries?scope=shared_with_me".to_owned(),
+        ),
+        ("owner_detail", Some(0), format!("people/{shared}/summary")),
+        ("member_detail", Some(1), format!("people/{shared}/summary")),
+        (
+            "member_field_audiences",
+            Some(1),
+            format!("people/{shared}/field-audiences"),
+        ),
+        (
+            "unknown_scope",
+            Some(0),
+            "people/summaries?scope=everyone".to_owned(),
+        ),
+        (
+            "limit_over",
+            Some(0),
+            "people/summaries?limit=101".to_owned(),
+        ),
+        ("unauthenticated", None, "people/summaries".to_owned()),
+    ] {
+        results.insert(name.into(), shape(&get(who, path).await));
+    }
+    // A real person the reader cannot see and an id that names nothing are the same `not_found`.
+    let invisible = get(Some(1), format!("people/{private}/summary")).await;
+    let missing = get(Some(1), format!("people/{}/summary", id())).await;
+    assert_eq!(
+        redact(&invisible.2, &names),
+        redact(&missing.2, &names),
+        "an invisible and a nonexistent person are indistinguishable"
+    );
+    results.insert("not_found".into(), shape(&invisible));
+    Ok(Value::Object(results))
+}
+
 async fn observe(app: &Router) -> Value {
     json!({
         "activation": activation_probes().await.expect("activation-grant protocol probes"),
@@ -2341,6 +2542,7 @@ async fn observe(app: &Router) -> Value {
         "content_and_retirement": content_and_retirement().await.expect("combined protocol probes"),
         "independent_timers": independent_timer_probes().await.expect("BE-B6 independent-timer probes"),
         "labels_and_capacity": labels_and_capacity_probes().await.expect("BE-Q25 label, naming and capacity probes"),
+        "people_summaries": people_summary_probes().await.expect("BE-PEOPLE-SUMMARY viewer-safe summary probes"),
         "health": probe(app, "/health", &["api_version"]).await,
         "me_unauthenticated": probe(app, "/api/experimental/v1/me", &["request_id"]).await,
         "ready": probe(app, "/ready", &[]).await,

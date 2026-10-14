@@ -314,6 +314,11 @@ CREATE TABLE person_aliases (
     canonical_id text NOT NULL
 );
 
+CREATE TABLE person_attributions (
+    person_id text NOT NULL,
+    added_by text NOT NULL
+);
+
 CREATE TABLE progress_entries (
     id text NOT NULL,
     progress_id text NOT NULL,
@@ -672,6 +677,9 @@ ALTER TABLE ONLY person_accounts
 ALTER TABLE ONLY person_aliases
     ADD CONSTRAINT person_aliases_pkey PRIMARY KEY (source_id);
 
+ALTER TABLE ONLY person_attributions
+    ADD CONSTRAINT person_attributions_pkey PRIMARY KEY (person_id);
+
 ALTER TABLE ONLY progress_entries
     ADD CONSTRAINT progress_entries_pkey PRIMARY KEY (id);
 
@@ -1011,6 +1019,12 @@ ALTER TABLE ONLY person_accounts
 ALTER TABLE ONLY person_aliases
     ADD CONSTRAINT person_aliases_canonical_id_fkey FOREIGN KEY (canonical_id) REFERENCES resources(id);
 
+ALTER TABLE ONLY person_attributions
+    ADD CONSTRAINT person_attributions_added_by_fkey FOREIGN KEY (added_by) REFERENCES accounts(id);
+
+ALTER TABLE ONLY person_attributions
+    ADD CONSTRAINT person_attributions_person_id_fkey FOREIGN KEY (person_id) REFERENCES resources(id);
+
 ALTER TABLE ONLY progress_entries
     ADD CONSTRAINT progress_entries_progress_id_fkey FOREIGN KEY (progress_id) REFERENCES resources(id);
 
@@ -1143,4 +1157,4 @@ ALTER TABLE ONLY timer_sessions
 
 
 INSERT INTO sync_clock(id,revision,resource_count) VALUES(1,0,0);
-INSERT INTO atlas_schema(version) VALUES(1005);
+INSERT INTO atlas_schema(version) VALUES(1006);

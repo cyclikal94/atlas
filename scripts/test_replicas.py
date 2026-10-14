@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 import uuid
 from smoke.client import ContractClient
-from smoke import calendars, sharing, households, tasks, people, devices, timers, labels
+from smoke import calendars, sharing, households, tasks, people, devices, timers, labels, people_summary
 
 ROOT = Path(__file__).resolve().parents[1]
 # ATLAS_TEST_BINARY names the exact executable under test (the release-shaped build).
@@ -408,6 +408,8 @@ def main():
             print(json.dumps(timers.run(call, accounts, tokens, document)))
             # Alternating processes serve the label, naming and capacity requests (BE-Q25).
             print(json.dumps(labels.run(call, tokens, secrets)))
+            # Viewer-safe People summaries, each read served by whichever process is next (BE-PEOPLE-SUMMARY).
+            print(json.dumps(people_summary.run(call, accounts, tokens)))
             def seed(account, device, kind):
                 """Fixture rows for devices.run: no OpenID provider or push endpoint exists here."""
                 expires = int(time.time()) + 3600

@@ -8,6 +8,7 @@ mod integrations;
 mod labels;
 mod oidc;
 mod onboarding;
+mod people_summary;
 mod policy_precondition;
 mod sessions;
 mod snapshot;

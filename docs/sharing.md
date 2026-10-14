@@ -263,6 +263,10 @@ edit. Exclusions apply to all audience grants; resource owners retain their own
 management access. Read/edit permission does not imply policy-management permission.
 The atomic batch direct `grant`/`revoke` commands remain available and affect only direct grants.
 A direct grant does not override an exclusion or remove a household grant.
+`GET /policies/{id}` refuses anyone but the owner with `403`. To describe who can see a
+person or field to any reader, use the viewer-safe summaries in
+[people](people.md#viewer-safe-summaries): complete for the owner, partial for everyone
+else, and never a `403` for a visible person.
 
 Household membership is evaluated live. Joining reveals existing household-shared
 resources. Leaving removes that source of access while preserving independent direct

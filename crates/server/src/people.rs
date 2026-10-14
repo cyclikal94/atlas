@@ -1,6 +1,6 @@
 use super::*;
 use atlas_core::error::ErrorCode;
-use atlas_core::people::PeopleCommand;
+use atlas_core::people::{PeopleCommand, PeopleScope};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Input {
@@ -114,6 +114,75 @@ pub(super) async fn duplicates(
             .person_duplicates(
                 &actor,
                 &id,
+                filter.after.as_deref(),
+                filter.limit.unwrap_or(50),
+            )
+            .await?,
+    )?))
+}
+
+/// `GET /people/summaries` filters. An unknown `scope` or member is a malformed request.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SummaryFilter {
+    #[serde(default)]
+    scope: PeopleScope,
+    #[serde(default)]
+    archived: bool,
+    after: Option<String>,
+    limit: Option<u16>,
+}
+pub(super) async fn summaries(
+    State(app): State<App>,
+    headers: HeaderMap,
+    query: Result<Query<SummaryFilter>, QueryRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (actor, _) = identity(&app, &headers).await?;
+    let Query(filter) = query.map_err(|_| anyhow!(ErrorCode::MalformedRequest))?;
+    Ok(Json(serde_json::to_value(
+        app.store
+            .people_summaries(
+                &actor,
+                filter.scope,
+                filter.archived,
+                filter.after.as_deref(),
+                filter.limit.unwrap_or(50),
+            )
+            .await?,
+    )?))
+}
+pub(super) async fn summary(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (actor, _) = identity(&app, &headers).await?;
+    Ok(Json(serde_json::to_value(
+        app.store.person_summary(&actor, &id).await?,
+    )?))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FieldAudienceFilter {
+    #[serde(default)]
+    archived: bool,
+    after: Option<String>,
+    limit: Option<u16>,
+}
+pub(super) async fn field_audiences(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    query: Result<Query<FieldAudienceFilter>, QueryRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (actor, _) = identity(&app, &headers).await?;
+    let Query(filter) = query.map_err(|_| anyhow!(ErrorCode::MalformedRequest))?;
+    Ok(Json(serde_json::to_value(
+        app.store
+            .person_field_audiences(
+                &actor,
+                &id,
+                filter.archived,
                 filter.after.as_deref(),
                 filter.limit.unwrap_or(50),
             )

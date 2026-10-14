@@ -12,6 +12,7 @@ This document explains ownership and relationships rather than duplicating every
 | `resource_grants`, `resource_household_grants`, `resource_exclusions`, `resource_ancestors` | Direct/live-household visibility, exclusions and required ancestor visibility |
 | `households`, `household_memberships`, `household_invitations`, `default_templates` | Membership, roles, invitations and creation templates |
 | `person_accounts`, `person_aliases`, `frozen_owner_visibility` | Account-linked identity, authorised canonical resolution and merge-time visibility preservation |
+| `person_attributions` | The account that created each person (schema `1006`), kept apart from `resources.owner_id` because linking and `reference_account` give a person an owner that did not create it. Written in the creating transaction by `create_person` and by `reference_account` when it creates an identity; never changed afterwards. A person without a row (every person created before `1006`) has unknown attribution. Grants no access |
 | `people_requests`, `people_results`, `people_request_ids` | Consent proposals, replay results and permanent request UUID reservation |
 | `tasks`, `task_definitions`, `task_enrolments`, `task_enrolment_history` | Task identity, execution definitions and versioned participation |
 | `task_occurrences`, `occurrence_participants`, `progress_entries` | Stable scheduled instances, participant snapshots and correction-aware evidence |

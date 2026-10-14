@@ -9,7 +9,7 @@ refusal, SQL validity) and calls this between and after them:
   compare SOURCE RESTORED   what a restore must and must not have changed, with non-zero counts
   same    A B               two digests are identical (a refused restore changed nothing)
   serve   SOURCE RESTORED   real servers on both; the same reads; a new concurrent timer
-  legacy  EXPORT            frozen-1003/1004 bundles 1000..1004, real startup upgrades, refusals
+  legacy  EXPORT            frozen-1003/1004/1005 bundles 1000..1005, real startup upgrades, refusals
 
 `ATLAS_PG_CLUSTER` is the cluster's socket directory. Nothing here touches another database."""
 import getpass
@@ -29,6 +29,7 @@ from test_recovery import (ADJUSTED, DELETED, MUST_SURVIVE, ROOT, SERVER, Server
 
 FROZEN_1003 = ROOT / 'crates/core/tests/fixtures/schema_1003_postgres.sql'
 FROZEN_1004 = ROOT / 'crates/core/tests/fixtures/schema_1004_postgres.sql'
+FROZEN_1005 = ROOT / 'crates/core/tests/fixtures/schema_1005_postgres.sql'
 # The accounts test_replicas.py creates and their shared password.
 REPLICA_PASSWORD = 'replica-test-password-123'
 CLUSTER = os.environ.get('ATLAS_PG_CLUSTER', '')
@@ -102,9 +103,12 @@ def assert_upgraded(target, schema):
     assert {'timer_active_account_occurrence', 'timer_account_stopped'} <= names, names
     columns = set(shape(target))
     assert {'sessions.client_channel text YES', 'sessions.client_browser text YES',
-            'sessions.client_platform text YES', 'device_profiles.name text YES'} <= columns
+            'sessions.client_platform text YES', 'device_profiles.name text YES',
+            'person_attributions.person_id text NO', 'person_attributions.added_by text NO'} <= columns
 
 
+# Reverses the 1005 -> 1006 step exactly (BE-PEOPLE-SUMMARY): its keys go with the table.
+REVERSE_1006 = 'DROP TABLE person_attributions;\nUPDATE atlas_schema SET version=1005'
 # Reverses the 1004 -> 1005 step exactly (BE-Q25): the constraints go with their columns.
 REVERSE_1005 = ('DROP TABLE device_profiles;\nALTER TABLE sessions DROP COLUMN client_channel, '
                 'DROP COLUMN client_browser, DROP COLUMN client_platform;\nUPDATE atlas_schema SET version=1004')
@@ -197,7 +201,7 @@ def older(target, version):
 
 def frozen(name, version=1003):
     target = createdb(name)
-    psql_file(target, FROZEN_1004 if version == 1004 else FROZEN_1003)
+    psql_file(target, {1003: FROZEN_1003, 1004: FROZEN_1004, 1005: FROZEN_1005}[version])
     assert psql(target, 'SELECT version FROM atlas_schema') == str(version)
     return target
 
@@ -212,10 +216,10 @@ def cmd_legacy(export):
     export = Path(export)
     tmp = Path(tempfile.mkdtemp(prefix='atlas-legacy-'))
     try:
-        # Bundles of every older schema, from the frozen 1003 baseline (1004 from its own frozen
-        # schema), restored with this executable.
+        # Bundles of every older schema, from the frozen 1003 baseline (1004 and 1005 from their own
+        # frozen schemas), restored with this executable.
         for version in range(first_upgradable(), schema):
-            source = frozen(f'legacy_{version}', 1004 if version >= 1004 else 1003)
+            source = frozen(f'legacy_{version}', min(max(version, 1003), 1005))
             ids = seed_fixture(source, history=True)
             older(source, version)
             assert psql(source, 'SELECT version FROM atlas_schema') == str(version)
@@ -235,10 +239,41 @@ def cmd_legacy(export):
             for table in ('people_request_history', 'household_invitation_history'):
                 assert after['tables'][table][0] == expected_history, (version, table)
             assert after['tables']['device_profiles'][0] == 0, version
+            # No bundle before 1006 proves who added a person, so the upgrade records nobody.
+            assert after['tables']['person_attributions'][0] == 0, version
             # The upgraded database has the new rule; the old index is gone.
             psql(target, f"INSERT INTO timer_sessions(id,progress_id,account_id,started_at,version) VALUES ('{uuid.uuid4()}','{ids['idle']}','{ids['alice']}',5000,1)")
             duplicate = psql(target, f"INSERT INTO timer_sessions(id,progress_id,account_id,started_at,version) VALUES ('{uuid.uuid4()}','{ids['busy']}','{ids['alice']}',5000,1)", check=False)
             assert duplicate.returncode and b'duplicate key' in duplicate.stderr, duplicate.stderr
+
+        # The genuine 1005 schema: the real, populated database reversed to exactly the frozen 1005
+        # schema. Started idle, the upgrade rewrites no row and records no attribution; started and
+        # used, every pre-existing person reads `unknown` and a new one is attributed to its creator.
+        reference_1005 = frozen('frozen_1005_empty', 1005)
+        for name, used in (('idle', False), ('direct', True)):
+            target = createdb(f'{name}_1005')
+            tool('restore', target, str(export))
+            psql(target, REVERSE_1006)
+            assert indexes(target) == indexes(reference_1005), 'the reversal is exactly the frozen 1005 index set'
+            assert shape(target) == shape(reference_1005)
+            assert constraints(target) == constraints(reference_1005)
+            before = digest(target)
+            with Server(target, tmp / f'{name}-1005.log') as server:
+                server.call('GET', '/ready')
+                if used:
+                    token = server.login('alice', REPLICA_PASSWORD)
+                    rows = server.call('GET', '/api/experimental/v1/people/summaries?limit=100', token)['items']
+                    assert rows and all(r['added_by_you'] == 'unknown' for r in rows), rows
+                    person = str(uuid.uuid4())
+                    server.call('POST', '/api/experimental/v1/commands', token, {'commands': [
+                        {'kind': 'create_person', 'id': person, 'name': 'After upgrade'}]}, str(uuid.uuid4()))
+                    mine = server.call('GET', f'/api/experimental/v1/people/{person}/summary', token)['summary']
+                    assert mine['added_by_you'] == 'yes', mine
+            assert_upgraded(target, schema)
+            if not used:
+                upgraded = digest(target)['tables']
+                assert upgraded.pop('person_attributions')[0] == 0
+                assert upgraded == before['tables'], 'the 1005 -> 1006 startup upgrade rewrites no row'
 
         # A real startup upgrade: a bundle of the real, populated database is restored and reversed
         # to exactly the frozen 1004 schema and then the frozen 1003 schema; a server started
@@ -248,6 +283,7 @@ def cmd_legacy(export):
         for name, used in (('idle', False), ('direct', True)):
             target = createdb(f'{name}_1003')
             tool('restore', target, str(export))
+            psql(target, REVERSE_1006)
             psql(target, REVERSE_1005)
             assert indexes(target) == indexes(reference_1004), 'the reversal is exactly the frozen 1004 index set'
             assert shape(target) == shape(reference_1004)
@@ -278,6 +314,7 @@ def cmd_legacy(export):
                 # The only new table is empty; every pre-existing table is unchanged (the restored
                 # copy holds no session rows, so the added nullable columns hold no value).
                 assert upgraded.pop('device_profiles')[0] == 0
+                assert upgraded.pop('person_attributions')[0] == 0
                 assert upgraded == before['tables'], 'the startup upgrade rewrites no row'
 
         # Unknown schemas are refused by the tool on both sides of the supported range, and a

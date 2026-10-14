@@ -172,6 +172,14 @@ impl Store {
                     identifier(id)?;
                     content(name, "")?;
                     sqlx::query("INSERT INTO resources(id,owner_id,kind,label,value) VALUES ($1,$2,'person',$3,'')").bind(id).bind(actor).bind(name).execute(&mut **tx).await?;
+                    // Durable original-creator attribution, separate from ownership (schema 1006).
+                    sqlx::query(
+                        "INSERT INTO person_attributions(person_id,added_by) VALUES ($1,$2)",
+                    )
+                    .bind(id)
+                    .bind(actor)
+                    .execute(&mut **tx)
+                    .await?;
                     Self::put_policy(
                         tx,
                         actor,

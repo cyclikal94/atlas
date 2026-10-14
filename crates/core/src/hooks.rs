@@ -116,8 +116,9 @@ impl Hooks {
         self.state().unverified = !enabled;
     }
 
-    /// `SHOW transaction_isolation` as observed after the locking reads of each attempt, and
-    /// between the two halves of a sharing snapshot.
+    /// `SHOW transaction_isolation` as observed after the locking reads of each attempt,
+    /// between the two halves of a sharing snapshot, and between a People summary's id query and
+    /// its enrichment.
     pub fn isolation_seen(&self) -> Vec<String> {
         self.state().isolation_seen.clone()
     }
@@ -182,7 +183,9 @@ impl Hooks {
     ) -> Result<()> {
         if matches!(
             point,
-            "retire.after_locking_reads" | "sharing_snapshot.between_reads"
+            "retire.after_locking_reads"
+                | "sharing_snapshot.between_reads"
+                | "people_summary.between_reads"
         ) && !sqlite
         {
             let level: String = sqlx::query_scalar("SHOW transaction_isolation")

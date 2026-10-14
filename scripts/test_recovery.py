@@ -5,8 +5,8 @@ previous schema the tool accepts.
 A current-schema database is populated through a real server process (the smoke scenarios), backed
 up and restored with `scripts/backup.py`, and then a real server is started on the restored file.
 Row-level digests prove what survived, so equality is never vacuous. Older bundles are built from
-the frozen 1003 schema fixture (and the 1004 bundle from the frozen 1004 fixture) and upgraded in
-place by the restore. Requires the contract
+the frozen 1003 schema fixture (and the 1004 and 1005 bundles from the frozen 1004 and 1005
+fixtures) and upgraded in place by the restore. Requires the contract
 requirements (`scripts/requirements-contract.txt`), like the smoke run."""
 import hashlib
 import json
@@ -29,6 +29,7 @@ V1 = '/api/experimental/v1'
 PASSWORD = 'recovery-scenario-password-123'
 FROZEN_1003 = ROOT / 'crates/core/tests/fixtures/schema_1003_sqlite.sql'
 FROZEN_1004 = ROOT / 'crates/core/tests/fixtures/schema_1004_sqlite.sql'
+FROZEN_1005 = ROOT / 'crates/core/tests/fixtures/schema_1005_sqlite.sql'
 # The tables a restore deliberately resets (`Store::prepare_restored_database`), and the ones it
 # adjusts in place. Everything else must survive byte-for-byte.
 DELETED = {'sync_cursors', 'sync_snapshots', 'sync_devices', 'sessions', 'oidc_flows',
@@ -39,11 +40,12 @@ DELETED = {'sync_cursors', 'sync_snapshots', 'sync_devices', 'sessions', 'oidc_f
            'snapshot_items', 'sync_deliveries'}
 ADJUSTED = {'accounts', 'account_invitations', 'calendar_sources', 'reminder_deliveries'}
 # Durable tables whose survival the recovery acceptance names: timer history (running and
-# stopped), both durable sent histories, the retirement ledger and receipts, and the content the
-# timers point at. Each must hold rows in the seeded database, so equality is not vacuous.
+# stopped), both durable sent histories, the retirement ledger and receipts, the content the
+# timers point at, and who added each person (schema 1006). Each must hold rows in the seeded
+# database, so equality is not vacuous.
 MUST_SURVIVE = ['timer_sessions', 'people_request_history', 'household_invitation_history',
                 'operation_outcomes', 'receipts', 'resources', 'occurrence_participants',
-                'progress_entries']
+                'progress_entries', 'person_attributions']
 
 
 def current_schema():
@@ -215,6 +217,14 @@ def assert_upgraded(path, expected):
     shape = table_columns(path)
     assert 'device_profiles' in shape, sorted(shape)
     assert {'client_channel', 'client_browser', 'client_platform'} <= set(shape['sessions']), shape['sessions']
+    assert shape.get('person_attributions') == ['person_id', 'added_by'], sorted(shape)
+
+
+def downgrade_to_1005(path):
+    """Reverse the 1005 -> 1006 step exactly (BE-PEOPLE-SUMMARY: one table)."""
+    with sqlite3.connect(path) as db:
+        db.execute('DROP TABLE person_attributions')
+        db.execute('UPDATE atlas_schema SET version=1005')
 
 
 def downgrade_to_1004(path):
@@ -249,6 +259,12 @@ def frozen_1004(path):
     """An empty database exactly as the 1004 release created it."""
     with sqlite3.connect(path) as db:
         db.executescript(FROZEN_1004.read_text())
+
+
+def frozen_1005(path):
+    """An empty database exactly as the 1005 release created it."""
+    with sqlite3.connect(path) as db:
+        db.executescript(FROZEN_1005.read_text())
 
 
 def older(path, version):
@@ -390,6 +406,44 @@ def main():
         assert restored.read_bytes() == before
         assert run_tool(base, 'restore', str(bundle), '--engine', 'postgres', '--offline', check=False).returncode != 0
 
+        # The genuine 1005 schema (BE-PEOPLE-SUMMARY). Reversing the 1006 step on the real, populated
+        # database must give exactly the frozen 1005 schema. A server started directly on it upgrades
+        # it in place and records no attribution: every person that existed before reads `unknown`,
+        # and a person created afterwards is attributed to its creator.
+        frozen_empty_1005 = root / 'frozen-1005.sqlite'
+        frozen_1005(frozen_empty_1005)
+        assert version_of(frozen_empty_1005) == [(1005,)]
+        real_1005 = root / 'real-1005.sqlite'
+        copy(original, real_1005)
+        downgrade_to_1005(real_1005)
+        assert schema_of(real_1005) == schema_of(frozen_empty_1005), 'the reversal is exactly the frozen 1005 schema'
+        shape_1005 = table_columns(real_1005)
+        pre_1006 = digests(real_1005)
+        attributed = root / 'direct-1005.sqlite'
+        copy(real_1005, attributed)
+        with Server(attributed, root / 'direct-1005.log') as server:
+            token = server.login('alice')
+            rows = server.call('GET', V1 + '/people/summaries?limit=100', token)['items']
+            assert rows and all(r['added_by_you'] == 'unknown' for r in rows), rows
+            new_person = str(uuid.uuid4())
+            server.call('POST', V1 + '/commands', token, {'commands': [
+                {'kind': 'create_person', 'id': new_person, 'name': 'After upgrade'}]}, str(uuid.uuid4()))
+            mine = server.call('GET', f'{V1}/people/{new_person}/summary', token)['summary']
+            assert mine['added_by_you'] == 'yes', mine
+        assert_upgraded(attributed, schema)
+        with sqlite3.connect(attributed) as db:
+            assert db.execute('SELECT person_id FROM person_attributions').fetchall() == [(new_person,)]
+        # The used copy above wrote rows (a sign-in, a person); the idle copy proves the upgrade
+        # itself rewrites nothing.
+        idle_1005 = root / 'idle-1005.sqlite'
+        copy(real_1005, idle_1005)
+        with Server(idle_1005, root / 'idle-1005.log') as server:
+            server.call('GET', '/ready')
+        assert_upgraded(idle_1005, schema)
+        assert digests(idle_1005, shape_1005) == pre_1006, 'the 1005 -> 1006 startup upgrade rewrites no row'
+        with sqlite3.connect(idle_1005) as db:
+            assert db.execute('SELECT count(*) FROM person_attributions').fetchone()[0] == 0
+
         # The genuine 1004 schema (BE-Q25). Reversing the 1005 step on the real, populated database
         # must give exactly the frozen 1004 schema. A server started directly on it upgrades it in
         # place: the sessions issued before the upgrade are listed with `client: null`, a new
@@ -398,7 +452,7 @@ def main():
         frozen_1004(frozen_empty_1004)
         assert version_of(frozen_empty_1004) == [(1004,)]
         real_1004 = root / 'real-1004.sqlite'
-        copy(original, real_1004)
+        copy(real_1005, real_1004)
         downgrade_to_1004(real_1004)
         assert schema_of(real_1004) == schema_of(frozen_empty_1004), 'the reversal is exactly the frozen 1004 schema'
         with sqlite3.connect(real_1004) as db:
@@ -475,8 +529,8 @@ def main():
         # valid "back up before upgrading" source, upgraded in place with its rows preserved.
         for version in range(first_upgradable(), schema):
             legacy = root / f'legacy-{version}.sqlite'
-            # 1004 is built from its own frozen release schema; older ones from frozen 1003.
-            (frozen_1004 if version >= 1004 else frozen_1003)(legacy)
+            # 1004 and 1005 are built from their own frozen release schemas; older ones from frozen 1003.
+            (frozen_1005 if version >= 1005 else frozen_1004 if version >= 1004 else frozen_1003)(legacy)
             ids = seed_fixture(legacy, history=True)
             older(legacy, version)
             assert version_of(legacy) == [(version,)]
@@ -498,6 +552,8 @@ def main():
                 assert db.execute('SELECT count(*) FROM people_request_history').fetchone()[0] == expected_history
                 assert db.execute('SELECT count(*) FROM household_invitation_history').fetchone()[0] == expected_history
                 assert db.execute('SELECT count(*) FROM device_profiles').fetchone()[0] == 0
+                # No bundle before 1006 proves who added a person, so the upgrade records nobody.
+                assert db.execute('SELECT count(*) FROM person_attributions').fetchone()[0] == 0
                 # The upgraded database has the new rule: a second running timer on another stream.
                 db.execute('PRAGMA foreign_keys=ON')
                 db.execute('INSERT INTO timer_sessions(id,progress_id,account_id,started_at,version) VALUES (?,?,?,5000,1)',

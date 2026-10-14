@@ -10,6 +10,7 @@ routes retain `/api/experimental/v1`; `/health` and `/ready` are outside that pr
 | `commands`, `access-commands`, `management-commands` | Atomic ordered resource changes, direct sharing, household/default/policy management |
 | `task-commands`, `task-access-commands`, task and occurrence reads | Definitions, evidence, schedules, timers, dependencies, rotas and lists |
 | `people-commands`, person detail, duplicate/merge preview and requests | Explicit account references, consent and privacy-preserving merging |
+| People summaries, person summary and field audiences | Viewer-safe linkage, attribution and audience for the People screens |
 | Calendar commands, source import/refresh, events and anchors | ICS enrichment and review |
 | Reminder commands, subscription/capability/delivery reads | Device-local or server-owned reminders |
 | `sync` | Authorised immutable snapshots followed by incremental batches |
@@ -134,6 +135,23 @@ database schema `1005`. A client must treat an absent member (an older server) a
 unavailable and a label it does not recognise as `unknown`, and must render names as text.
 See [authentication](authentication.md#session-and-device-labels). The compatibility
 baseline gains a `labels_and_capacity` probe group.
+
+`0.29.0` adds viewer-safe People summaries (BE-PEOPLE-SUMMARY) and changes no existing
+response: `listPeople`, `getPerson`, `Projection`, `/sync` and `GET /policies/{id}` are
+byte-for-byte as before. It adds three authenticated reads, `GET /people/summaries`
+(`listPeopleSummaries`), `GET /people/{id}/summary` (`getPersonSummary`) and
+`GET /people/{id}/field-audiences` (`listPersonFieldAudiences`), and their strict
+schemas: `PersonSummaryPage`, `PersonSummary`, `SummaryOwner`, `SummaryPersonRef`,
+`AudienceSummary`, `HouseholdAudience`, `SummaryDirectGrant`, `PeopleHome`,
+`PersonSummaryDetail`, `SharedWith`, `SharedHousehold`, `SharedMember`,
+`SummaryAccountGrant`, `SummaryAccountRef`, `FieldAudiencePage` and `FieldAudience`. A
+reader who does not own a person always receives a `partial` summary that discloses
+nothing about access the reader does not hold. It needs database schema `1006`, which
+adds the original-creator record behind `added_by_you`; people created earlier read
+`unknown`. A client must call these reads only once the server reports `0.29.0` or later,
+and must not probe `GET /policies/{id}` for people it does not own. See
+[people](people.md#viewer-safe-summaries). The compatibility baseline gains a
+`people_summaries` probe group.
 
 Mutations require an account-scoped UUID `Idempotency-Key` and explicit version
 preconditions where defined. Commands that replace existing authored text also carry the

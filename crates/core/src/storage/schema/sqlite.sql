@@ -85,6 +85,13 @@ CREATE TABLE person_accounts (
  account_id TEXT NOT NULL UNIQUE REFERENCES accounts(id)
 );
 
+-- BE-PEOPLE-SUMMARY: the account that created a person, separate from its current owner. Grants
+-- no access. A person without a row (every person created before 1006) has unknown attribution.
+CREATE TABLE person_attributions (
+ person_id TEXT PRIMARY KEY REFERENCES resources(id),
+ added_by TEXT NOT NULL REFERENCES accounts(id)
+);
+
 CREATE TABLE frozen_owner_visibility (
  resource_id TEXT PRIMARY KEY REFERENCES resources(id)
 );
@@ -490,4 +497,4 @@ BEGIN
  SELECT NEW.id,ancestor_id,depth+1 FROM resource_ancestors WHERE resource_id=NEW.parent_id;
 END;
 INSERT INTO sync_clock(id,revision,resource_count) VALUES(1,0,0);
-INSERT INTO atlas_schema(version) VALUES(1005);
+INSERT INTO atlas_schema(version) VALUES(1006);

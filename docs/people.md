@@ -43,7 +43,8 @@ request-ID tombstones and account-scoped operation results remain durable for re
 cleanup must not recreate a handled action or reuse an old request identity. The response exposes the proposed basic
 identity information, not internal preview tokens or private contribution state.
 `GET /people/{id}` resolves an old merged ID to its current authorised canonical
-identity and reports its account link.
+identity and reports its account link. Audience, linkage and attribution summaries for
+the People screens are separate reads; see [viewer-safe summaries](#viewer-safe-summaries).
 
 `GET /people/requests/sent` lists this account's own sent requests, paginated and
 across every state (`pending`/`accepted`/`declined`/`cancelled`/`expired`), not just
@@ -54,6 +55,94 @@ operational row is later purged by the same seven-day cleanup described above. E
 row names its recipient (`recipient_id` and `recipient_username`), so a fresh device can
 label it without any local record of what was sent. This is an ordinary authenticated
 online read, not part of the sync/offline projection model.
+
+## Viewer-safe summaries
+
+Since API `0.29.0` (schema `1006`) three authenticated online reads describe people for
+the People list, its filters and columns, the field table's "Who can see it" and the
+detail "Shared with" rail, without the owner-only `GET /policies/{id}`:
+
+| Read | Returns |
+| --- | --- |
+| `GET /people/summaries?scope=&archived=&after=&limit=` | `PersonSummaryPage`: one page (1–100 rows, default 50) of the caller's visible people in ascending id order, the caller's primary household as `home` (or `null`) and `next_after` |
+| `GET /people/{id}/summary` | `PersonSummaryDetail`: one visible person's `PersonSummary` and its `SharedWith` rail |
+| `GET /people/{id}/field-audiences?archived=&after=&limit=` | `FieldAudiencePage`: the person's fields the caller can see, each with its `AudienceSummary` |
+
+A merged person's old id resolves to the canonical person, as on `GET /people/{id}`. A
+person the caller cannot see and an id that names nothing are the same `404 not_found`.
+None of the three has an owner-only branch, so none returns `403` because of a person's
+sharing; a `403` can only come from credential transport, as on every protected read.
+
+**Who added a person.** Each person created since schema `1006` records the account
+that created it (`person_attributions`), separately from its current owner. Accepting a
+link, a merge into a linked identity and `reference_account` all leave a person owned by
+an account that did not create it, and unlinking keeps the transferred owner, so ownership
+cannot answer the question. `create_person` records its caller; `reference_account`
+records its caller when it creates the referenced account's identity and nothing when the
+identity already exists; link, merge, unlink, rename and archive never change the record.
+`added_by_you` is `yes`, `no` (never naming who) or `unknown`. No earlier record proves
+who created an existing person (ownership may have moved, unlink deletes the link, and
+receipts hold digests only), so the `1005 → 1006` upgrade records nobody and every older
+person is `unknown`: make no attribution claim for it. Attribution grants no access and
+changes no permission check.
+
+**Disclosure.** The owner of a person or field receives the complete audience: every
+direct grant, every household grant, the exclusion count and, in the rail, the member list
+of each household the owner belongs to with excluded members marked, and the excluded
+accounts. Every other reader receives `disclosure: "partial"`, always, whether or not the
+owner has shared it more widely: the owner, the reader's own direct grant, and the
+households the reader belongs to (name, version and size as in `GET /households`), never a
+member list, another account's grant, an exclusion, a household the reader is not in, or a
+count of anything hidden. A client says the owner may have shared it more widely. The owner
+(the sharer) is disclosed to every reader, with the owner's own linked person when the
+reader can see it. `member_count` is a household's size, not how many members can see the
+person. `your_access` is `owner`, `edit` or `view` exactly as `can_edit`; a person linked
+to another account is `view` for everyone but that account, even with an editable grant.
+
+**Filters.** `scope` is evaluated in the database over the caller's whole visible set,
+then paginated, so following `next_after` to the end is complete at each read:
+
+| `scope` | Includes |
+| --- | --- |
+| `all` (default) | Every visible person |
+| `in_home` | People shared with the caller's primary household, while the caller belongs to it. With no primary household it is empty and `home` is `null` |
+| `shared_with_me` | People owned by another account and not known to have been added by the caller; `unknown` attribution is included |
+| `not_linked` | People without an account link |
+
+`archived=true` lists only archived people, including merged aliases. `field_count` counts
+the non-archived fields the caller can see. A row whose visibility or filter membership
+changes while a client pages may be missed or appear newly; re-read after changes.
+
+**Consistency and freshness.** Each call reads one database snapshot (PostgreSQL
+`REPEATABLE READ`; SQLite's first read fixes the WAL snapshot), so a row's audience,
+versions and field count belong together. Revocation applies to the next call: the person
+leaves every scope and the `{id}` reads return `404`. A summary is identity-bound display
+data, never an access grant, and is online-only: it is not part of `/sync` and is
+`Cache-Control: private, no-store`. Re-read when a synced projection's `version` or
+`policy_version` differs from the summary's, when a projection is removed, after a receipt
+for a people, sharing, policy or household command, after reconnecting or
+re-authenticating, and when `GET /households` versions change. Keep pages per account and
+access epoch, do not persist them, drop a late response for another identity, and show a
+summary as unavailable offline rather than showing an old one.
+
+A household member's view of a person shared with their primary household:
+
+<!-- experimental-schema: PersonSummary -->
+```json
+{"id": "6f1c2a4e-8b2d-4c55-9a77-3f0e1d2c4b5a", "label": "Mo", "version": 1, "policy_version": 1, "archived": false, "linkage": "none", "linked_account_id": null, "owner": {"account_id": "0d6c1b9e-2f3a-4e5d-8c7b-1a2b3c4d5e6f", "username": "alice", "you": false, "person": null}, "added_by_you": "no", "your_access": "view", "field_count": 1, "audience": {"disclosure": "partial", "in_home": true, "households": [{"id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d", "can_edit": false, "you_are_member": true, "name": "Atlas Home", "version": 3, "member_count": 2}], "your_direct_grant": null, "direct_grant_count": null, "excluded_count": null}}
+```
+
+The same caller's rail, and In Home for a caller with no primary household:
+
+<!-- experimental-schema: SharedWith -->
+```json
+{"disclosure": "partial", "owner": {"account_id": "0d6c1b9e-2f3a-4e5d-8c7b-1a2b3c4d5e6f", "username": "alice", "you": false, "person": null}, "accounts": [], "households": [{"id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d", "can_edit": false, "you_are_member": true, "name": "Atlas Home", "version": 3, "member_count": 2, "members": null}], "excluded_accounts": null}
+```
+
+<!-- experimental-schema: PersonSummaryPage -->
+```json
+{"items": [], "next_after": null, "home": null}
+```
 
 ## Merge privacy and offline identities
 

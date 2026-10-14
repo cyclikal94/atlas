@@ -2,7 +2,7 @@
   "openapi": "3.1.1",
   "info": {
     "title": "Atlas API",
-    "version": "0.28.0",
+    "version": "0.29.0",
     "description": "Pre-release API. Breaking changes and explicit database resets are permitted until a supported release."
   },
   "servers": [
@@ -16535,6 +16535,638 @@
         "description": "Requires ownership of at least one visible identity. Only visible fields are listed. The token covers caller-visible state; private contributions are preserved from current state at commit.",
         "summary": "Preview a people merge"
       }
+    },
+    "/people/summaries": {
+      "get": {
+        "operationId": "listPeopleSummaries",
+        "summary": "List viewer-safe People summaries",
+        "description": "Authenticated like every other protected read. Online-only and identity-bound: not part of `/sync`, not cacheable (`Cache-Control: private, no-store`), never an access grant. Read in one database snapshot. A `403` arises only from credential transport (`forbidden`/`credential_mismatch`), never from the person's sharing policy: unlike `GET /policies/{id}`, there is no owner-only branch, so a client must not probe `GET /policies/{id}` for non-owned rows. One page of the reader's visible people in ascending id order. `scope` is evaluated in the database over the reader's whole visible set before pagination, so following `next_after` to the end yields the complete filtered set at each read: `all`; `in_home` (shared with the reader's primary household, empty with `home: null` when none is configured); `shared_with_me` (owned by someone else and not known to have been added by the reader; unknown attribution is included); `not_linked` (no account link). A row whose visibility or filter membership changes during a traversal may be missed or newly included; re-read after changes. An unknown `scope` is `malformed_request`.",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "scope",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "all",
+                "in_home",
+                "shared_with_me",
+                "not_linked"
+              ],
+              "default": "all"
+            }
+          },
+          {
+            "in": "query",
+            "name": "archived",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "`true` lists only archived rows (including merged people), `false` only active ones."
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "The `next_after` of the previous page."
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonSummaryPage"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "malformed_request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "unauthenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "forbidden, credential_mismatch",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "invalid_value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "internal_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "slice_capacity, temporarily_unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          }
+        },
+        "x-error-codes": {
+          "400": [
+            "malformed_request"
+          ],
+          "401": [
+            "unauthenticated"
+          ],
+          "403": [
+            "forbidden",
+            "credential_mismatch"
+          ],
+          "422": [
+            "invalid_value"
+          ],
+          "500": [
+            "internal_error"
+          ],
+          "503": [
+            "slice_capacity",
+            "temporarily_unavailable"
+          ]
+        }
+      }
+    },
+    "/people/{id}/summary": {
+      "get": {
+        "operationId": "getPersonSummary",
+        "summary": "Get a person's viewer-safe summary and Shared with rail",
+        "description": "Authenticated like every other protected read. Online-only and identity-bound: not part of `/sync`, not cacheable (`Cache-Control: private, no-store`), never an access grant. Read in one database snapshot. A `403` arises only from credential transport (`forbidden`/`credential_mismatch`), never from the person's sharing policy: unlike `GET /policies/{id}`, there is no owner-only branch, so a client must not probe `GET /policies/{id}` for non-owned rows. The summary of one visible person plus the Shared with rail. The owner receives the complete audience (direct grants, every household with member lists for households the owner belongs to, and exclusions). Anyone else receives a `partial` rail: the owner, their own direct grant and the households they belong to, never a member list or anything about other access. A person the reader cannot see, or that does not exist, is the same `not_found`.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "A person id; a merged person's old id resolves to the person it was merged into."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonSummaryDetail"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "malformed_request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "unauthenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "forbidden, credential_mismatch",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "invalid_value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "internal_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "slice_capacity, temporarily_unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          }
+        },
+        "x-error-codes": {
+          "400": [
+            "malformed_request"
+          ],
+          "401": [
+            "unauthenticated"
+          ],
+          "403": [
+            "forbidden",
+            "credential_mismatch"
+          ],
+          "404": [
+            "not_found"
+          ],
+          "422": [
+            "invalid_value"
+          ],
+          "500": [
+            "internal_error"
+          ],
+          "503": [
+            "slice_capacity",
+            "temporarily_unavailable"
+          ]
+        }
+      }
+    },
+    "/people/{id}/field-audiences": {
+      "get": {
+        "operationId": "listPersonFieldAudiences",
+        "summary": "List who can see each field of a person",
+        "description": "Authenticated like every other protected read. Online-only and identity-bound: not part of `/sync`, not cacheable (`Cache-Control: private, no-store`), never an access grant. Read in one database snapshot. A `403` arises only from credential transport (`forbidden`/`credential_mismatch`), never from the person's sharing policy: unlike `GET /policies/{id}`, there is no owner-only branch, so a client must not probe `GET /policies/{id}` for non-owned rows. One page, in ascending id order, of the person's fields that the reader can see, each with its audience under the same disclosure rules (complete for the field's owner, otherwise partial). A field the reader cannot see is never listed or counted. The person itself must be visible, otherwise `not_found`.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "A person id; a merged person's old id resolves to the person it was merged into."
+          },
+          {
+            "in": "query",
+            "name": "archived",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            },
+            "description": "`true` lists only archived rows (including merged people), `false` only active ones."
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "The `next_after` of the previous page."
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FieldAudiencePage"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "malformed_request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "unauthenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "forbidden, credential_mismatch",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "invalid_value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "internal_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "slice_capacity, temporarily_unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          }
+        },
+        "x-error-codes": {
+          "400": [
+            "malformed_request"
+          ],
+          "401": [
+            "unauthenticated"
+          ],
+          "403": [
+            "forbidden",
+            "credential_mismatch"
+          ],
+          "404": [
+            "not_found"
+          ],
+          "422": [
+            "invalid_value"
+          ],
+          "500": [
+            "internal_error"
+          ],
+          "503": [
+            "slice_capacity",
+            "temporarily_unavailable"
+          ]
+        }
+      }
     }
   },
   "components": {
@@ -22906,6 +23538,648 @@
             "name": "Kieran's phone"
           }
         ]
+      },
+      "SummaryPersonRef": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300
+          }
+        },
+        "required": [
+          "id",
+          "label"
+        ],
+        "additionalProperties": false
+      },
+      "SummaryOwner": {
+        "type": "object",
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "username": {
+            "type": "string"
+          },
+          "you": {
+            "type": "boolean"
+          },
+          "person": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SummaryPersonRef"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The owner's own linked person, only when the reader can see it; otherwise null. Display name fallback is `username`."
+          }
+        },
+        "required": [
+          "account_id",
+          "username",
+          "you",
+          "person"
+        ],
+        "additionalProperties": false,
+        "description": "The current owner. Ownership is the sharer and is disclosed to every reader; it can differ from who added the person (see `added_by_you`)."
+      },
+      "HouseholdAudience": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "can_edit": {
+            "type": "boolean"
+          },
+          "you_are_member": {
+            "type": "boolean"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 300
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "member_count": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "can_edit",
+          "you_are_member",
+          "name",
+          "version",
+          "member_count"
+        ],
+        "additionalProperties": false,
+        "description": "A household the resource is shared with. `name`, `version` and `member_count` are present only for a household the reader belongs to (as in `GET /households`) and null otherwise. `member_count` is the household's size, not the number of members who can see the resource. A non-owner only ever receives households they belong to."
+      },
+      "SummaryDirectGrant": {
+        "type": "object",
+        "properties": {
+          "can_edit": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "can_edit"
+        ],
+        "additionalProperties": false
+      },
+      "AudienceSummary": {
+        "type": "object",
+        "properties": {
+          "disclosure": {
+            "enum": [
+              "complete",
+              "partial"
+            ],
+            "description": "`complete` only for the owner. Every other reader always receives `partial`, whether or not the owner has shared the resource with anyone else: the owner may have shared it more widely, and this response neither confirms nor denies any other access. A partial summary carries no existence flag, hidden identity or hidden count."
+          },
+          "in_home": {
+            "type": "boolean",
+            "description": "Shared with the reader's primary household (and the reader still belongs to it)."
+          },
+          "households": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HouseholdAudience"
+            },
+            "maxItems": 100
+          },
+          "your_direct_grant": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SummaryDirectGrant"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The reader's own direct grant; always null for the owner."
+          },
+          "direct_grant_count": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Owner only; null when `partial`."
+          },
+          "excluded_count": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Owner only; null when `partial`."
+          }
+        },
+        "required": [
+          "disclosure",
+          "in_home",
+          "households",
+          "your_direct_grant",
+          "direct_grant_count",
+          "excluded_count"
+        ],
+        "additionalProperties": false,
+        "description": "Who can see a person or field, as far as the reader is authorised to know."
+      },
+      "PersonSummary": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "policy_version": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "As on the projection. Compare `version` and `policy_version` with the synced projection to detect a stale summary."
+          },
+          "archived": {
+            "type": "boolean"
+          },
+          "linkage": {
+            "enum": [
+              "you",
+              "other",
+              "none"
+            ],
+            "description": "`you`: linked to the reader's account; `other`: linked to another account (that account controls the name); `none`: not linked."
+          },
+          "linked_account_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "owner": {
+            "$ref": "#/components/schemas/SummaryOwner"
+          },
+          "added_by_you": {
+            "enum": [
+              "yes",
+              "no",
+              "unknown"
+            ],
+            "description": "Whether the reader originally added this person, kept separately from ownership (account linkage can move ownership). `no` never names who did. `unknown`: no attribution is recorded, which is every person created before API 0.29.0 (schema 1006) because no older record proves its creator; make no attribution claim. Grants no access."
+          },
+          "your_access": {
+            "enum": [
+              "owner",
+              "edit",
+              "view"
+            ],
+            "description": "The reader's own access: `owner`, else `edit` or `view` exactly as `can_edit` on the projection. A person linked to another account is `view` for everyone except that account."
+          },
+          "field_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Non-archived fields of this person the reader can see. Never counts a field the reader cannot see."
+          },
+          "audience": {
+            "$ref": "#/components/schemas/AudienceSummary"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "version",
+          "policy_version",
+          "archived",
+          "linkage",
+          "linked_account_id",
+          "owner",
+          "added_by_you",
+          "your_access",
+          "field_count",
+          "audience"
+        ],
+        "additionalProperties": false,
+        "description": "A visible person as the reader may see it, for the People list."
+      },
+      "PeopleHome": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "member_count": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "version",
+          "member_count"
+        ],
+        "additionalProperties": false,
+        "description": "The reader's primary household."
+      },
+      "PersonSummaryPage": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PersonSummary"
+            },
+            "maxItems": 100
+          },
+          "next_after": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The last listed id when the page is full, otherwise null. A following page may be empty."
+          },
+          "home": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PeopleHome"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The reader's primary household, or null when none is configured (then `scope=in_home` is always empty)."
+          }
+        },
+        "required": [
+          "items",
+          "next_after",
+          "home"
+        ],
+        "additionalProperties": false
+      },
+      "SummaryAccountGrant": {
+        "type": "object",
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "username": {
+            "type": "string"
+          },
+          "can_edit": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "account_id",
+          "username",
+          "can_edit"
+        ],
+        "additionalProperties": false
+      },
+      "SummaryAccountRef": {
+        "type": "object",
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "username": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_id",
+          "username"
+        ],
+        "additionalProperties": false
+      },
+      "SharedMember": {
+        "type": "object",
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "username": {
+            "type": "string"
+          },
+          "excluded": {
+            "type": "boolean",
+            "description": "Excluded from this resource by its owner."
+          }
+        },
+        "required": [
+          "account_id",
+          "username",
+          "excluded"
+        ],
+        "additionalProperties": false
+      },
+      "SharedHousehold": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "can_edit": {
+            "type": "boolean"
+          },
+          "you_are_member": {
+            "type": "boolean"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 300
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "member_count": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "members": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/SharedMember"
+                },
+                "maxItems": 100
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Owner only, and only for a household the owner belongs to; otherwise null. Never expanded for a non-owner."
+          }
+        },
+        "required": [
+          "id",
+          "can_edit",
+          "you_are_member",
+          "name",
+          "version",
+          "member_count",
+          "members"
+        ],
+        "additionalProperties": false,
+        "description": "A household entry of the Shared with rail."
+      },
+      "SharedWith": {
+        "type": "object",
+        "properties": {
+          "disclosure": {
+            "enum": [
+              "complete",
+              "partial"
+            ],
+            "description": "`complete` only for the owner. Every other reader always receives `partial`, whether or not the owner has shared the resource with anyone else: the owner may have shared it more widely, and this response neither confirms nor denies any other access. A partial summary carries no existence flag, hidden identity or hidden count."
+          },
+          "owner": {
+            "$ref": "#/components/schemas/SummaryOwner"
+          },
+          "accounts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SummaryAccountGrant"
+            },
+            "maxItems": 200,
+            "description": "Owner: every direct grant. Anyone else: only their own direct grant, if any."
+          },
+          "households": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SharedHousehold"
+            },
+            "maxItems": 100
+          },
+          "excluded_accounts": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/SummaryAccountRef"
+                },
+                "maxItems": 200
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Owner only; null when `partial`."
+          }
+        },
+        "required": [
+          "disclosure",
+          "owner",
+          "accounts",
+          "households",
+          "excluded_accounts"
+        ],
+        "additionalProperties": false,
+        "description": "The detail Shared with rail."
+      },
+      "PersonSummaryDetail": {
+        "type": "object",
+        "properties": {
+          "summary": {
+            "$ref": "#/components/schemas/PersonSummary"
+          },
+          "shared_with": {
+            "$ref": "#/components/schemas/SharedWith"
+          }
+        },
+        "required": [
+          "summary",
+          "shared_with"
+        ],
+        "additionalProperties": false
+      },
+      "FieldAudience": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "policy_version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "archived": {
+            "type": "boolean"
+          },
+          "owner_is_you": {
+            "type": "boolean"
+          },
+          "your_access": {
+            "enum": [
+              "owner",
+              "edit",
+              "view"
+            ],
+            "description": "The reader's own access: `owner`, else `edit` or `view` exactly as `can_edit` on the projection. A person linked to another account is `view` for everyone except that account."
+          },
+          "audience": {
+            "$ref": "#/components/schemas/AudienceSummary"
+          }
+        },
+        "required": [
+          "id",
+          "version",
+          "policy_version",
+          "archived",
+          "owner_is_you",
+          "your_access",
+          "audience"
+        ],
+        "additionalProperties": false,
+        "description": "Who can see one field (Who can see it), under the same disclosure rules as a person."
+      },
+      "FieldAudiencePage": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FieldAudience"
+            },
+            "maxItems": 100
+          },
+          "next_after": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_after"
+        ],
+        "additionalProperties": false
       }
     }
   }

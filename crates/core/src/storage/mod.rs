@@ -3,7 +3,7 @@ use anyhow::{Result, anyhow, ensure};
 use sqlx::{Acquire, Any, Connection, Transaction, any::AnyPoolOptions};
 
 /// Version recorded by a freshly initialised database; the last step of `UPGRADES`.
-const SCHEMA_VERSION: i64 = 1005;
+const SCHEMA_VERSION: i64 = 1006;
 
 /// One additive, in-place step. Steps run inside `migrate()`'s serialising transaction, in
 /// order, and each must move the recorded version forward by exactly its `to`.
@@ -43,6 +43,12 @@ const UPGRADES: &[Upgrade] = &[
         to: 1005,
         sqlite: include_str!("schema/upgrade_1005_sqlite.sql"),
         postgres: include_str!("schema/upgrade_1005_postgres.sql"),
+    },
+    Upgrade {
+        from: 1005,
+        to: 1006,
+        sqlite: include_str!("schema/upgrade_1006_sqlite.sql"),
+        postgres: include_str!("schema/upgrade_1006_postgres.sql"),
     },
 ];
 

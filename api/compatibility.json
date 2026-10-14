@@ -1,6 +1,6 @@
 {
-  "api_version": "0.28.0",
-  "contract_sha256": "087ced05e7a731d99b6374bbe0572e40746cec88dad0ce350c7bfe52fbf153fc",
+  "api_version": "0.29.0",
+  "contract_sha256": "0a5b5ebccd2dc9a93cc32a889bafe3fc9f82286c840e4ca161913032c5a70803",
   "behaviour": {
     "activation": {
       "activate": {
@@ -785,6 +785,368 @@
           "pending"
         ],
         "status": 200
+      }
+    },
+    "people_summaries": {
+      "direct_grantee_shared_with_me": {
+        "body": {
+          "home": null,
+          "items": [
+            {
+              "added_by_you": "no",
+              "archived": false,
+              "audience": {
+                "direct_grant_count": null,
+                "disclosure": "partial",
+                "excluded_count": null,
+                "households": [],
+                "in_home": false,
+                "your_direct_grant": {
+                  "can_edit": false
+                }
+              },
+              "field_count": 0,
+              "id": "SHARED_PERSON",
+              "label": "Morgan",
+              "linkage": "none",
+              "linked_account_id": null,
+              "owner": {
+                "account_id": "ALICE",
+                "person": null,
+                "username": "device-alice",
+                "you": false
+              },
+              "policy_version": 1,
+              "version": 1,
+              "your_access": "view"
+            }
+          ],
+          "next_after": null
+        },
+        "cache_control": "private, no-store",
+        "status": 200
+      },
+      "limit_over": {
+        "body": {
+          "code": "invalid_value",
+          "details": [],
+          "message": "Check the request fields and values."
+        },
+        "cache_control": "private, no-store",
+        "status": 422
+      },
+      "member_detail": {
+        "body": {
+          "shared_with": {
+            "accounts": [],
+            "disclosure": "partial",
+            "excluded_accounts": null,
+            "households": [
+              {
+                "can_edit": false,
+                "id": "HOME",
+                "member_count": 2,
+                "members": null,
+                "name": "Home",
+                "version": 3,
+                "you_are_member": true
+              }
+            ],
+            "owner": {
+              "account_id": "ALICE",
+              "person": null,
+              "username": "device-alice",
+              "you": false
+            }
+          },
+          "summary": {
+            "added_by_you": "no",
+            "archived": false,
+            "audience": {
+              "direct_grant_count": null,
+              "disclosure": "partial",
+              "excluded_count": null,
+              "households": [
+                {
+                  "can_edit": false,
+                  "id": "HOME",
+                  "member_count": 2,
+                  "name": "Home",
+                  "version": 3,
+                  "you_are_member": true
+                }
+              ],
+              "in_home": true,
+              "your_direct_grant": null
+            },
+            "field_count": 0,
+            "id": "SHARED_PERSON",
+            "label": "Morgan",
+            "linkage": "none",
+            "linked_account_id": null,
+            "owner": {
+              "account_id": "ALICE",
+              "person": null,
+              "username": "device-alice",
+              "you": false
+            },
+            "policy_version": 1,
+            "version": 1,
+            "your_access": "view"
+          }
+        },
+        "cache_control": "private, no-store",
+        "status": 200
+      },
+      "member_field_audiences": {
+        "body": {
+          "items": [],
+          "next_after": null
+        },
+        "cache_control": "private, no-store",
+        "status": 200
+      },
+      "member_in_home": {
+        "body": {
+          "home": {
+            "id": "HOME",
+            "member_count": 2,
+            "name": "Home",
+            "version": 3
+          },
+          "items": [
+            {
+              "added_by_you": "no",
+              "archived": false,
+              "audience": {
+                "direct_grant_count": null,
+                "disclosure": "partial",
+                "excluded_count": null,
+                "households": [
+                  {
+                    "can_edit": false,
+                    "id": "HOME",
+                    "member_count": 2,
+                    "name": "Home",
+                    "version": 3,
+                    "you_are_member": true
+                  }
+                ],
+                "in_home": true,
+                "your_direct_grant": null
+              },
+              "field_count": 0,
+              "id": "SHARED_PERSON",
+              "label": "Morgan",
+              "linkage": "none",
+              "linked_account_id": null,
+              "owner": {
+                "account_id": "ALICE",
+                "person": null,
+                "username": "device-alice",
+                "you": false
+              },
+              "policy_version": 1,
+              "version": 1,
+              "your_access": "view"
+            }
+          ],
+          "next_after": null
+        },
+        "cache_control": "private, no-store",
+        "status": 200
+      },
+      "no_primary_household_in_home": {
+        "body": {
+          "home": null,
+          "items": [],
+          "next_after": null
+        },
+        "cache_control": "private, no-store",
+        "status": 200
+      },
+      "not_found": {
+        "body": {
+          "code": "not_found",
+          "details": [],
+          "message": "The resource is not available."
+        },
+        "cache_control": "private, no-store",
+        "status": 404
+      },
+      "owner_detail": {
+        "body": {
+          "shared_with": {
+            "accounts": [
+              {
+                "account_id": "CAROL",
+                "can_edit": false,
+                "username": "summary-carol"
+              }
+            ],
+            "disclosure": "complete",
+            "excluded_accounts": [],
+            "households": [
+              {
+                "can_edit": false,
+                "id": "HOME",
+                "member_count": 2,
+                "members": [
+                  {
+                    "account_id": "ALICE",
+                    "excluded": false,
+                    "username": "device-alice"
+                  },
+                  {
+                    "account_id": "BOB",
+                    "excluded": false,
+                    "username": "device-bob"
+                  }
+                ],
+                "name": "Home",
+                "version": 3,
+                "you_are_member": true
+              }
+            ],
+            "owner": {
+              "account_id": "ALICE",
+              "person": null,
+              "username": "device-alice",
+              "you": true
+            }
+          },
+          "summary": {
+            "added_by_you": "yes",
+            "archived": false,
+            "audience": {
+              "direct_grant_count": 1,
+              "disclosure": "complete",
+              "excluded_count": 0,
+              "households": [
+                {
+                  "can_edit": false,
+                  "id": "HOME",
+                  "member_count": 2,
+                  "name": "Home",
+                  "version": 3,
+                  "you_are_member": true
+                }
+              ],
+              "in_home": true,
+              "your_direct_grant": null
+            },
+            "field_count": 0,
+            "id": "SHARED_PERSON",
+            "label": "Morgan",
+            "linkage": "none",
+            "linked_account_id": null,
+            "owner": {
+              "account_id": "ALICE",
+              "person": null,
+              "username": "device-alice",
+              "you": true
+            },
+            "policy_version": 1,
+            "version": 1,
+            "your_access": "owner"
+          }
+        },
+        "cache_control": "private, no-store",
+        "status": 200
+      },
+      "owner_list": {
+        "body": {
+          "home": {
+            "id": "HOME",
+            "member_count": 2,
+            "name": "Home",
+            "version": 3
+          },
+          "items": [
+            {
+              "added_by_you": "yes",
+              "archived": false,
+              "audience": {
+                "direct_grant_count": 1,
+                "disclosure": "complete",
+                "excluded_count": 0,
+                "households": [
+                  {
+                    "can_edit": false,
+                    "id": "HOME",
+                    "member_count": 2,
+                    "name": "Home",
+                    "version": 3,
+                    "you_are_member": true
+                  }
+                ],
+                "in_home": true,
+                "your_direct_grant": null
+              },
+              "field_count": 0,
+              "id": "SHARED_PERSON",
+              "label": "Morgan",
+              "linkage": "none",
+              "linked_account_id": null,
+              "owner": {
+                "account_id": "ALICE",
+                "person": null,
+                "username": "device-alice",
+                "you": true
+              },
+              "policy_version": 1,
+              "version": 1,
+              "your_access": "owner"
+            },
+            {
+              "added_by_you": "yes",
+              "archived": false,
+              "audience": {
+                "direct_grant_count": 0,
+                "disclosure": "complete",
+                "excluded_count": 0,
+                "households": [],
+                "in_home": false,
+                "your_direct_grant": null
+              },
+              "field_count": 0,
+              "id": "PRIVATE_PERSON",
+              "label": "Private",
+              "linkage": "none",
+              "linked_account_id": null,
+              "owner": {
+                "account_id": "ALICE",
+                "person": null,
+                "username": "device-alice",
+                "you": true
+              },
+              "policy_version": 1,
+              "version": 1,
+              "your_access": "owner"
+            }
+          ],
+          "next_after": null
+        },
+        "cache_control": "private, no-store",
+        "status": 200
+      },
+      "unauthenticated": {
+        "body": {
+          "code": "unauthenticated",
+          "details": [],
+          "message": "A valid session is required."
+        },
+        "cache_control": "private, no-store",
+        "status": 401
+      },
+      "unknown_scope": {
+        "body": {
+          "code": "malformed_request",
+          "details": [],
+          "message": "Check the request fields and values."
+        },
+        "cache_control": "private, no-store",
+        "status": 400
       }
     },
     "ready": {

@@ -259,6 +259,15 @@ impl Store {
                         .bind(account_id)
                         .execute(&mut *tx)
                         .await?;
+                    // The referenced account owns the new person, but the referencing account
+                    // created it. Referencing an existing identity records nothing.
+                    sqlx::query(
+                        "INSERT INTO person_attributions(person_id,added_by) VALUES ($1,$2)",
+                    )
+                    .bind(&person_id)
+                    .bind(actor)
+                    .execute(&mut *tx)
+                    .await?;
                 }
                 ensure!(sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM resource_exclusions WHERE resource_id=$1 AND account_id=$2").bind(&person_id).bind(actor).fetch_one(&mut *tx).await?==0, ErrorCode::NotFound);
                 if Self::subset(&mut tx, actor, &BTreeSet::from([person_id.clone()]))

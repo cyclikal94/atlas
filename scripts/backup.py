@@ -17,7 +17,7 @@ FORMAT = 1
 # is a previous baseline, which is what a "back up before upgrading" bundle contains; the server
 # upgrades it in place when restore prepares it. `storage/mod.rs` has a test that fails when this
 # range stops matching the server's `UPGRADES` chain and `SCHEMA_VERSION`, so keep the tuple on one line.
-SUPPORTED_SCHEMAS = (1000, 1001, 1002, 1003, 1004, 1005)
+SUPPORTED_SCHEMAS = (1000, 1001, 1002, 1003, 1004, 1005, 1006)
 
 
 def run(command, env=None):
