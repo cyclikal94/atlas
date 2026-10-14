@@ -1,6 +1,6 @@
 {
   "api_version": "0.29.0",
-  "contract_sha256": "8501e7b0001731b34fc477bc6feff5e9d6189205b41794d1691d44ed7804d46a",
+  "contract_sha256": "369ca0de5ab0cd5983252b55d4a546263819c236fa285a386b0dd374bf82b6e0",
   "behaviour": {
     "activation": {
       "activate": {

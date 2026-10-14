@@ -149,7 +149,8 @@ schemas: `PersonSummaryPage`, `PersonSummary`, `SummaryOwner`, `SummaryPersonRef
 summary that discloses nothing about access the reader does not hold. `added_by_you`
 covers every person merged into a person, so linking into an existing profile keeps it. A
 field's `audience` is its own sharing and its `effective` access is complete only for a
-reader who owns the field and its person. Every response carries `home` and the reader's
+reader who owns the field and its person and belongs to every household either is shared
+with; otherwise it is `partial` without counts. Every response carries `home` and the reader's
 `preferences_version`, and the descriptions state the online freshness and response
 ordering rules. It needs database schema `1006`, which
 adds the original-creator record behind `added_by_you`; people created earlier read

@@ -14,8 +14,10 @@ use atlas_server::{hash_password, now};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 
-use crate::support::http::{command_request, request};
-use crate::support::retirement::{PASSWORD, Reply, World, bearer, id, login, world};
+use crate::support::http::{command_request, request, session_request};
+use crate::support::retirement::{
+    ORIGIN, PASSWORD, Reply, World, attempt, bearer, id, login, world,
+};
 
 fn contract() -> Value {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../api/openapi.json");
@@ -725,5 +727,204 @@ async fn a_primary_household_change_on_another_device_is_visible_in_every_summar
         fields.2["items"][0]["effective"],
         json!({"disclosure": "partial", "account_count": null, "limited_count": null})
     );
+    Ok(())
+}
+
+/// Revision 2, R4: owning a person and its field does not authorise reading the membership of a
+/// household they are shared with once the owner has left it. Through the real router, while bob
+/// is a member a native registration into Home changes his exact count (positive control); after
+/// alice removes him his effective access is `partial`, and native and browser registrations into
+/// Home change none of his responses. Registration is the onboarding membership writer.
+#[tokio::test]
+async fn a_removed_owner_learns_nothing_from_registrations_into_its_old_household() -> Result<()> {
+    let w = world(true).await?;
+    let alice = w.alice.clone();
+    let bob: String = sqlx::query_scalar("SELECT id FROM accounts WHERE username='device-bob'")
+        .fetch_one(&w.store.pool)
+        .await?;
+    let (home, invitation, person, field) = (id(), id(), id(), id());
+    w.store
+        .management(
+            &alice,
+            &id(),
+            &[M::CreateHousehold {
+                id: home.clone(),
+                name: "Atlas Home".into(),
+            }],
+            now(),
+        )
+        .await?;
+    w.store
+        .management(
+            &alice,
+            &id(),
+            &[M::InviteToHousehold {
+                id: invitation.clone(),
+                household_id: home.clone(),
+                recipient_id: bob.clone(),
+                expected_version: 1,
+            }],
+            now(),
+        )
+        .await?;
+    w.store
+        .management(
+            &bob,
+            &id(),
+            &[M::RespondToHouseholdInvitation {
+                id: invitation,
+                expected_version: 1,
+                accept: true,
+            }],
+            now(),
+        )
+        .await?;
+    let household = Policy {
+        grants: vec![PrincipalGrant::Household {
+            id: home.clone(),
+            edit: false,
+        }],
+        exclude_accounts: vec![],
+    };
+    w.store
+        .apply(
+            &bob,
+            &id(),
+            &[
+                Command::CreatePerson {
+                    id: person.clone(),
+                    name: "Mo".into(),
+                    initial_policy: Some(household.clone()),
+                },
+                Command::CreateField {
+                    id: field.clone(),
+                    person_id: person.clone(),
+                    label: "Birthday".into(),
+                    value: "1 May".into(),
+                    initial_policy: Some(household),
+                },
+            ],
+        )
+        .await?;
+    let alice_token = login(&w.app, "device-alice", "phone").await;
+    let bob_token = login(&w.app, "device-bob", "laptop").await;
+    let audiences = format!("people/{person}/field-audiences");
+    let read = |path: String| {
+        let (app, auth) = (w.app.clone(), bearer(&bob_token));
+        async move {
+            let reply = request(&app, "GET", &path, &[("authorization", &auth)], Value::Null).await;
+            assert_eq!(reply.0, StatusCode::OK, "{}", reply.2);
+            reply.2
+        }
+    };
+    let members = || {
+        let (app, auth, home) = (w.app.clone(), bearer(&alice_token), home.clone());
+        async move {
+            let reply = request(
+                &app,
+                "GET",
+                "households",
+                &[("authorization", &auth)],
+                Value::Null,
+            )
+            .await;
+            let home = reply
+                .2
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|h| h["id"] == home)
+                .unwrap()
+                .clone();
+            (
+                home["members"].as_array().unwrap().len(),
+                home["version"].as_i64().unwrap(),
+            )
+        }
+    };
+    let invite = || {
+        let (app, token, home) = (w.app.clone(), alice_token.clone(), home.clone());
+        async move {
+            let (status, body) = session_request(
+                &app,
+                "POST",
+                "account-invitations",
+                Some(&token),
+                json!({"household_id": home}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            body["token"].as_str().unwrap().to_owned()
+        }
+    };
+    let register = |token: String, username: &'static str| {
+        let app = w.app.clone();
+        async move {
+            let (status, body) = session_request(
+                &app,
+                "POST",
+                "registration",
+                None,
+                json!({"token": token, "username": username, "password": "onboarding-password-123", "device_id": "phone"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+    };
+    let complete =
+        |seen: i64| json!({"disclosure": "complete", "account_count": seen, "limited_count": 0});
+    let body = read(audiences.clone()).await;
+    conforms("FieldAudiencePage", &body);
+    assert_eq!(body["items"][0]["effective"], complete(1));
+
+    // Positive control: bob is a member, so a registration into Home is his to see.
+    register(invite().await, "summary-erin").await;
+    assert_eq!(members().await.0, 3);
+    assert_eq!(
+        read(audiences.clone()).await["items"][0]["effective"],
+        complete(2)
+    );
+
+    let (_, version) = members().await;
+    let (status, removed) = command_request(
+        &w.app,
+        "management-commands",
+        Some(&alice_token),
+        Some(&id()),
+        Some(json!({"commands": [{"kind": "remove_household_member", "household_id": home, "account_id": bob, "expected_version": version}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
+    let before = read(audiences.clone()).await;
+    conforms("FieldAudiencePage", &before);
+    assert_eq!(
+        before["items"][0]["effective"],
+        json!({"disclosure": "partial", "account_count": null, "limited_count": null})
+    );
+    assert_eq!(before["items"][0]["audience"]["disclosure"], "complete");
+    assert_eq!(
+        before["items"][0]["audience"]["households"][0]["member_count"],
+        Value::Null
+    );
+    let rail = read(format!("people/{person}/summary")).await;
+
+    // Native registration into Home after bob's removal.
+    register(invite().await, "summary-frank").await;
+    assert_eq!(members().await.0, 3);
+    assert_eq!(read(audiences.clone()).await, before);
+    // Browser registration into Home: the same onboarding writer through its other entry point.
+    let (_verifier, challenge) = attempt();
+    let reply = request(
+        &w.app,
+        "POST",
+        "browser-registration",
+        &[("origin", ORIGIN)],
+        json!({"token": invite().await, "username": "summary-grace", "password": "onboarding-password-123", "device_id": "phone", "attempt_challenge": challenge}),
+    )
+    .await;
+    assert_eq!(reply.0, StatusCode::OK, "{}", reply.2);
+    assert_eq!(members().await.0, 4);
+    assert_eq!(read(audiences.clone()).await, before);
+    assert_eq!(read(format!("people/{person}/summary")).await, rail);
     Ok(())
 }

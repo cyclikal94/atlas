@@ -214,9 +214,11 @@ pub struct PersonSummaryDetail {
 /// so the field's own sharing (`FieldAudience::audience`) is an upper bound, not the audience.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct EffectiveAccess {
-    /// `complete` only when the viewer owns both the field and its person, and so may already
-    /// read both policies. Otherwise `partial`: the person's sharing may narrow who sees the field
-    /// and this response neither confirms nor denies that it does.
+    /// `complete` only when the viewer may read every input: the viewer owns the field and its
+    /// person (both policies) and is a current member of every household either one is shared
+    /// with (their memberships). Otherwise `partial`, with both counts null: the person's sharing
+    /// or a household's membership may change who sees the field, and this response neither
+    /// confirms nor denies it. An owner who has left a household a grant still names is `partial`.
     pub disclosure: Disclosure,
     /// Complete only: other accounts that can see the field now.
     pub account_count: Option<i64>,
@@ -765,28 +767,17 @@ impl Store {
             .fetch_all(&mut *tx)
             .await?;
         let (home, preferences_version) = Self::people_context(&mut tx, actor).await?;
-        let owns_person =
-            sqlx::query_scalar::<_, String>("SELECT owner_id FROM resources WHERE id=$1")
-                .bind(&canonical)
-                .fetch_one(&mut *tx)
-                .await?
-                == actor;
         let mut items = Vec::with_capacity(ids.len());
         if !ids.is_empty() {
             let mut projected = projections(&mut tx, actor, &ids, "field").await?;
             let keys: Vec<&str> = ids.iter().map(String::as_str).collect();
             let mut raw = Self::raw_audiences(&mut tx, actor, &keys).await?;
-            // Effective access is computed only when the viewer owns the person too: then both
-            // policies are already the viewer's to read. Never for anyone else's person.
-            let both: Vec<&str> = if owns_person {
-                keys.iter()
-                    .copied()
-                    .filter(|id| raw.get(*id).is_some_and(|e| e.owner_id == actor))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let mut effective = Self::effective_counts(&mut tx, &both).await?;
+            // Exact effective access is computed only for fields whose every input the viewer may
+            // read; every other field is `partial` without counts.
+            let qualified = Self::effective_qualified(&mut tx, actor, &keys).await?;
+            hook!(self, "people_summary.between_qualify_and_count", &mut tx);
+            let qualified: Vec<&str> = qualified.iter().map(String::as_str).collect();
+            let mut effective = Self::effective_counts(&mut tx, &qualified).await?;
             for id in &ids {
                 let p = projected
                     .remove(id)
@@ -831,7 +822,25 @@ impl Store {
         })
     }
 
-    /// For each field in `ids` (each owned, with its person, by the viewer): how many accounts its
+    /// The fields in `ids` whose effective access the viewer may learn exactly: the viewer owns the
+    /// field and every ancestor (so may read each policy `policy::VISIBLE` consults) and is a
+    /// current member of every household granted to any of them (so may read the memberships it
+    /// expands). Owning a policy does not authorise reading a household the owner has left: the
+    /// result would reveal who joined or left it. The test is conservative: it does not look at
+    /// hidden members to decide whether a grant matters.
+    async fn effective_qualified(
+        tx: &mut Transaction<'_, Any>,
+        actor: &str,
+        ids: &[&str],
+    ) -> Result<Vec<String>> {
+        Ok(rows_in(tx, "SELECT r.id FROM resources r WHERE r.id IN ({ids}) AND r.owner_id=$1 AND NOT EXISTS(SELECT 1 FROM resource_ancestors a JOIN resources p ON p.id=a.ancestor_id WHERE a.resource_id=r.id AND p.owner_id<>$1) AND NOT EXISTS(SELECT 1 FROM resource_household_grants hg WHERE (hg.resource_id=r.id OR EXISTS(SELECT 1 FROM resource_ancestors ha WHERE ha.resource_id=r.id AND ha.ancestor_id=hg.resource_id)) AND NOT EXISTS(SELECT 1 FROM household_memberships hm WHERE hm.household_id=hg.household_id AND hm.account_id=$1)) ORDER BY r.id", Some(actor), ids)
+            .await?
+            .iter()
+            .map(|r| r.get(0))
+            .collect())
+    }
+
+    /// For each field in `ids` (each qualified by [`Self::effective_qualified`]): how many accounts its
     /// own sharing reaches that can see it now, and how many it reaches that cannot, because they
     /// cannot see the person. Owner and excluded accounts are not counted. Visibility is the
     /// production rule (`policy::VISIBLE`) evaluated for each such account, in one statement.

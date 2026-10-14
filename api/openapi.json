@@ -16946,7 +16946,7 @@
       "get": {
         "operationId": "listPersonFieldAudiences",
         "summary": "List who can see each field of a person",
-        "description": "Authenticated like every other protected read. Online-only and identity-bound: not part of `/sync`, not cacheable (`Cache-Control: private, no-store`), never an access grant. Read in one database snapshot. Freshness: the response reflects the server at its snapshot only. A client re-reads on every change to any synced person or field projection (not only the listed rows), after any command receipt, on reconnection or re-authentication, when `GET /households` versions or `preferences_version` change, and, while a summary is shown online, at least every 60 seconds and whenever the view becomes visible again: household and primary household changes made elsewhere publish nothing to this device. Apply only the response to the latest request for the same account, access epoch and query; never one superseded by an invalidation. A `403` arises only from credential transport (`forbidden`/`credential_mismatch`), never from the person's sharing policy: unlike `GET /policies/{id}`, there is no owner-only branch, so a client must not probe `GET /policies/{id}` for non-owned rows. One page, in ascending id order, of the person's fields that the reader can see, each with its own sharing under the same disclosure rules (complete for the field's owner, otherwise partial) and who can actually see it (`effective`: complete only for a reader who owns the field and its person). A field the reader cannot see is never listed or counted. The person itself must be visible, otherwise `not_found`.",
+        "description": "Authenticated like every other protected read. Online-only and identity-bound: not part of `/sync`, not cacheable (`Cache-Control: private, no-store`), never an access grant. Read in one database snapshot. Freshness: the response reflects the server at its snapshot only. A client re-reads on every change to any synced person or field projection (not only the listed rows), after any command receipt, on reconnection or re-authentication, when `GET /households` versions or `preferences_version` change, and, while a summary is shown online, at least every 60 seconds and whenever the view becomes visible again: household and primary household changes made elsewhere publish nothing to this device. Apply only the response to the latest request for the same account, access epoch and query; never one superseded by an invalidation. A `403` arises only from credential transport (`forbidden`/`credential_mismatch`), never from the person's sharing policy: unlike `GET /policies/{id}`, there is no owner-only branch, so a client must not probe `GET /policies/{id}` for non-owned rows. One page, in ascending id order, of the person's fields that the reader can see, each with its own sharing under the same disclosure rules (complete for the field's owner, otherwise partial) and who can actually see it (`effective`: complete only for a reader who owns the field and its person and belongs to every household either is shared with; otherwise `partial` without counts). A field the reader cannot see is never listed or counted. The person itself must be visible, otherwise `not_found`.",
         "parameters": [
           {
             "name": "id",
@@ -24236,7 +24236,7 @@
               "complete",
               "partial"
             ],
-            "description": "`complete` only when the reader owns both the field and its person, and so may already read both policies. Otherwise `partial`, always: a field is visible only to someone who can also see its person, the person's sharing may narrow who can see the field, and this response neither confirms nor denies that it does."
+            "description": "`complete` only when the reader owns both the field and its person (so may read both policies) and is a current member of every household the field or its person is shared with (so may read their membership). Otherwise `partial`, always. This includes a reader who owns both but has left a household a retained grant still names: ownership of a policy does not authorise reading the membership of a household the reader is not in, and counts derived from it would reveal who joined or left. It also includes a field on another owner's person, whose sharing may narrow who can see the field. A `partial` response neither confirms nor denies any of this. It is conservative: it does not depend on whether an unreadable household currently affects the answer."
           },
           "account_count": {
             "anyOf": [
@@ -24248,7 +24248,7 @@
                 "type": "null"
               }
             ],
-            "description": "Complete only: other accounts that can see the field now. Null when `partial`."
+            "description": "Complete only: other accounts that can see the field now. Null when `partial`; never a lower bound."
           },
           "limited_count": {
             "anyOf": [
@@ -24269,7 +24269,7 @@
           "limited_count"
         ],
         "additionalProperties": false,
-        "description": "Who can actually see a field, as opposed to its own sharing configuration (`audience`)."
+        "description": "Who can actually see a field, as opposed to its own sharing configuration (`audience`). Exact counts need every input to that answer: both policies and the current membership of every household either one is shared with. When any input is unavailable to the reader the result is `partial` with both counts null, and nothing the reader cannot read changes it."
       }
     }
   }

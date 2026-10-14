@@ -12,14 +12,15 @@
 //! and without attribution, some added by the viewer), which the `shared_with_me` filter and
 //! `added_by_you` now read, and one viewer-owned person with 99 fields shared with Home, whose
 //! `person_field_audiences` page computes effective access for every Home member (9,900
-//! resources in all). Rows are written by raw SQL in one transaction; the reads under test are the
+//! resources in all). Revision 2 checks that page is fully qualified (complete for its owner, a
+//! Home member), so it times the counting path rather than the `partial` one. Rows are written by raw SQL in one transaction; the reads under test are the
 //! real ones. Uses a disposable SQLite file, or a fresh schema in the disposable PostgreSQL
 //! database named by ATLAS_TEST_POSTGRES_URL; it never touches an existing schema.
 //! `ATLAS_LOAD_ITERATIONS` (default 30) sets the timed first-page reads per filter and size.
 use anyhow::{Result, ensure};
 use atlas_core::{
     Store,
-    people::{PeopleScope, summary_id_query},
+    people::{Disclosure, PeopleScope, summary_id_query},
 };
 use serde_json::json;
 use std::time::Instant;
@@ -473,6 +474,14 @@ async fn main() -> Result<()> {
     ensure!(
         page.items.len() == WIDE_FIELDS,
         "the wide person lists every field"
+    );
+    // Revision 2: the owner is a member of Home, so every field qualifies and the page measures
+    // the full count, not the cheaper `partial` path.
+    ensure!(
+        page.items
+            .iter()
+            .all(|f| f.effective.disclosure == Disclosure::Complete),
+        "every field of the wide person is complete for its owner"
     );
     let limited: i64 = page
         .items

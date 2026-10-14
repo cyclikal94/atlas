@@ -18,14 +18,28 @@ def _manage(call, token, command, expected=200):
 def _household(call, tokens, name, member, member_id):
     household = str(uuid.uuid4())
     _manage(call, tokens['alice'], {'kind': 'create_household', 'id': household, 'name': name})
-    version = next(h for h in call('GET', V1 + '/households', tokens['alice'])
-                   if h['id'] == household)['version']
+    _join(call, tokens, household, member, member_id)
+    return household
+
+
+def _version(call, tokens, household):
+    return next(h for h in call('GET', V1 + '/households', tokens['alice'])
+                if h['id'] == household)['version']
+
+
+def _join(call, tokens, household, member, member_id):
+    """Alice (the manager) invites `member` and `member` accepts."""
     invitation = str(uuid.uuid4())
     _manage(call, tokens['alice'], {'kind': 'invite_to_household', 'id': invitation,
-            'household_id': household, 'recipient_id': member_id, 'expected_version': version})
+            'household_id': household, 'recipient_id': member_id,
+            'expected_version': _version(call, tokens, household)})
     _manage(call, tokens[member], {'kind': 'respond_to_household_invitation', 'id': invitation,
             'expected_version': 1, 'accept': True})
-    return household
+
+
+def _remove(call, tokens, household, member_id):
+    _manage(call, tokens['alice'], {'kind': 'remove_household_member', 'household_id': household,
+            'account_id': member_id, 'expected_version': _version(call, tokens, household)})
 
 
 def _set_primary(call, token, household):
@@ -215,6 +229,32 @@ def run(call, accounts, tokens):
     replace(wide, wide_grants)
     assert effective(alice) == complete(1, 0)
 
+    # Revision 2, R4: bob owns a person and its field shared with Fourth. While he is a member,
+    # carol joining changes his exact count; once alice removes him, his effective access is
+    # partial and carol joining or leaving Fourth changes none of his responses.
+    fourth = _household(call, tokens, 'Summary Fourth', 'bob', accounts['bob'])
+    in_fourth = {'kind': 'household', 'id': fourth, 'edit': False}
+    kept = _person(call, bob, 'Summary Kept', [in_fourth])
+    _field(call, bob, kept, [in_fourth])
+    kept_fields = f'{V1}/people/{kept}/field-audiences'
+    assert call('GET', kept_fields, bob)['items'][0]['effective'] == complete(1, 0)
+    _join(call, tokens, fourth, 'carol', accounts['carol'])
+    assert call('GET', kept_fields, bob)['items'][0]['effective'] == complete(2, 0)
+    _remove(call, tokens, fourth, accounts['carol'])
+    _remove(call, tokens, fourth, accounts['bob'])
+    removed = call('GET', kept_fields, bob)
+    item = removed['items'][0]
+    assert item['effective'] == {'disclosure': 'partial', 'account_count': None, 'limited_count': None}, item
+    assert item['audience']['disclosure'] == 'complete'
+    assert item['audience']['households'][0]['name'] is None
+    _join(call, tokens, fourth, 'carol', accounts['carol'])
+    assert call('GET', kept_fields, carol)['items'][0]['id'] == item['id']
+    assert call('GET', kept_fields, bob) == removed
+    _remove(call, tokens, fourth, accounts['carol'])
+    call('GET', kept_fields, carol, expected=404)
+    assert call('GET', kept_fields, bob) == removed
+    examples['removed_owner_field_audience'] = item
+
     # Revision 1, R1: bob links a person he added to carol, who already has a profile (linked):
     # it merges into that profile, and bob is still known to have added it.
     # A private person is an ordinary (offline-capable) command, not an access command.
@@ -237,7 +277,8 @@ def run(call, accounts, tokens):
     assert _row(call, carol, linked)['added_by_you'] == 'no'
 
     names = {accounts['alice']: 'ALICE', accounts['bob']: 'BOB', accounts['carol']: 'CAROL',
-             home: 'HOME', away: 'AWAY', wide: 'WIDE_PERSON', linked: 'LINKED_PERSON'}
+             home: 'HOME', away: 'AWAY', wide: 'WIDE_PERSON', linked: 'LINKED_PERSON',
+             fourth: 'FOURTH', kept: 'KEPT_PERSON', item['id']: 'KEPT_FIELD'}
     for item in wide_view['fields']['items']:
         names[item['id']] = 'FIELD'
     return {'scenario': 'people-summaries', 'examples': _redact(examples, names)}

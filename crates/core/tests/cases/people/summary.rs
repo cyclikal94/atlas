@@ -2119,6 +2119,615 @@ async fn s22_a_delayed_response_carries_its_older_versions() -> Result<()> {
     Ok(())
 }
 
+// S23 -----------------------------------------------------------------------------------------
+// Revision 2, R4: owning a field and its person authorises reading both policies, not the current
+// membership of a household either is shared with. Exact effective access is returned only when
+// the viewer is also a current member of every such household; otherwise it is `partial`, and
+// changes to a household the viewer cannot read do not change the response at all.
+
+async fn remove(s: &Store, manager: &str, member: &str, household: &str) -> Result<()> {
+    let expected_version = household_version(s, manager, household).await?;
+    manage(
+        s,
+        manager,
+        M::RemoveHouseholdMember {
+            household_id: household.into(),
+            account_id: member.into(),
+            expected_version,
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// The whole field-audience page, as served.
+async fn audiences(s: &Store, viewer: &str, person: &str, archived: bool) -> Result<Value> {
+    Ok(serde_json::to_value(
+        s.person_field_audiences(viewer, person, archived, None, 100)
+            .await?,
+    )?)
+}
+
+const PARTIAL: (Disclosure, Option<i64>, Option<i64>) = (Disclosure::Partial, None, None);
+
+fn complete(seen: i64, limited: i64) -> (Disclosure, Option<i64>, Option<i64>) {
+    (Disclosure::Complete, Some(seen), Some(limited))
+}
+
+#[tokio::test]
+async fn s23_an_owner_outside_a_granted_household_learns_nothing_from_its_membership() -> Result<()>
+{
+    let (_dir, s) = fixture().await?;
+    let (a, b, c) = (account(&s).await?, account(&s).await?, account(&s).await?);
+    let home = household(&s, &a, "Home").await?;
+    join(&s, &a, &b, &home).await?;
+    // B, an ordinary member, owns a person and fields shared with Home; one field excludes C,
+    // who is not a member.
+    let p = create_person(&s, &b, "Robin", policy(vec![home_grant(&home, false)], &[])).await?;
+    let f = create_field(
+        &s,
+        &b,
+        &p,
+        Some(policy(vec![home_grant(&home, false)], &[])),
+    )
+    .await?;
+    let fx = create_field(
+        &s,
+        &b,
+        &p,
+        Some(policy(vec![home_grant(&home, false)], &[&c])),
+    )
+    .await?;
+    let fa = create_field(
+        &s,
+        &b,
+        &p,
+        Some(policy(vec![home_grant(&home, false)], &[])),
+    )
+    .await?;
+    archive(&s, &b, &fa, true).await?;
+    assert_eq!(
+        effective(&field_view(&s, &b, &p, &f).await?),
+        complete(1, 0)
+    );
+    assert_eq!(
+        effective(&field_view(&s, &b, &p, &fx).await?),
+        complete(1, 0)
+    );
+    // Positive control: while B is a member, C's joining and leaving is B's to know, and the two
+    // fields differ exactly by C's exclusion.
+    join(&s, &a, &c, &home).await?;
+    assert_eq!(
+        effective(&field_view(&s, &b, &p, &f).await?),
+        complete(2, 0)
+    );
+    assert_eq!(
+        effective(&field_view(&s, &b, &p, &fx).await?),
+        complete(1, 0)
+    );
+    leave(&s, &c, &home).await?;
+    assert_eq!(
+        effective(&field_view(&s, &b, &p, &f).await?),
+        complete(1, 0)
+    );
+
+    // A removes B. B still owns everything and its grants still name Home, but B can no longer
+    // read Home's membership.
+    remove(&s, &a, &b, &home).await?;
+    assert!(s.households(&b).await?.iter().all(|h| h.id != home));
+    for field in [&f, &fx] {
+        let v = field_view(&s, &b, &p, field).await?;
+        assert_eq!(
+            effective(&v),
+            PARTIAL,
+            "no exact count without Home's membership"
+        );
+        assert_eq!(
+            v.audience.disclosure,
+            Disclosure::Complete,
+            "B's own sharing"
+        );
+        assert_eq!(
+            serde_json::to_value(&v.audience.households)?,
+            serde_json::json!([{"id": home, "can_edit": false, "you_are_member": false,
+                "name": null, "version": null, "member_count": null}])
+        );
+    }
+    let archived = s.person_field_audiences(&b, &p, true, None, 100).await?;
+    assert_eq!(archived.items.len(), 1);
+    assert_eq!(effective(&archived.items[0]), PARTIAL);
+    let listed = audiences(&s, &b, &p, false).await?;
+    let listed_archived = audiences(&s, &b, &p, true).await?;
+
+    // C joins: C can read the shared field (not the one excluding C); B's responses do not move.
+    join(&s, &a, &c, &home).await?;
+    assert_eq!(field_view(&s, &c, &p, &f).await?.id, f);
+    assert!(
+        s.person_field_audiences(&c, &p, false, None, 100)
+            .await?
+            .items
+            .iter()
+            .all(|x| x.id != fx)
+    );
+    assert_eq!(audiences(&s, &b, &p, false).await?, listed);
+    assert_eq!(audiences(&s, &b, &p, true).await?, listed_archived);
+    // C leaves: C loses the person; B's responses still do not move.
+    leave(&s, &c, &home).await?;
+    assert_eq!(
+        code(
+            s.person_field_audiences(&c, &p, false, None, 100)
+                .await
+                .unwrap_err()
+        ),
+        "not_found"
+    );
+    assert_eq!(audiences(&s, &b, &p, false).await?, listed);
+    assert_eq!(audiences(&s, &b, &p, true).await?, listed_archived);
+
+    // Rejoining restores exact counts under the fresh membership.
+    join(&s, &a, &b, &home).await?;
+    assert_eq!(
+        effective(&field_view(&s, &b, &p, &f).await?),
+        complete(1, 0)
+    );
+    join(&s, &a, &c, &home).await?;
+    assert_eq!(
+        effective(&field_view(&s, &b, &p, &f).await?),
+        complete(2, 0)
+    );
+    assert_eq!(
+        effective(&field_view(&s, &b, &p, &fx).await?),
+        complete(1, 0)
+    );
+
+    // Leaving voluntarily is the same.
+    leave(&s, &b, &home).await?;
+    assert_eq!(effective(&field_view(&s, &b, &p, &f).await?), PARTIAL);
+    assert_eq!(effective(&field_view(&s, &b, &p, &fx).await?), PARTIAL);
+    let listed = audiences(&s, &b, &p, false).await?;
+    leave(&s, &c, &home).await?;
+    assert_eq!(audiences(&s, &b, &p, false).await?, listed);
+    join(&s, &a, &c, &home).await?;
+    assert_eq!(audiences(&s, &b, &p, false).await?, listed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn s24_every_household_on_the_field_or_its_person_must_be_readable() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (a, b, c, d) = (
+        account(&s).await?,
+        account(&s).await?,
+        account(&s).await?,
+        account(&s).await?,
+    );
+    let home = household(&s, &a, "Home").await?;
+    join(&s, &a, &b, &home).await?;
+    join(&s, &a, &c, &home).await?;
+    let own = household(&s, &b, "Own").await?;
+    join(&s, &b, &d, &own).await?;
+    let direct_to = |x: &str| account_grant(x, false);
+    // Parent-only: the person is shared with Home, the field only directly with C.
+    let p = create_person(
+        &s,
+        &b,
+        "Parent only",
+        policy(vec![home_grant(&home, false)], &[]),
+    )
+    .await?;
+    let pf = create_field(&s, &b, &p, Some(policy(vec![direct_to(&c)], &[]))).await?;
+    // Field-only: the person is shared directly with A and C, the field with Home.
+    let q = create_person(
+        &s,
+        &b,
+        "Field only",
+        policy(vec![direct_to(&a), direct_to(&c)], &[]),
+    )
+    .await?;
+    let qf = create_field(
+        &s,
+        &b,
+        &q,
+        Some(policy(vec![home_grant(&home, false)], &[])),
+    )
+    .await?;
+    // A readable and an unreadable household on the person, the field only on the readable one.
+    let r = create_person(
+        &s,
+        &b,
+        "Both",
+        policy(vec![home_grant(&own, false), home_grant(&home, false)], &[]),
+    )
+    .await?;
+    let rf = create_field(&s, &b, &r, Some(policy(vec![home_grant(&own, false)], &[]))).await?;
+    // Different households: the person with Own (and A and C directly), the field with Home.
+    let t = create_person(
+        &s,
+        &b,
+        "Different",
+        policy(
+            vec![home_grant(&own, false), direct_to(&a), direct_to(&c)],
+            &[],
+        ),
+    )
+    .await?;
+    let tf = create_field(
+        &s,
+        &b,
+        &t,
+        Some(policy(vec![home_grant(&home, false)], &[])),
+    )
+    .await?;
+    // Control: only Own, which B stays in.
+    let u = create_person(
+        &s,
+        &b,
+        "Own only",
+        policy(vec![home_grant(&own, false)], &[]),
+    )
+    .await?;
+    let uf = create_field(&s, &b, &u, Some(policy(vec![home_grant(&own, false)], &[]))).await?;
+    let expected = [
+        (&p, &pf, complete(1, 0)),
+        (&q, &qf, complete(2, 0)),
+        (&r, &rf, complete(1, 0)),
+        (&t, &tf, complete(2, 0)),
+        (&u, &uf, complete(1, 0)),
+    ];
+    for (person, field, counts) in &expected {
+        assert_eq!(
+            effective(&field_view(&s, &b, person, field).await?),
+            *counts
+        );
+    }
+
+    remove(&s, &a, &b, &home).await?;
+    for (person, field, _) in &expected[..4] {
+        assert_eq!(
+            effective(&field_view(&s, &b, person, field).await?),
+            PARTIAL,
+            "Home is an input"
+        );
+    }
+    assert_eq!(
+        effective(&field_view(&s, &b, &u, &uf).await?),
+        complete(1, 0)
+    );
+    let mut listed = Vec::new();
+    for person in [&p, &q, &r, &t, &u] {
+        listed.push(audiences(&s, &b, person, false).await?);
+    }
+    // C leaves and rejoins Home: C's own access changes, B's responses do not.
+    leave(&s, &c, &home).await?;
+    assert_eq!(
+        code(
+            s.person_field_audiences(&c, &p, false, None, 100)
+                .await
+                .unwrap_err()
+        ),
+        "not_found"
+    );
+    assert!(
+        s.person_field_audiences(&c, &q, false, None, 100)
+            .await?
+            .items
+            .is_empty(),
+        "C still sees the person directly, but not the Home field"
+    );
+    for (person, before) in [&p, &q, &r, &t, &u].into_iter().zip(&listed) {
+        assert_eq!(&audiences(&s, &b, person, false).await?, before);
+    }
+    join(&s, &a, &c, &home).await?;
+    assert_eq!(field_view(&s, &c, &p, &pf).await?.id, pf);
+    for (person, before) in [&p, &q, &r, &t, &u].into_iter().zip(&listed) {
+        assert_eq!(&audiences(&s, &b, person, false).await?, before);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn s25_exact_counts_remain_where_every_input_is_readable() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (a, b, c, d) = (
+        account(&s).await?,
+        account(&s).await?,
+        account(&s).await?,
+        account(&s).await?,
+    );
+    let home = household(&s, &a, "Home").await?;
+    join(&s, &a, &b, &home).await?;
+    join(&s, &a, &c, &home).await?;
+    let second = household(&s, &a, "Second").await?;
+    join(&s, &a, &c, &second).await?;
+    let club = household(&s, &d, "Club").await?;
+    join(&s, &d, &a, &club).await?;
+    let person = policy(
+        vec![
+            home_grant(&home, false),
+            home_grant(&second, false),
+            account_grant(&d, false),
+        ],
+        &[],
+    );
+    let p = create_person(&s, &a, "Robin", person.clone()).await?;
+    // C is reached directly and through both households: counted once.
+    let f = create_field(
+        &s,
+        &a,
+        &p,
+        Some(policy(
+            vec![
+                account_grant(&c, false),
+                home_grant(&home, false),
+                home_grant(&second, false),
+            ],
+            &[],
+        )),
+    )
+    .await?;
+    assert_eq!(
+        effective(&field_view(&s, &a, &p, &f).await?),
+        complete(2, 0)
+    );
+    // A person exclusion limits; restoring it restores.
+    let mut narrowed = person.clone();
+    narrowed.exclude_accounts = vec![b.clone()];
+    replace_policy(&s, &a, &p, narrowed).await?;
+    assert_eq!(
+        effective(&field_view(&s, &a, &p, &f).await?),
+        complete(1, 1)
+    );
+    replace_policy(&s, &a, &p, person).await?;
+    assert_eq!(
+        effective(&field_view(&s, &a, &p, &f).await?),
+        complete(2, 0)
+    );
+    // One page mixing a complete field, a field on a household A has left, and B's field.
+    let x = create_field(
+        &s,
+        &a,
+        &p,
+        Some(policy(vec![home_grant(&club, false)], &[])),
+    )
+    .await?;
+    let theirs = create_field(
+        &s,
+        &b,
+        &p,
+        Some(policy(vec![home_grant(&home, false)], &[])),
+    )
+    .await?;
+    assert_eq!(
+        effective(&field_view(&s, &a, &p, &x).await?),
+        complete(1, 0)
+    );
+    remove(&s, &d, &a, &club).await?;
+    let page = s.person_field_audiences(&a, &p, false, None, 100).await?;
+    let by_id: BTreeMap<_, _> = page
+        .items
+        .iter()
+        .map(|i| (i.id.clone(), effective(i)))
+        .collect();
+    assert_eq!(
+        by_id[&f],
+        complete(2, 0),
+        "an unrelated field keeps its counts"
+    );
+    assert_eq!(by_id[&x], PARTIAL);
+    assert_eq!(by_id[&theirs], PARTIAL);
+    // The same page read one row at a time agrees.
+    let mut after = None;
+    let mut seen = BTreeMap::new();
+    loop {
+        let one = s
+            .person_field_audiences(&a, &p, false, after.as_deref(), 1)
+            .await?;
+        for i in &one.items {
+            seen.insert(i.id.clone(), effective(i));
+        }
+        match one.next_after {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(seen, by_id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn s26_typed_fields_and_merged_fields_are_qualified_where_they_now_are() -> Result<()> {
+    use atlas_core::tasks::FieldValue;
+    let (_dir, s) = fixture().await?;
+    let (a, b) = (account(&s).await?, account(&s).await?);
+    let home = household(&s, &a, "Home").await?;
+    join(&s, &a, &b, &home).await?;
+    let target = create_person(
+        &s,
+        &b,
+        "Target",
+        policy(vec![account_grant(&a, false)], &[]),
+    )
+    .await?;
+    let source = create_person(
+        &s,
+        &b,
+        "Source",
+        policy(vec![home_grant(&home, false)], &[]),
+    )
+    .await?;
+    let typed = id();
+    s.task_command(
+        &b,
+        &id(),
+        &TaskCommand::PutField {
+            id: typed.clone(),
+            parent_id: source.clone(),
+            expected_version: None,
+            expected_policy_version: None,
+            label: "Birthday".into(),
+            value: FieldValue::Date {
+                year: None,
+                month: 9,
+                day: 20,
+            },
+            initial_policy: Some(policy(vec![home_grant(&home, false)], &[])),
+        },
+        None,
+        NOW,
+    )
+    .await?;
+    let moved = create_field(
+        &s,
+        &b,
+        &source,
+        Some(policy(vec![account_grant(&a, false)], &[])),
+    )
+    .await?;
+    assert_eq!(
+        effective(&field_view(&s, &b, &source, &typed).await?),
+        complete(1, 0)
+    );
+    assert_eq!(
+        effective(&field_view(&s, &b, &source, &moved).await?),
+        complete(1, 0)
+    );
+    remove(&s, &a, &b, &home).await?;
+    assert_eq!(
+        effective(&field_view(&s, &b, &source, &typed).await?),
+        PARTIAL
+    );
+    assert_eq!(
+        effective(&field_view(&s, &b, &source, &moved).await?),
+        PARTIAL,
+        "its person's Home grant is an input"
+    );
+    // Merging moves both fields under the target, whose policy the merge replaces with explicit
+    // grants; Home is no longer an input to either, so exact counts return.
+    merge(&s, &b, &source, &target, "Target").await?;
+    let page = s
+        .person_field_audiences(&b, &target, false, None, 100)
+        .await?;
+    let mut ids: Vec<&str> = page.items.iter().map(|i| i.id.as_str()).collect();
+    ids.sort_unstable();
+    let mut expected = vec![typed.as_str(), moved.as_str()];
+    expected.sort_unstable();
+    assert_eq!(ids, expected);
+    for item in &page.items {
+        assert_eq!(item.audience.households, Vec::new(), "{}", item.id);
+        assert_eq!(effective(item), complete(1, 0), "{}", item.id);
+    }
+    // The old id resolves to the same page.
+    assert_eq!(
+        audiences(&s, &b, &source, false).await?,
+        audiences(&s, &b, &target, false).await?
+    );
+    Ok(())
+}
+
+// S27 -----------------------------------------------------------------------------------------
+// Revision 2, R4: qualification and counts come from the response's one snapshot, in both orders.
+
+const QUALIFIED: &str = "people_summary.between_qualify_and_count";
+
+#[tokio::test]
+async fn s27_qualification_and_counts_are_read_from_one_snapshot() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (a, b, c) = (account(&s).await?, account(&s).await?, account(&s).await?);
+    let home = household(&s, &a, "Home").await?;
+    join(&s, &a, &b, &home).await?;
+    let p = create_person(&s, &b, "Robin", policy(vec![home_grant(&home, false)], &[])).await?;
+    let f = create_field(
+        &s,
+        &b,
+        &p,
+        Some(policy(vec![home_grant(&home, false)], &[])),
+    )
+    .await?;
+    let paused = |s: &Store, b: &str, p: &str| {
+        let (s, b, p) = (s.clone(), b.to_owned(), p.to_owned());
+        tokio::spawn(async move { s.person_field_audiences(&b, &p, false, None, 100).await })
+    };
+
+    // B is qualified when its read pauses; A then removes B and C joins.
+    let mut gate = s.hooks().arm(QUALIFIED);
+    let read = paused(&s, &b, &p);
+    gate.reached().await;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        remove(&s, &a, &b, &home).await?;
+        join(&s, &a, &c, &home).await
+    })
+    .await
+    .expect("the writers were blocked by the paused reader")?;
+    let fresh = field_view(&s, &b, &p, &f).await?;
+    gate.release();
+    let delayed = read.await??;
+    assert_eq!(
+        effective(&delayed.items[0]),
+        complete(1, 0),
+        "wholly the old snapshot: C is not counted"
+    );
+    assert_eq!(effective(&fresh), PARTIAL);
+
+    // The reverse: B is not qualified when its read pauses; B rejoins and C leaves.
+    let mut gate = s.hooks().arm(QUALIFIED);
+    let read = paused(&s, &b, &p);
+    gate.reached().await;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        join(&s, &a, &b, &home).await?;
+        leave(&s, &c, &home).await
+    })
+    .await
+    .expect("the writers were blocked by the paused reader")?;
+    let fresh = field_view(&s, &b, &p, &f).await?;
+    gate.release();
+    let delayed = read.await??;
+    assert_eq!(
+        effective(&delayed.items[0]),
+        PARTIAL,
+        "wholly the old snapshot"
+    );
+    assert_eq!(effective(&fresh), complete(1, 0));
+    if postgres() {
+        let seen = s.hooks().isolation_seen();
+        assert_eq!(seen.len() as u32, s.hooks().count(QUALIFIED));
+        assert!(
+            seen.iter().all(|level| level == "repeatable read"),
+            "{seen:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn s28_a_failure_between_qualification_and_counts_is_an_error_not_a_count() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let a = account(&s).await?;
+    let p = create_person(&s, &a, "Robin", Policy::default()).await?;
+    create_field(&s, &a, &p, Some(Policy::default())).await?;
+    // PostgreSQL: the injected statement succeeds and the counts statement that follows fails.
+    // SQLite: the injected statement itself fails.
+    let sql = if postgres() {
+        "SET LOCAL search_path TO pg_catalog"
+    } else {
+        "SELECT missing_column FROM resources"
+    };
+    s.hooks().inject_sql_times(QUALIFIED, sql, 1);
+    assert!(
+        s.person_field_audiences(&a, &p, false, None, 100)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        effective(
+            &s.person_field_audiences(&a, &p, false, None, 100)
+                .await?
+                .items[0]
+        ),
+        complete(0, 0)
+    );
+    Ok(())
+}
+
 // S17 -----------------------------------------------------------------------------------------
 
 /// One statement that creates a person row.

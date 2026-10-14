@@ -116,14 +116,23 @@ to another account is `view` for everyone but that account, even with an editabl
 see its person, so a field's own sharing is an upper bound on its audience, not the
 audience. `FieldAudience.audience` describes the field's own sharing under the rules above:
 for a field, `disclosure: "complete"` means only that the caller owns that configuration.
-`FieldAudience.effective` says who can actually see it. It is `complete` only when the
-caller owns both the field and its person, and so may already read both policies:
+`FieldAudience.effective` says who can actually see it. Exact counts need every input to
+that answer, so it is `complete` only when the caller owns both the field and its person
+(and so may read both policies) **and** is a current member of every household the field
+or its person is shared with (and so may read their membership, as in `GET /households`):
 `account_count` is the other accounts that can see the field now and `limited_count` the
 accounts its own sharing reaches (a direct grant or a member of a granted household, not
 excluded and not the owner) that cannot, because they cannot see the person. Otherwise it is
-`partial` with both counts `null`, always, including for the owner of a field on someone
-else's person: that person's audience belongs to its owner, and the response neither
-confirms nor denies that it narrows the field's.
+`partial` with both counts `null`, always. That includes the owner of a field on someone
+else's person (that person's audience belongs to its owner) and an owner of both who has
+left a household that a retained grant on either still names: owning a policy does not
+authorise reading the membership of a household the owner is not in, and a count derived
+from it would reveal who joined or left. Nothing the caller cannot read changes a `partial`
+response. The rule is conservative: it does not depend on whether the unreadable household
+currently affects the answer, so a field shared only directly can be `partial` because its
+person still names a household its owner has left. The owner still sees the field's own
+configuration (`audience`), with that household's `name`, `version` and `member_count`
+`null`, and can change it. Unknown, failed or offline is not `partial` and never "Only you".
 
 **Filters.** `scope` is evaluated in the database over the caller's whole visible set,
 then paginated, so following `next_after` to the end is complete at each read:
@@ -195,6 +204,22 @@ The owner of a field and its person, where one Home member cannot see the person
 <!-- experimental-schema: FieldAudience -->
 ```json
 {"id": "3c2b1a09-8f7e-4d6c-9b5a-4f3e2d1c0b9a", "version": 1, "policy_version": 1, "archived": false, "owner_is_you": true, "your_access": "owner", "audience": {"disclosure": "complete", "in_home": true, "households": [{"id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d", "can_edit": false, "you_are_member": true, "name": "Atlas Home", "version": 3, "member_count": 3}], "your_direct_grant": null, "direct_grant_count": 0, "excluded_count": 0}, "effective": {"disclosure": "complete", "account_count": 1, "limited_count": 1}}
+```
+
+The same owner after leaving Atlas Home, which the field's retained grant still names: its
+own configuration is complete, the household is redacted and effective access is `partial`:
+
+<!-- experimental-schema: FieldAudience -->
+```json
+{"id": "3c2b1a09-8f7e-4d6c-9b5a-4f3e2d1c0b9a", "version": 1, "policy_version": 1, "archived": false, "owner_is_you": true, "your_access": "owner", "audience": {"disclosure": "complete", "in_home": false, "households": [{"id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d", "can_edit": false, "you_are_member": false, "name": null, "version": null, "member_count": null}], "your_direct_grant": null, "direct_grant_count": 0, "excluded_count": 0}, "effective": {"disclosure": "partial", "account_count": null, "limited_count": null}}
+```
+
+A field shared directly with one account, on a person still shared with a household its
+owner has left (only the person depends on that household):
+
+<!-- experimental-schema: FieldAudience -->
+```json
+{"id": "5e4d3c2b-1a09-4f8e-9d7c-6b5a4f3e2d1c", "version": 1, "policy_version": 1, "archived": false, "owner_is_you": true, "your_access": "owner", "audience": {"disclosure": "complete", "in_home": false, "households": [], "your_direct_grant": null, "direct_grant_count": 1, "excluded_count": 0}, "effective": {"disclosure": "partial", "account_count": null, "limited_count": null}}
 ```
 
 ## Merge privacy and offline identities

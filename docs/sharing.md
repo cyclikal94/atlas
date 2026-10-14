@@ -268,7 +268,9 @@ person or field to any reader, use the viewer-safe summaries in
 [people](people.md#viewer-safe-summaries): complete for the owner, partial for everyone
 else, and never a `403` for a visible person. A field's own sharing is not who can see it
 (the person must be visible too); its `effective` access is complete only for the owner of
-both.
+both who is also a member of every household either is shared with. An owner who leaves a
+household keeps its grants but not its membership, so effective access becomes `partial`
+until the owner rejoins or changes the policy.
 
 Household membership is evaluated live. Joining reveals existing household-shared
 resources. Leaving removes that source of access while preserving independent direct
