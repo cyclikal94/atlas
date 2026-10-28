@@ -38,6 +38,7 @@ mod storage;
 mod sync;
 mod sync_cursor;
 pub mod tasks;
+pub use sync::{SYNC_LIMIT_DEFAULT, SYNC_LIMIT_MAX};
 use uuid::Uuid;
 
 #[derive(Clone)]

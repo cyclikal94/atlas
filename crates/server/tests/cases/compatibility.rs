@@ -730,6 +730,122 @@ async fn command_batch_probes() -> Result<Value> {
     Ok(Value::Object(results))
 }
 
+/// BE-B1: `/sync` page counts at the `limit` ceiling and default, and the rejected bounds. Records
+/// only status, code, batch count and `has_more`, never cursors, revisions or IDs.
+async fn sync_page_bounds_probes() -> Result<Value> {
+    use crate::support::http::request;
+    use atlas_core::Command;
+    use atlas_server::hash_password;
+
+    fn shape(reply: &(StatusCode, axum::http::HeaderMap, Value)) -> Value {
+        json!({
+            "status": reply.0.as_u16(),
+            "code": reply.2.get("code"),
+            "batches": reply.2.get("batches").and_then(Value::as_array).map(Vec::len),
+            "has_more": reply.2.get("has_more"),
+        })
+    }
+
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let store = Store::connect(&url).await?;
+    store.migrate().await?;
+    let actor = Uuid::new_v4().to_string();
+    store
+        .add_account(
+            &actor,
+            "sync-page-probe",
+            &hash_password("sync-page-probe-123".into()).await?,
+        )
+        .await?;
+    let app = App::new(store.clone()).await?.router();
+    let mut auth = Vec::new();
+    let mut cursors = Vec::new();
+    for device in ["ceiling", "default"] {
+        let login = request(
+            &app,
+            "POST",
+            "sessions",
+            &[],
+            json!({"username":"sync-page-probe","password":"sync-page-probe-123","device_id":device}),
+        )
+        .await;
+        assert_eq!(login.0, StatusCode::OK, "{}", login.2);
+        let bearer = format!("Bearer {}", login.2["access_token"].as_str().unwrap());
+        let snapshot = request(
+            &app,
+            "GET",
+            "sync",
+            &[("authorization", &bearer)],
+            Value::Null,
+        )
+        .await;
+        assert_eq!(snapshot.0, StatusCode::OK, "{}", snapshot.2);
+        assert_eq!(snapshot.2["has_more"], false);
+        cursors.push(snapshot.2["next_cursor"].as_str().unwrap().to_owned());
+        auth.push(bearer);
+    }
+    // 201 pending one-change batches: a person, then 200 single edits.
+    let person = Uuid::new_v4().to_string();
+    store
+        .apply(
+            &actor,
+            &Uuid::new_v4().to_string(),
+            &[Command::CreatePerson {
+                id: person.clone(),
+                name: "Probe".into(),
+                initial_policy: None,
+            }],
+        )
+        .await?;
+    for version in 1..=200 {
+        store
+            .apply(
+                &actor,
+                &Uuid::new_v4().to_string(),
+                &[Command::Edit {
+                    id: person.clone(),
+                    expected_version: version,
+                    expected_policy_version: Some(1),
+                    label: format!("Probe {version}"),
+                    value: String::new(),
+                }],
+            )
+            .await?;
+    }
+    let get = |path: String, auth: String| {
+        let app = app.clone();
+        async move { request(&app, "GET", &path, &[("authorization", &auth)], Value::Null).await }
+    };
+
+    let mut results = serde_json::Map::new();
+    let ceiling = get(
+        format!("sync?cursor={}&limit=200", cursors[0]),
+        auth[0].clone(),
+    )
+    .await;
+    assert_eq!(ceiling.0, StatusCode::OK, "{}", ceiling.2);
+    results.insert("ceiling_page".into(), shape(&ceiling));
+    let next = ceiling.2["next_cursor"].as_str().unwrap();
+    let following = get(format!("sync?cursor={next}&limit=200"), auth[0].clone()).await;
+    assert_eq!(following.0, StatusCode::OK, "{}", following.2);
+    results.insert("following_page".into(), shape(&following));
+    let default = get(format!("sync?cursor={}", cursors[1]), auth[1].clone()).await;
+    assert_eq!(default.0, StatusCode::OK, "{}", default.2);
+    results.insert("default_page".into(), shape(&default));
+    for (name, limit) in [("over_ceiling", 201), ("zero", 0)] {
+        let rejected = get(format!("sync?limit={limit}"), auth[0].clone()).await;
+        assert_eq!(
+            rejected.0,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{}",
+            rejected.2
+        );
+        results.insert(name.into(), shape(&rejected));
+    }
+    store.pool.close().await;
+    Ok(Value::Object(results))
+}
+
 /// BE-B8: safe, distinguishable calendar-refresh error codes, reached through the real
 /// `refresh_link` call path, not merely present in the OpenAPI enumeration. Covers
 /// `connection_unavailable` (cause 1, no connection at all), `integration_unconfigured` (cause
@@ -2543,6 +2659,7 @@ async fn observe(app: &Router) -> Value {
         "independent_timers": independent_timer_probes().await.expect("BE-B6 independent-timer probes"),
         "labels_and_capacity": labels_and_capacity_probes().await.expect("BE-Q25 label, naming and capacity probes"),
         "people_summaries": people_summary_probes().await.expect("BE-PEOPLE-SUMMARY viewer-safe summary probes"),
+        "sync_page_bounds": sync_page_bounds_probes().await.expect("BE-B1 sync page-bound probes"),
         "health": probe(app, "/health", &["api_version"]).await,
         "me_unauthenticated": probe(app, "/api/experimental/v1/me", &["request_id"]).await,
         "ready": probe(app, "/ready", &[]).await,

@@ -83,7 +83,7 @@ pub(crate) async fn sync(
                 &account,
                 &device,
                 input.cursor.as_deref(),
-                input.limit.unwrap_or(50),
+                input.limit.unwrap_or(atlas_core::SYNC_LIMIT_DEFAULT),
                 now,
             )
             .await?,

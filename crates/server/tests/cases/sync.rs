@@ -383,3 +383,135 @@ async fn unrelated_failed_logins_do_not_lock_out_valid_accounts() -> Result<()> 
     );
     Ok(())
 }
+
+/// BE-B1: `limit` over HTTP. The ceiling round-trips, an absent `limit` is the default, and
+/// out-of-range, malformed and repeated values keep their existing answers.
+#[tokio::test]
+async fn sync_limit_ceiling_default_and_rejections_over_http() -> Result<()> {
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let store = Store::connect(&url).await?;
+    store.migrate().await?;
+    let owner = Uuid::new_v4().to_string();
+    let password = "local-test-password-123";
+    store
+        .add_account(&owner, "pages", &hash_password(password.into()).await?)
+        .await?;
+    let app = App::new(store.clone()).await?.router();
+    let mut tokens = Vec::new();
+    let mut cursors = Vec::new();
+    for device in ["ceiling", "default"] {
+        let (status, body) = request(
+            &app,
+            "POST",
+            "/api/experimental/v1/sessions",
+            None,
+            None,
+            json!({"username":"pages","password":password,"device_id":device}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let token = body["access_token"].as_str().unwrap().to_owned();
+        let (status, page) = request(
+            &app,
+            "GET",
+            "/api/experimental/v1/sync?limit=200",
+            Some(&token),
+            None,
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(page["has_more"], false);
+        cursors.push(page["next_cursor"].as_str().unwrap().to_owned());
+        tokens.push(token);
+    }
+    // 201 pending batches for the account: one person, then single edits seeded in the store.
+    let person = Uuid::new_v4().to_string();
+    store
+        .apply(
+            &owner,
+            &Uuid::new_v4().to_string(),
+            &[atlas_core::Command::CreatePerson {
+                id: person.clone(),
+                name: "Paged".into(),
+                initial_policy: None,
+            }],
+        )
+        .await?;
+    for version in 1..=200 {
+        store
+            .apply(
+                &owner,
+                &Uuid::new_v4().to_string(),
+                &[atlas_core::Command::Edit {
+                    id: person.clone(),
+                    expected_version: version,
+                    expected_policy_version: Some(1),
+                    label: format!("Version {version}"),
+                    value: String::new(),
+                }],
+            )
+            .await?;
+    }
+    let get = |path: String, token: String| {
+        let app = app.clone();
+        async move { request(&app, "GET", &path, Some(&token), None, Value::Null).await }
+    };
+    let delta =
+        |cursor: &str, limit: &str| format!("/api/experimental/v1/sync?cursor={cursor}{limit}");
+
+    // H1: the ceiling, then the following page.
+    let (status, first) = get(delta(&cursors[0], "&limit=200"), tokens[0].clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["phase"], "delta");
+    assert_eq!(first["batches"].as_array().unwrap().len(), 200);
+    assert_eq!(first["has_more"], true);
+    let next = first["next_cursor"].as_str().unwrap();
+    let (status, second) = get(delta(next, "&limit=200"), tokens[0].clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second["batches"].as_array().unwrap().len(), 1);
+    assert_eq!(second["has_more"], false);
+
+    // H2: no limit is the default of 50.
+    let (status, page) = get(delta(&cursors[1], ""), tokens[1].clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["batches"].as_array().unwrap().len(), 50);
+    assert_eq!(page["has_more"], true);
+
+    // H3 and H4: the existing answers for rejected values.
+    for (query, status, code) in [
+        (
+            "limit=201",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_value",
+        ),
+        ("limit=0", StatusCode::UNPROCESSABLE_ENTITY, "invalid_value"),
+        (
+            "limit=999",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_value",
+        ),
+        ("limit=-1", StatusCode::BAD_REQUEST, "malformed_request"),
+        ("limit=abc", StatusCode::BAD_REQUEST, "malformed_request"),
+        ("limit=", StatusCode::BAD_REQUEST, "malformed_request"),
+        (
+            "limit=1&limit=2",
+            StatusCode::BAD_REQUEST,
+            "malformed_request",
+        ),
+        ("unknown=1", StatusCode::BAD_REQUEST, "malformed_request"),
+    ] {
+        let (actual, body) = get(
+            format!("/api/experimental/v1/sync?{query}"),
+            tokens[0].clone(),
+        )
+        .await;
+        assert_eq!(
+            (actual, body["code"].as_str()),
+            (status, Some(code)),
+            "{query}"
+        );
+    }
+    store.pool.close().await;
+    Ok(())
+}

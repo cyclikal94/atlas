@@ -2,7 +2,7 @@
   "openapi": "3.1.1",
   "info": {
     "title": "Atlas API",
-    "version": "0.29.0",
+    "version": "0.30.0",
     "description": "Pre-release API. Breaking changes and explicit database resets are permitted until a supported release."
   },
   "servers": [
@@ -1053,7 +1053,7 @@
             "credential_mismatch"
           ]
         },
-        "description": "No cursor starts a consistent staged snapshot; replace cached server state only after its final page. Snapshot sessions last one hour; delta cursors follow configured retention (90 days by default). Delta limits count indivisible publication batches, each containing at most 200 changed resources plus required ancestors (at most three per changed resource). Deltas resolve current authorised content; they are a state synchronisation feed, not an audit history. Revocations emit removals only for resources previously delivered to this device. Snapshot permission reductions return access_changed; deltas recover incrementally. Expired or pruned history requires a fresh snapshot; retain pending drafts separately.",
+        "description": "No cursor starts a consistent staged snapshot; replace cached server state only after its final page. Snapshot sessions last one hour; delta cursors follow configured retention (90 days by default). Snapshot limits count resources, returned in one batch per page. Delta limits count indivisible publication batches, at most 200 per page and never split, each containing at most 200 changed resources plus required ancestors (at most three per changed resource). Deltas resolve current authorised content; they are a state synchronisation feed, not an audit history. Revocations emit removals only for resources previously delivered to this device. Snapshot permission reductions return access_changed; deltas recover incrementally. Expired or pruned history requires a fresh snapshot; retain pending drafts separately.",
         "parameters": [
           {
             "name": "cursor",
@@ -1071,7 +1071,8 @@
               "type": "integer",
               "minimum": 1,
               "maximum": 200,
-              "default": 50
+              "default": 50,
+              "description": "Snapshot phase: resources per page. Delta phase: publication batches per page. Values outside 1 to 200 return 422 invalid_value."
             }
           }
         ]
@@ -17822,7 +17823,8 @@
           },
           "batches": {
             "type": "array",
-            "maxItems": 80,
+            "maxItems": 200,
+            "description": "At most the request's limit, and never more than 200. A snapshot page holds exactly one batch; a delta page holds whole publication batches.",
             "items": {
               "$ref": "#/components/schemas/Batch"
             }

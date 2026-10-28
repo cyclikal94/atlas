@@ -39,3 +39,23 @@ Revocation cannot remove information from a device that remains offline. On reco
 apply explicit removals or replace the authorised cache. A missing item in a daily view
 or a filtered page is not a deletion signal. Sync process-crash, rollback, contention,
 retention and privacy obligations are covered by [domain tests](testing.md).
+
+## Page size and limit
+
+`limit` counts resources on a snapshot page and publication batches on a delta page. It
+accepts 1 to 200 and defaults to 50; any other value is `422 invalid_value`, returned before
+any snapshot, cursor or device registration is written. A snapshot page holds exactly one
+batch of at most `limit` resources. A delta page holds at most `limit` whole publication
+batches in revision order: `limit` never splits a batch. Follow `next_cursor` while
+`has_more` is true to reach every pending batch.
+
+The contract states the same bounds: the `limit` maximum and `SyncPage.batches.maxItems`
+are both 200, and `Batch.changes.maxItems` is 800 (200 changed resources plus at most three
+ancestors each). Before contract 0.30.0 the page bound read 80, so a correct response to a
+`limit` of 81 to 200 with more than 80 pending batches failed a validator built from the
+contract; the server's responses did not change. Raising the bound was chosen over lowering
+the ceiling because lowering it would reject or truncate requests the server already
+answers, and a batch count does not bound memory. By contract arithmetic a delta page at
+the ceiling may carry 200 batches of up to 800 changes, each value at most 8 KiB. The
+ceiling is a request bound, not a memory-safe size: a client that needs smaller responses
+requests a smaller `limit`, and choosing it for a device is the client's decision.

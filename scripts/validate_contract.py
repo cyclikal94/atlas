@@ -36,6 +36,21 @@ def check_api_version():
 
 check_api_version()
 
+def check_sync_bounds():
+    """A delta page at the /sync limit ceiling must be valid against SyncPage (BE-B1)."""
+    [limit] = [p["schema"] for p in document["paths"]["/sync"]["get"]["parameters"] if p["name"] == "limit"]
+    schemas = document["components"]["schemas"]
+    page = schemas["SyncPage"]["properties"]["batches"]["maxItems"]
+    changes = schemas["Batch"]["properties"]["changes"]["maxItems"]
+    if limit.get("minimum") != 1 or not limit["default"] <= limit["maximum"]:
+        raise SystemExit(f"/sync limit must have minimum 1 and default <= maximum, got {limit}")
+    if limit["maximum"] != page:
+        raise SystemExit(f"/sync limit maximum {limit['maximum']} must equal SyncPage.batches.maxItems {page}")
+    if changes < limit["maximum"]:
+        raise SystemExit(f"Batch.changes.maxItems {changes} must hold a full snapshot page of {limit['maximum']} resources")
+
+check_sync_bounds()
+
 def check_example(name, value):
     schema = {**document, "$ref": f"#/components/schemas/{name}"}
     Draft202012Validator(schema, format_checker=FormatChecker()).validate(value)

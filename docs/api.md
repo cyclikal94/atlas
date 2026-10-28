@@ -159,6 +159,15 @@ and must not probe `GET /policies/{id}` for people it does not own. See
 [people](people.md#viewer-safe-summaries). The compatibility baseline gains a
 `people_summaries` probe group.
 
+`0.30.0` reconciles the `/sync` page bound with the `limit` the server already accepts
+(BE-B1). `SyncPage.batches.maxItems` rises from 80 to 200, the `limit` maximum, so a
+delta page requested at the ceiling is valid against the contract. It is a MINOR advance
+because an existing response schema changes, but no response does: every request accepted
+before returns the same page, and `limit` outside 1 to 200 is still `422 invalid_value`.
+The `limit` parameter and the `readSync` description now state its unit in each phase. No
+schema (database) change is needed. See [sync](sync.md#page-size-and-limit). The
+compatibility baseline gains a `sync_page_bounds` probe group.
+
 Mutations require an account-scoped UUID `Idempotency-Key` and explicit version
 preconditions where defined. Commands that replace existing authored text also carry the
 resource's sharing revision (`expected_policy_version`), so a write cannot commit under
@@ -189,7 +198,7 @@ statuses and [sync](sync.md) for client recovery.
 `GET /health` returns the version of the API contract the running server was built with:
 
 ```json
-{"status": "ok", "api_version": "0.28.0"}
+{"status": "ok", "api_version": "0.30.0"}
 ```
 
 `api_version` is exactly `info.version` in [the contract](../api/openapi.json), read from

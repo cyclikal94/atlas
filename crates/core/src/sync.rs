@@ -3,6 +3,14 @@ use super::*;
 use crate::devices::{Clock, Continuity, forget_unlisted, order_membership};
 use crate::error::ErrorCode;
 
+/// Largest `limit` a `/sync` request may give: resources per snapshot page, publication batches
+/// per delta page. Equal to `SyncPage.batches.maxItems` and the `limit` maximum in
+/// `api/openapi.json`.
+pub const SYNC_LIMIT_MAX: usize = 200;
+/// `limit` when a request omits it (`api/openapi.json` `limit.default`).
+pub const SYNC_LIMIT_DEFAULT: usize = 50;
+const _: () = assert!(1 <= SYNC_LIMIT_DEFAULT && SYNC_LIMIT_DEFAULT <= SYNC_LIMIT_MAX);
+
 impl Store {
     /// Retry SQLite snapshot-to-writer conflicts without changing the read boundary
     /// inside a transaction. PostgreSQL uses a repeatable-read snapshot. The time is read from
@@ -17,7 +25,7 @@ impl Store {
         time: impl Clock,
     ) -> Result<Page> {
         ensure!(
-            (1..=200).contains(&limit)
+            (1..=SYNC_LIMIT_MAX).contains(&limit)
                 && !device.is_empty()
                 && device.len() <= 100
                 && cursor.is_none_or(|c| c.len() <= 512),

@@ -1,6 +1,6 @@
 {
-  "api_version": "0.29.0",
-  "contract_sha256": "369ca0de5ab0cd5983252b55d4a546263819c236fa285a386b0dd374bf82b6e0",
+  "api_version": "0.30.0",
+  "contract_sha256": "9cadef17e7bad98358d0155df49c31fbd4e2e8c6f462492ead76a34137f5c691",
   "behaviour": {
     "activation": {
       "activate": {
@@ -1265,6 +1265,38 @@
         "code": "unauthenticated",
         "set_cookie": false,
         "status": 401
+      }
+    },
+    "sync_page_bounds": {
+      "ceiling_page": {
+        "batches": 200,
+        "code": null,
+        "has_more": true,
+        "status": 200
+      },
+      "default_page": {
+        "batches": 50,
+        "code": null,
+        "has_more": true,
+        "status": 200
+      },
+      "following_page": {
+        "batches": 1,
+        "code": null,
+        "has_more": false,
+        "status": 200
+      },
+      "over_ceiling": {
+        "batches": null,
+        "code": "invalid_value",
+        "has_more": null,
+        "status": 422
+      },
+      "zero": {
+        "batches": null,
+        "code": "invalid_value",
+        "has_more": null,
+        "status": 422
       }
     },
     "web_push_payload": {
