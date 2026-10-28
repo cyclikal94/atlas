@@ -66,15 +66,16 @@ def nodes(value):
 
 
 def normalised(body):
-    """The body with the random parts of its cursor (device MAC, expiry, snapshot token)
-    replaced; everything else is deterministic for a fresh database and seeded ids."""
+    """The body with the random parts of its cursor (device MAC, expiry, the key-masked
+    continuation position, snapshot token) replaced; everything else is deterministic for a
+    fresh database and seeded ids."""
     value = json.loads(body)
     cursor = value.get('next_cursor', '')
     parts = cursor.split('.')
     if cursor.startswith('d1.') and len(parts) == 4:
         value['next_cursor'] = f'd1.{parts[1]}.<expiry>.<mac>'
     elif cursor.startswith('d2.') and len(parts) == 7:
-        value['next_cursor'] = f'd2.{parts[1]}.<expiry>.{parts[3]}.{parts[4]}.{parts[5]}.<mac>'
+        value['next_cursor'] = f'd2.{parts[1]}.<expiry>.{parts[3]}.{parts[4]}.<position>.<mac>'
     elif cursor:
         value['next_cursor'] = '<snapshot>'
     return json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
