@@ -263,11 +263,10 @@ fn piece_is_ordered(changes: &[Change], whole: &BTreeMap<String, Projection>) {
     for p in upserts(changes) {
         let mut parent = p.parent_id.as_ref();
         while let Some(id) = parent.filter(|id| whole.contains_key(*id)) {
-            assert!(
-                positions[id] < positions[&p.id],
-                "ancestor {id} precedes {}",
-                p.id
-            );
+            let at = positions
+                .get(id)
+                .unwrap_or_else(|| panic!("ancestor {id} of {} missing from its piece", p.id));
+            assert!(*at < positions[&p.id], "ancestor {id} precedes {}", p.id);
             parent = whole[id].parent_id.as_ref();
         }
     }
@@ -1006,7 +1005,7 @@ async fn continuation_tokens_resist_tampering() -> Result<()> {
     let (_d, store) = fixture().await?;
     let (a, b, _, first) = chain(&store).await?;
     let token = first.next_cursor.clone();
-    assert_eq!(token.len(), 133);
+    assert_eq!(token.len(), 136);
     let side_effects = |store: Store, b: String| async move {
         let ledger = ledger(&store, &b, "reader").await?;
         let seen: i64 = sqlx::query_scalar(
@@ -1393,8 +1392,12 @@ async fn access_is_checked_per_piece() -> Result<()> {
         .find(|id| **id != person)
         .expect("a field")
         .clone();
-    let hidden = fields.iter().max().expect("fields").clone();
-    assert!(!sent.contains(&hidden));
+    // The next candidate after the first piece: an id-keyed continuation would name it.
+    let hidden = fields
+        .iter()
+        .find(|f| !sent.contains(f))
+        .expect("an unsent field")
+        .clone();
     revoke(&store, &a, &hidden, &b).await?;
     revoke(&store, &a, &delivered, &b).await?;
     let (rest, _) = drain(

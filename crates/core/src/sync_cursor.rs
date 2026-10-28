@@ -9,6 +9,8 @@ pub(super) fn new_key() -> String {
 /// Delta cursors and continuations use distinct domains, so neither verifies as the other.
 const DELTA: &str = "atlas-delta-v1";
 const CONTINUATION: &str = "atlas-delta-v2";
+/// The pad that hides a continuation's position.
+const POSITION: &str = "atlas-delta-v2-position";
 
 fn mac(key: &str, domain: &str, actor: &str, device: &str, payload: &str) -> Result<Hmac<Sha256>> {
     ensure!(key.len() == 64, ErrorCode::ResyncRequired);
@@ -100,7 +102,24 @@ pub(super) struct Continuation {
     pub ordinal: usize,
 }
 
-/// `d2.{boundary}.{expiry}.{revision}.{index}.{pass}{ordinal}.{mac}`, in the continuation domain.
+/// The position counts every notice of the revision, including ones the reader can no longer
+/// see, so in clear it would reveal how many of those a piece skipped. It travels masked with a
+/// pad derived from the device key, the revision, the piece index and the expiry.
+fn pad(key: &str, actor: &str, device: &str, c: &Continuation) -> Result<u32> {
+    let pad = mac(
+        key,
+        POSITION,
+        actor,
+        device,
+        &format!("{:016x}.{:08x}.{:016x}", c.revision, c.index, c.expiry),
+    )?
+    .finalize()
+    .into_bytes();
+    Ok(u32::from_be_bytes([pad[0], pad[1], pad[2], pad[3]]))
+}
+
+/// `d2.{boundary}.{expiry}.{revision}.{index}.{masked position}.{mac}`, in the continuation
+/// domain. The position is the pass bit above a 16-bit ordinal.
 pub(super) fn sign_continuation(
     key: &str,
     actor: &str,
@@ -112,12 +131,13 @@ pub(super) fn sign_continuation(
         ErrorCode::InvalidValue
     );
     let pass = match c.pass {
-        Pass::Upsert => 'u',
-        Pass::Remove => 'r',
+        Pass::Upsert => 0,
+        Pass::Remove => 1 << 16,
     };
+    let position = (pass | c.ordinal as u32) ^ pad(key, actor, device, c)?;
     let payload = format!(
-        "d2.{:016x}.{:016x}.{:016x}.{:08x}.{pass}{:04x}",
-        c.boundary, c.expiry, c.revision, c.index, c.ordinal
+        "d2.{:016x}.{:016x}.{:016x}.{:08x}.{position:08x}",
+        c.boundary, c.expiry, c.revision, c.index
     );
     let signature = signature(mac(key, CONTINUATION, actor, device, &payload)?);
     Ok(format!("{payload}.{signature}"))
@@ -134,20 +154,14 @@ pub(super) fn verify_continuation(
     ensure!(
         parts.len() == 7
             && parts[0] == "d2"
-            && [16, 16, 16, 8, 5, 64]
+            && [16, 16, 16, 8, 8, 64]
                 .iter()
                 .zip(&parts[1..])
                 .all(|(len, part)| part.len() == *len),
         ErrorCode::ResyncRequired
     );
-    let (pass, ordinal) = parts[5].split_at(1);
-    let pass = match pass {
-        "u" => Pass::Upsert,
-        "r" => Pass::Remove,
-        _ => return Err(anyhow!(ErrorCode::ResyncRequired)),
-    };
     ensure!(
-        [parts[1], parts[2], parts[3], parts[4], ordinal]
+        parts[1..6]
             .iter()
             .all(|s| s.bytes().all(|b| b.is_ascii_hexdigit())),
         ErrorCode::ResyncRequired
@@ -155,15 +169,64 @@ pub(super) fn verify_continuation(
     authentic(key, CONTINUATION, actor, device, token)?;
     let number =
         |s: &str| i64::from_str_radix(s, 16).map_err(|_| anyhow!(ErrorCode::ResyncRequired));
-    let c = Continuation {
+    let hex32 =
+        |s: &str| u32::from_str_radix(s, 16).map_err(|_| anyhow!(ErrorCode::ResyncRequired));
+    let mut c = Continuation {
         boundary: number(parts[1])?,
         expiry: number(parts[2])?,
         revision: number(parts[3])?,
-        index: u32::from_str_radix(parts[4], 16).map_err(|_| anyhow!(ErrorCode::ResyncRequired))?,
-        pass,
-        ordinal: usize::from_str_radix(ordinal, 16)
-            .map_err(|_| anyhow!(ErrorCode::ResyncRequired))?,
+        index: hex32(parts[4])?,
+        pass: Pass::Upsert,
+        ordinal: 0,
     };
+    let position = hex32(parts[5])? ^ pad(key, actor, device, &c)?;
+    c.pass = match position >> 16 {
+        0 => Pass::Upsert,
+        1 => Pass::Remove,
+        _ => return Err(anyhow!(ErrorCode::ResyncRequired)),
+    };
+    c.ordinal = (position & 0xffff) as usize;
     ensure!(c.revision > c.boundary, ErrorCode::ResyncRequired);
     Ok(c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn continuation(pass: Pass, ordinal: usize) -> Continuation {
+        Continuation {
+            boundary: 3,
+            expiry: 1_800_000_000,
+            revision: 9,
+            index: 2,
+            pass,
+            ordinal,
+        }
+    }
+
+    /// The position round-trips and is never carried in clear.
+    #[test]
+    fn positions_round_trip_masked() -> Result<()> {
+        for (pass, ordinal, plain) in [
+            (Pass::Upsert, 0, 0),
+            (Pass::Upsert, 5, 5),
+            (Pass::Remove, 0, 1 << 16),
+            (Pass::Remove, 0xffff, (1 << 16) | 0xffff),
+        ] {
+            let c = continuation(pass, ordinal);
+            let token = sign_continuation(KEY, "actor", "device", &c)?;
+            assert_eq!(token.len(), 136);
+            assert_eq!(verify_continuation(KEY, "actor", "device", &token)?, c);
+            let field: u32 = u32::from_str_radix(token.split('.').nth(5).expect("position"), 16)?;
+            assert_ne!(field, plain, "the position is masked");
+        }
+        assert!(
+            sign_continuation(KEY, "actor", "device", &continuation(Pass::Upsert, 0x10000))
+                .is_err()
+        );
+        Ok(())
+    }
 }
