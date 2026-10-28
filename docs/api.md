@@ -159,6 +159,16 @@ and must not probe `GET /policies/{id}` for people it does not own. See
 [people](people.md#viewer-safe-summaries). The compatibility baseline gains a
 `people_summaries` probe group.
 
+`0.30.0` adds opt-in bounded `/sync` delivery (BE-Q23) and changes no existing response: a
+request without the new `max_changes` query parameter (4–800) is answered byte for byte as
+before. With it, a snapshot page holds at most `min(limit, max_changes)` resources and a
+delta revision larger than the bound arrives as pieces, one per response, each marked by
+the new optional `Batch.segment` member (schema `BatchSegment`: `index`, `last`) and followed
+by a continuation cursor. The schema is unchanged at `1006`. A client must send
+`max_changes` only once the server reports `0.30.0` or later and must stage pieces until the
+last one; see [sync](sync.md#bounded-delivery). The compatibility baseline gains a
+`bounded_sync` probe group.
+
 Mutations require an account-scoped UUID `Idempotency-Key` and explicit version
 preconditions where defined. Commands that replace existing authored text also carry the
 resource's sharing revision (`expected_policy_version`), so a write cannot commit under
@@ -189,7 +199,7 @@ statuses and [sync](sync.md) for client recovery.
 `GET /health` returns the version of the API contract the running server was built with:
 
 ```json
-{"status": "ok", "api_version": "0.28.0"}
+{"status": "ok", "api_version": "0.30.0"}
 ```
 
 `api_version` is exactly `info.version` in [the contract](../api/openapi.json), read from

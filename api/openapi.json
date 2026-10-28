@@ -2,7 +2,7 @@
   "openapi": "3.1.1",
   "info": {
     "title": "Atlas API",
-    "version": "0.29.0",
+    "version": "0.30.0",
     "description": "Pre-release API. Breaking changes and explicit database resets are permitted until a supported release."
   },
   "servers": [
@@ -1053,7 +1053,7 @@
             "credential_mismatch"
           ]
         },
-        "description": "No cursor starts a consistent staged snapshot; replace cached server state only after its final page. Snapshot sessions last one hour; delta cursors follow configured retention (90 days by default). Delta limits count indivisible publication batches, each containing at most 200 changed resources plus required ancestors (at most three per changed resource). Deltas resolve current authorised content; they are a state synchronisation feed, not an audit history. Revocations emit removals only for resources previously delivered to this device. Snapshot permission reductions return access_changed; deltas recover incrementally. Expired or pruned history requires a fresh snapshot; retain pending drafts separately.",
+        "description": "No cursor starts a consistent staged snapshot; replace cached server state only after its final page. Snapshot sessions last one hour; delta cursors follow configured retention (90 days by default). Delta limits count indivisible publication batches, each containing at most 200 changed resources plus required ancestors (at most three per changed resource). Deltas resolve current authorised content; they are a state synchronisation feed, not an audit history. Revocations emit removals only for resources previously delivered to this device. Snapshot permission reductions return access_changed; deltas recover incrementally. Expired or pruned history requires a fresh snapshot; retain pending drafts separately. With max_changes, a delta revision larger than the bound arrives as segments sharing its revision, each a consecutive slice of its upsert pass (parents first) then removal pass (children first), each closed under visible ancestors and re-authorised at its own request; after a non-final segment next_cursor continues the same revision, after the last one it is an ordinary delta cursor. Clients stage segments and apply the revision only when the segment marked last arrives. Continuations fail like delta cursors (resync_required) and are not invalidated by access changes.",
         "parameters": [
           {
             "name": "cursor",
@@ -1072,6 +1072,16 @@
               "minimum": 1,
               "maximum": 200,
               "default": 50
+            }
+          },
+          {
+            "name": "max_changes",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 4,
+              "maximum": 800,
+              "description": "Optional bound on the Change items in this response, counted across its batches, ancestors included. A snapshot page then holds at most min(limit, max_changes) resources. In the delta phase whole batches are returned while they fit; a batch larger than the bound on its own is split into segments, one per response, alone in its page. The minimum is one changed resource plus its at most three ancestors; it is structural, not a memory figure. Absent, responses are unchanged."
             }
           }
         ]
@@ -17803,6 +17813,9 @@
             "items": {
               "$ref": "#/components/schemas/Change"
             }
+          },
+          "segment": {
+            "$ref": "#/components/schemas/BatchSegment"
           }
         },
         "required": [
@@ -17810,6 +17823,24 @@
           "changes"
         ],
         "additionalProperties": false
+      },
+      "BatchSegment": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "last": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "index",
+          "last"
+        ],
+        "additionalProperties": false,
+        "description": "Present only on a piece of a delta revision that was split because it exceeded the request's max_changes. Pieces of one revision share its revision number and arrive in index order, one piece per response."
       },
       "SyncPage": {
         "type": "object",

@@ -383,3 +383,170 @@ async fn unrelated_failed_logins_do_not_lock_out_valid_accounts() -> Result<()> 
     );
     Ok(())
 }
+
+/// BE-Q23 N1: `max_changes` through the HTTP route. Out-of-range integers are `422
+/// invalid_value`; anything that is not a non-negative integer, or a repeated parameter, is
+/// `400 malformed_request`, exactly as `limit` already behaves; a split revision carries
+/// `segment` and a `d2` continuation; a tampered continuation is `410 resync_required`.
+#[tokio::test]
+async fn bounded_sync_parameters() -> Result<()> {
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let store = Store::connect(&url).await?;
+    store.migrate().await?;
+    let alice = Uuid::new_v4().to_string();
+    let password = "local-test-password-123";
+    store
+        .add_account(&alice, "alice", &hash_password(password.into()).await?)
+        .await?;
+    let app = App::new(store.clone()).await?.router();
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/experimental/v1/sessions",
+        None,
+        None,
+        json!({"username":"alice","password":password,"device_id":"phone"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let token = body["access_token"].as_str().unwrap().to_owned();
+    let sync = |query: String| {
+        let (app, token) = (app.clone(), token.clone());
+        async move {
+            request(
+                &app,
+                "GET",
+                &format!("/api/experimental/v1/sync{query}"),
+                Some(&token),
+                None,
+                Value::Null,
+            )
+            .await
+        }
+    };
+    let (status, head) = sync(String::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    let cursor = head["next_cursor"].as_str().unwrap().to_owned();
+    let person = Uuid::new_v4().to_string();
+    let mut commands = vec![json!({"kind":"create_person","id":person,"name":"Bounded"})];
+    commands.extend((0..12).map(|_| {
+        json!({"kind":"create_field","id":Uuid::new_v4().to_string(),"person_id":person,
+            "label":"Field","value":"Value"})
+    }));
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/experimental/v1/commands",
+        Some(&token),
+        Some(&Uuid::new_v4().to_string()),
+        json!({ "commands": commands }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    for (query, expected, code) in [
+        (
+            "max_changes=3",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_value",
+        ),
+        (
+            "max_changes=801",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_value",
+        ),
+        (
+            "max_changes=0",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_value",
+        ),
+        (
+            "max_changes=-1",
+            StatusCode::BAD_REQUEST,
+            "malformed_request",
+        ),
+        (
+            "max_changes=abc",
+            StatusCode::BAD_REQUEST,
+            "malformed_request",
+        ),
+        (
+            "max_changes=4.5",
+            StatusCode::BAD_REQUEST,
+            "malformed_request",
+        ),
+        ("max_changes=", StatusCode::BAD_REQUEST, "malformed_request"),
+        (
+            "max_changes=4&max_changes=5",
+            StatusCode::BAD_REQUEST,
+            "malformed_request",
+        ),
+        (
+            "limit=4&limit=5",
+            StatusCode::BAD_REQUEST,
+            "malformed_request",
+        ),
+        ("max_change=4", StatusCode::BAD_REQUEST, "malformed_request"),
+    ] {
+        let (status, body) = sync(format!("?cursor={cursor}&{query}")).await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (expected, Some(code)),
+            "{query}"
+        );
+    }
+    // Without the bound: one whole batch, no segment member.
+    let (status, whole) = sync(format!("?cursor={cursor}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(whole["batches"].as_array().unwrap().len(), 1);
+    assert!(whole["batches"][0].get("segment").is_none());
+    assert!(whole["next_cursor"].as_str().unwrap().starts_with("d1."));
+    // With it: pieces of 4 (the person and three fields), each with its continuation.
+    let mut next = cursor.clone();
+    let mut pieces = Vec::new();
+    loop {
+        let (status, page) = sync(format!("?cursor={next}&max_changes=4")).await;
+        assert_eq!(status, StatusCode::OK);
+        let batch = &page["batches"][0];
+        let mut members: Vec<_> = batch.as_object().unwrap().keys().cloned().collect();
+        members.sort();
+        assert_eq!(members, ["changes", "revision", "segment"]);
+        let mut members: Vec<_> = batch["segment"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        members.sort();
+        assert_eq!(members, ["index", "last"]);
+        assert!(batch["changes"].as_array().unwrap().len() <= 4);
+        next = page["next_cursor"].as_str().unwrap().to_owned();
+        pieces.push(batch["segment"].clone());
+        if batch["segment"]["last"] == true {
+            assert!(next.starts_with("d1.") && page["has_more"] == false);
+            break;
+        }
+        assert!(next.starts_with("d2.") && page["has_more"] == true);
+    }
+    assert_eq!(pieces.len(), 4, "12 fields, three per piece");
+    let (status, first) = sync(format!("?cursor={cursor}&max_changes=4")).await;
+    assert_eq!(status, StatusCode::OK);
+    let continuation = first["next_cursor"].as_str().unwrap().to_owned();
+    let mut forged = continuation.clone();
+    let last = forged.pop().unwrap();
+    forged.push(if last == '0' { '1' } else { '0' });
+    let (status, body) = sync(format!("?cursor={forged}&max_changes=4")).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::GONE, Some("resync_required"))
+    );
+    // A continuation without the bound returns the rest of the revision at once.
+    let (status, rest) = sync(format!("?cursor={continuation}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        rest["batches"][0]["segment"],
+        json!({"index":1,"last":true})
+    );
+    assert_eq!(rest["batches"][0]["changes"].as_array().unwrap().len(), 10);
+    store.pool.close().await;
+    Ok(())
+}

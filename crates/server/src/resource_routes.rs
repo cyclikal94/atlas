@@ -64,6 +64,7 @@ pub(crate) async fn access_commands(
 pub(crate) struct SyncQuery {
     cursor: Option<String>,
     limit: Option<usize>,
+    max_changes: Option<usize>,
 }
 pub(crate) async fn sync(
     State(app): State<App>,
@@ -79,11 +80,12 @@ pub(crate) async fn sync(
     hook!(app.store, "sync_route.after_identity");
     Ok(Json(
         app.store
-            .sync(
+            .sync_bounded(
                 &account,
                 &device,
                 input.cursor.as_deref(),
                 input.limit.unwrap_or(50),
+                input.max_changes,
                 now,
             )
             .await?,

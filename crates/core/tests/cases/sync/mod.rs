@@ -5,3 +5,4 @@ mod golden;
 mod lifecycle;
 mod publication;
 mod retention;
+mod segments;

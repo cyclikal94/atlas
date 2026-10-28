@@ -61,10 +61,11 @@ async fn drain(
 }
 
 async fn versions(store: &Store, id: &str) -> Result<(i64, i64)> {
-    let row: (i64, i64) = sqlx::query_as("SELECT version,policy_version FROM resources WHERE id=$1")
-        .bind(id)
-        .fetch_one(&store.pool)
-        .await?;
+    let row: (i64, i64) =
+        sqlx::query_as("SELECT version,policy_version FROM resources WHERE id=$1")
+            .bind(id)
+            .fetch_one(&store.pool)
+            .await?;
     Ok(row)
 }
 
@@ -86,7 +87,10 @@ pub(crate) async fn transcript(store: &Store) -> Result<Vec<String>> {
     let b1 = store.sync(&b, "b1", None, 200, T).await?.next_cursor;
     let b200 = store.sync(&b, "b200", None, 200, T).await?.next_cursor;
     let share = |edit| Policy {
-        grants: vec![PrincipalGrant::Account { id: b.clone(), edit }],
+        grants: vec![PrincipalGrant::Account {
+            id: b.clone(),
+            edit,
+        }],
         exclude_accounts: vec![],
     };
     let (p1, p2, f1, f2, f3) = (n(0x101), n(0x102), n(0x201), n(0x202), n(0x203));
@@ -230,7 +234,11 @@ async fn golden_capture() -> Result<()> {
     let (_d1, first) = fixture().await?;
     let (_d2, second) = fixture().await?;
     let recorded = transcript(&first).await?;
-    assert_eq!(recorded, transcript(&second).await?, "the transcript is deterministic");
+    assert_eq!(
+        recorded,
+        transcript(&second).await?,
+        "the transcript is deterministic"
+    );
     std::fs::write(GOLDEN, serde_json::to_string_pretty(&recorded)? + "\n")?;
     Ok(())
 }

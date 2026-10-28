@@ -2527,6 +2527,147 @@ async fn people_summary_probes() -> Result<Value> {
     Ok(Value::Object(results))
 }
 
+/// BE-Q23 bounded `/sync` delivery probes (contract v1): the request without `max_changes` is
+/// unchanged; out-of-range, non-integer and repeated values; a split revision's member set and
+/// continuation cursor form; a tampered continuation. Records only deterministic shape (statuses,
+/// codes, member names, counts, cursor form and length), never an id or a cursor.
+async fn bounded_sync_probes() -> Result<Value> {
+    use crate::support::http::request;
+    use atlas_server::hash_password;
+
+    fn form(cursor: &Value) -> Value {
+        let cursor = cursor.as_str().unwrap_or_default();
+        let kind = match cursor.get(..3) {
+            Some("d1.") => "d1",
+            Some("d2.") => "d2",
+            _ if Uuid::parse_str(cursor).is_ok() => "snapshot",
+            _ => "other",
+        };
+        json!({"form": kind, "length": cursor.len()})
+    }
+    fn page(reply: &(StatusCode, axum::http::HeaderMap, Value)) -> Value {
+        let body = &reply.2;
+        let Some(batches) = body["batches"].as_array() else {
+            return json!({"status": reply.0.as_u16(), "code": body.get("code")});
+        };
+        let mut members: Vec<_> = body.as_object().unwrap().keys().cloned().collect();
+        members.sort();
+        json!({
+            "status": reply.0.as_u16(),
+            "members": members,
+            "phase": body["phase"],
+            "has_more": body["has_more"],
+            "cursor": form(&body["next_cursor"]),
+            "batches": batches.iter().map(|b| {
+                let mut members: Vec<_> = b.as_object().unwrap().keys().cloned().collect();
+                members.sort();
+                json!({
+                    "members": members,
+                    "changes": b["changes"].as_array().map(Vec::len),
+                    "segment": b.get("segment"),
+                })
+            }).collect::<Vec<_>>(),
+        })
+    }
+
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let store = Store::connect(&url).await?;
+    store.migrate().await?;
+    let actor = Uuid::new_v4().to_string();
+    store
+        .add_account(
+            &actor,
+            "bounded-sync-probe",
+            &hash_password("bounded-sync-probe-123".into()).await?,
+        )
+        .await?;
+    let app = App::new(store.clone()).await?.router();
+    let login = request(
+        &app,
+        "POST",
+        "sessions",
+        &[],
+        json!({"username":"bounded-sync-probe","password":"bounded-sync-probe-123","device_id":"probe"}),
+    )
+    .await;
+    assert_eq!(login.0, StatusCode::OK, "{}", login.2);
+    let auth = format!("Bearer {}", login.2["access_token"].as_str().unwrap());
+    let sync = |query: String| {
+        let (app, auth) = (app.clone(), auth.clone());
+        async move {
+            request(
+                &app,
+                "GET",
+                &format!("sync{query}"),
+                &[("authorization", &auth)],
+                Value::Null,
+            )
+            .await
+        }
+    };
+    let mut results = serde_json::Map::new();
+    let snapshot = sync(String::new()).await;
+    results.insert("snapshot_without_bound".into(), page(&snapshot));
+    let cursor = snapshot.2["next_cursor"].as_str().unwrap().to_owned();
+    let person = Uuid::new_v4().to_string();
+    let mut commands = vec![json!({"kind":"create_person","id":person,"name":"Probe"})];
+    commands.extend((0..7).map(|_| {
+        json!({"kind":"create_field","id":Uuid::new_v4().to_string(),"person_id":person,"label":"Probe","value":"Probe"})
+    }));
+    let created = request(
+        &app,
+        "POST",
+        "commands",
+        &[
+            ("authorization", &auth),
+            ("idempotency-key", &Uuid::new_v4().to_string()),
+        ],
+        json!({ "commands": commands }),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::OK, "{}", created.2);
+    results.insert(
+        "delta_without_bound".into(),
+        page(&sync(format!("?cursor={cursor}")).await),
+    );
+    let first = sync(format!("?cursor={cursor}&max_changes=4")).await;
+    assert_eq!(
+        first.2["batches"][0]["segment"],
+        json!({"index":0,"last":false})
+    );
+    results.insert("first_segment".into(), page(&first));
+    let continuation = first.2["next_cursor"].as_str().unwrap().to_owned();
+    let second = sync(format!("?cursor={continuation}&max_changes=4")).await;
+    results.insert("next_segment".into(), page(&second));
+    results.insert(
+        "rest_without_bound".into(),
+        page(&sync(format!("?cursor={continuation}")).await),
+    );
+    let mut forged = continuation.clone();
+    let last = forged.pop().unwrap();
+    forged.push(if last == '0' { '1' } else { '0' });
+    for (name, query) in [
+        (
+            "tampered_continuation",
+            format!("?cursor={forged}&max_changes=4"),
+        ),
+        ("below_minimum", format!("?cursor={cursor}&max_changes=3")),
+        ("above_maximum", format!("?cursor={cursor}&max_changes=801")),
+        (
+            "not_an_integer",
+            format!("?cursor={cursor}&max_changes=abc"),
+        ),
+        (
+            "repeated",
+            format!("?cursor={cursor}&max_changes=4&max_changes=5"),
+        ),
+        ("snapshot_narrowed", "?max_changes=4".to_owned()),
+    ] {
+        results.insert(name.into(), page(&sync(query).await));
+    }
+    Ok(Value::Object(results))
+}
+
 async fn observe(app: &Router) -> Value {
     json!({
         "activation": activation_probes().await.expect("activation-grant protocol probes"),
@@ -2543,6 +2684,7 @@ async fn observe(app: &Router) -> Value {
         "independent_timers": independent_timer_probes().await.expect("BE-B6 independent-timer probes"),
         "labels_and_capacity": labels_and_capacity_probes().await.expect("BE-Q25 label, naming and capacity probes"),
         "people_summaries": people_summary_probes().await.expect("BE-PEOPLE-SUMMARY viewer-safe summary probes"),
+        "bounded_sync": bounded_sync_probes().await.expect("BE-Q23 bounded sync delivery probes"),
         "health": probe(app, "/health", &["api_version"]).await,
         "me_unauthenticated": probe(app, "/api/experimental/v1/me", &["request_id"]).await,
         "ready": probe(app, "/ready", &[]).await,

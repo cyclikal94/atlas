@@ -1,6 +1,6 @@
 {
-  "api_version": "0.29.0",
-  "contract_sha256": "369ca0de5ab0cd5983252b55d4a546263819c236fa285a386b0dd374bf82b6e0",
+  "api_version": "0.30.0",
+  "contract_sha256": "9433b84572d083b53fdf545e88f69d5a526d254908b97192854d0edeed80aaed",
   "behaviour": {
     "activation": {
       "activate": {
@@ -42,6 +42,190 @@
         ],
         "set_cookie": false,
         "status": 200
+      }
+    },
+    "bounded_sync": {
+      "above_maximum": {
+        "code": "invalid_value",
+        "status": 422
+      },
+      "below_minimum": {
+        "code": "invalid_value",
+        "status": 422
+      },
+      "delta_without_bound": {
+        "batches": [
+          {
+            "changes": 8,
+            "members": [
+              "changes",
+              "revision"
+            ],
+            "segment": null
+          }
+        ],
+        "cursor": {
+          "form": "d1",
+          "length": 101
+        },
+        "has_more": false,
+        "members": [
+          "batches",
+          "has_more",
+          "next_cursor",
+          "phase"
+        ],
+        "phase": "delta",
+        "status": 200
+      },
+      "first_segment": {
+        "batches": [
+          {
+            "changes": 4,
+            "members": [
+              "changes",
+              "revision",
+              "segment"
+            ],
+            "segment": {
+              "index": 0,
+              "last": false
+            }
+          }
+        ],
+        "cursor": {
+          "form": "d2",
+          "length": 133
+        },
+        "has_more": true,
+        "members": [
+          "batches",
+          "has_more",
+          "next_cursor",
+          "phase"
+        ],
+        "phase": "delta",
+        "status": 200
+      },
+      "next_segment": {
+        "batches": [
+          {
+            "changes": 4,
+            "members": [
+              "changes",
+              "revision",
+              "segment"
+            ],
+            "segment": {
+              "index": 1,
+              "last": false
+            }
+          }
+        ],
+        "cursor": {
+          "form": "d2",
+          "length": 133
+        },
+        "has_more": true,
+        "members": [
+          "batches",
+          "has_more",
+          "next_cursor",
+          "phase"
+        ],
+        "phase": "delta",
+        "status": 200
+      },
+      "not_an_integer": {
+        "code": "malformed_request",
+        "status": 400
+      },
+      "repeated": {
+        "code": "malformed_request",
+        "status": 400
+      },
+      "rest_without_bound": {
+        "batches": [
+          {
+            "changes": 5,
+            "members": [
+              "changes",
+              "revision",
+              "segment"
+            ],
+            "segment": {
+              "index": 1,
+              "last": true
+            }
+          }
+        ],
+        "cursor": {
+          "form": "d1",
+          "length": 101
+        },
+        "has_more": false,
+        "members": [
+          "batches",
+          "has_more",
+          "next_cursor",
+          "phase"
+        ],
+        "phase": "delta",
+        "status": 200
+      },
+      "snapshot_narrowed": {
+        "batches": [
+          {
+            "changes": 4,
+            "members": [
+              "changes",
+              "revision"
+            ],
+            "segment": null
+          }
+        ],
+        "cursor": {
+          "form": "snapshot",
+          "length": 36
+        },
+        "has_more": true,
+        "members": [
+          "batches",
+          "has_more",
+          "next_cursor",
+          "phase"
+        ],
+        "phase": "snapshot",
+        "status": 200
+      },
+      "snapshot_without_bound": {
+        "batches": [
+          {
+            "changes": 0,
+            "members": [
+              "changes",
+              "revision"
+            ],
+            "segment": null
+          }
+        ],
+        "cursor": {
+          "form": "d1",
+          "length": 101
+        },
+        "has_more": false,
+        "members": [
+          "batches",
+          "has_more",
+          "next_cursor",
+          "phase"
+        ],
+        "phase": "snapshot",
+        "status": 200
+      },
+      "tampered_continuation": {
+        "code": "resync_required",
+        "status": 410
       }
     },
     "calendar_configure": {

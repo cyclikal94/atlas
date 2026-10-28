@@ -12,7 +12,7 @@ import urllib.request
 import uuid
 
 from smoke.client import ContractClient
-from smoke import calendars, sharing, households, tasks, people, devices, timers, labels, people_summary
+from smoke import calendars, sharing, households, tasks, people, devices, timers, labels, people_summary, bounded_sync
 
 root = Path(__file__).resolve().parents[1]
 binary = Path(os.environ.get('ATLAS_TEST_BINARY', root / 'target/debug/atlas-server'))
@@ -94,6 +94,7 @@ with tempfile.TemporaryDirectory(prefix='atlas-server-smoke-') as temporary:
                             'secret,version,active) VALUES (?,?,?,?,?,1,1)',
                             (str(uuid.uuid4()), account, device, 'ntfy', 'fixture'))
             devices.run(call, tokens, secrets, seed)
+            print(json.dumps(bounded_sync.run(call, accounts, tokens, secrets)))
             secrets.append('replacement-smoke-password-456')
             call('POST', '/api/experimental/v1/password', tokens['alice'],
                 {'current_password':secrets[0], 'new_password':secrets[-1]}, expected=204)
@@ -116,4 +117,4 @@ with tempfile.TemporaryDirectory(prefix='atlas-server-smoke-') as temporary:
     logged_ids = {event['request_id'] for event in events if event['event'] == 'http_request'}
     if request_ids != logged_ids:
         raise RuntimeError('Requests and logs are not correlated')
-print('Live contract smoke passed: authentication, sharing, households, tasks, people, independent timers, calendars, session/device labels and capacity, viewer-safe People summaries, device retirement and sanitised logs')
+print('Live contract smoke passed: authentication, sharing, households, tasks, people, independent timers, calendars, session/device labels and capacity, viewer-safe People summaries, device retirement, bounded sync delivery and sanitised logs')
