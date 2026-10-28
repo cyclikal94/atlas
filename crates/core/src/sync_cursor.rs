@@ -9,8 +9,8 @@ pub(super) fn new_key() -> String {
 /// Delta cursors and continuations use distinct domains, so neither verifies as the other.
 const DELTA: &str = "atlas-delta-v1";
 const CONTINUATION: &str = "atlas-delta-v2";
-/// The pad that hides a continuation's position.
-const POSITION: &str = "atlas-delta-v2-position";
+/// The pad that hides a continuation's position, keyed by that token's own MAC.
+const POSITION: &str = "atlas-delta-v2-siv";
 
 fn mac(key: &str, domain: &str, actor: &str, device: &str, payload: &str) -> Result<Hmac<Sha256>> {
     ensure!(key.len() == 64, ErrorCode::ResyncRequired);
@@ -103,23 +103,20 @@ pub(super) struct Continuation {
 }
 
 /// The position counts every notice of the revision, including ones the reader can no longer
-/// see, so in clear it would reveal how many of those a piece skipped. It travels masked with a
-/// pad derived from the device key, the revision, the piece index and the expiry.
-fn pad(key: &str, actor: &str, device: &str, c: &Continuation) -> Result<u32> {
-    let pad = mac(
-        key,
-        POSITION,
-        actor,
-        device,
-        &format!("{:016x}.{:08x}.{:016x}", c.revision, c.index, c.expiry),
-    )?
-    .finalize()
-    .into_bytes();
+/// see, so in clear it would reveal how many of those a piece skipped. A pad shared by two
+/// tokens would reveal the same through the XOR of their fields, so the token is sealed
+/// synthetic-IV style: the MAC covers the plain position, and the pad is derived from that MAC.
+/// Distinct positions get unrelated pads; an identical continuation gets an identical token.
+fn pad(key: &str, actor: &str, device: &str, tag: &str) -> Result<u32> {
+    let pad = mac(key, POSITION, actor, device, tag)?
+        .finalize()
+        .into_bytes();
     Ok(u32::from_be_bytes([pad[0], pad[1], pad[2], pad[3]]))
 }
 
-/// `d2.{boundary}.{expiry}.{revision}.{index}.{masked position}.{mac}`, in the continuation
-/// domain. The position is the pass bit above a 16-bit ordinal.
+/// `d2.{boundary}.{expiry}.{revision}.{index}.{sealed position}.{mac}`, in the continuation
+/// domain. The position is the pass bit above a 16-bit ordinal; the MAC is over the header and
+/// the plain position.
 pub(super) fn sign_continuation(
     key: &str,
     actor: &str,
@@ -134,13 +131,20 @@ pub(super) fn sign_continuation(
         Pass::Upsert => 0,
         Pass::Remove => 1 << 16,
     };
-    let position = (pass | c.ordinal as u32) ^ pad(key, actor, device, c)?;
-    let payload = format!(
-        "d2.{:016x}.{:016x}.{:016x}.{:08x}.{position:08x}",
+    let position = pass | c.ordinal as u32;
+    let header = format!(
+        "d2.{:016x}.{:016x}.{:016x}.{:08x}",
         c.boundary, c.expiry, c.revision, c.index
     );
-    let signature = signature(mac(key, CONTINUATION, actor, device, &payload)?);
-    Ok(format!("{payload}.{signature}"))
+    let tag = signature(mac(
+        key,
+        CONTINUATION,
+        actor,
+        device,
+        &format!("{header}.{position:08x}"),
+    )?);
+    let sealed = position ^ pad(key, actor, device, &tag)?;
+    Ok(format!("{header}.{sealed:08x}.{tag}"))
 }
 
 /// Every parse or authentication failure is `resync_required`, as for a delta cursor.
@@ -166,11 +170,21 @@ pub(super) fn verify_continuation(
             .all(|s| s.bytes().all(|b| b.is_ascii_hexdigit())),
         ErrorCode::ResyncRequired
     );
-    authentic(key, CONTINUATION, actor, device, token)?;
-    let number =
-        |s: &str| i64::from_str_radix(s, 16).map_err(|_| anyhow!(ErrorCode::ResyncRequired));
     let hex32 =
         |s: &str| u32::from_str_radix(s, 16).map_err(|_| anyhow!(ErrorCode::ResyncRequired));
+    // Unseal with the pad of the presented MAC, then authenticate the plain position: an altered
+    // field or MAC yields a position the MAC does not cover.
+    let position = hex32(parts[5])? ^ pad(key, actor, device, parts[6])?;
+    let header = parts[..5].join(".");
+    authentic(
+        key,
+        CONTINUATION,
+        actor,
+        device,
+        &format!("{header}.{position:08x}.{}", parts[6]),
+    )?;
+    let number =
+        |s: &str| i64::from_str_radix(s, 16).map_err(|_| anyhow!(ErrorCode::ResyncRequired));
     let mut c = Continuation {
         boundary: number(parts[1])?,
         expiry: number(parts[2])?,
@@ -179,7 +193,6 @@ pub(super) fn verify_continuation(
         pass: Pass::Upsert,
         ordinal: 0,
     };
-    let position = hex32(parts[5])? ^ pad(key, actor, device, &c)?;
     c.pass = match position >> 16 {
         0 => Pass::Upsert,
         1 => Pass::Remove,
@@ -227,6 +240,35 @@ mod tests {
             sign_continuation(KEY, "actor", "device", &continuation(Pass::Upsert, 0x10000))
                 .is_err()
         );
+        Ok(())
+    }
+
+    fn field(token: &str) -> u32 {
+        u32::from_str_radix(token.split('.').nth(5).expect("position"), 16).expect("hex")
+    }
+
+    /// R1 (review 28 October 2026): continuations sharing every public field but the position, as
+    /// different bounds, a repeat after a visibility change or another chain to the same index
+    /// produce, must not cancel to the XOR of their positions, which counts hidden notices. A
+    /// retry of the same continuation still gets the same token.
+    #[test]
+    fn positions_do_not_cancel_across_tokens() -> Result<()> {
+        let mut sealed = Vec::new();
+        for pass in [Pass::Upsert, Pass::Remove] {
+            for ordinal in (0..=40).chain([0xfffe, 0xffff]) {
+                let c = continuation(pass, ordinal);
+                let token = sign_continuation(KEY, "actor", "device", &c)?;
+                assert_eq!(token, sign_continuation(KEY, "actor", "device", &c)?);
+                assert_eq!(verify_continuation(KEY, "actor", "device", &token)?, c);
+                let plain = if pass == Pass::Remove { 1 << 16 } else { 0 } | ordinal as u32;
+                sealed.push((plain, field(&token)));
+            }
+        }
+        for (i, (a, x)) in sealed.iter().enumerate() {
+            for (b, y) in &sealed[i + 1..] {
+                assert_ne!(x ^ y, a ^ b, "positions {a:#x} and {b:#x} cancel");
+            }
+        }
         Ok(())
     }
 }

@@ -5,6 +5,7 @@ use anyhow::Result;
 use atlas_core::{
     Batch, Change, Command, Page, Projection, Store,
     households::ManagementCommand as M,
+    people::PeopleCommand,
     policy::{Policy, PrincipalGrant},
     tasks::*,
 };
@@ -1045,31 +1046,27 @@ async fn continuation_tokens_resist_tampering() -> Result<()> {
     // The same token presented as the other cursor form, and a continuation signed with the
     // delta-cursor domain by someone holding the key.
     refused(format!("d1{}", &token[2..]), "reader", b.clone(), T).await?;
-    let key: String = sqlx::query_scalar(
-        "SELECT cursor_key FROM sync_devices WHERE account_id=$1 AND device_id=$2",
-    )
-    .bind(&b)
-    .bind("reader")
-    .fetch_one(&store.pool)
-    .await?;
+    let key = cursor_key(&store, &b, "reader").await?;
     let sign = |domain: &str, payload: &str| {
-        let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("key");
-        mac.update(format!("{domain}\n{b}\n6:reader\n{payload}").as_bytes());
-        let tag: String = mac
-            .finalize()
-            .into_bytes()
-            .iter()
-            .map(|x| format!("{x:02x}"))
-            .collect();
-        format!("{payload}.{tag}")
+        format!("{payload}.{}", tag(&key, domain, &b, "reader", payload))
     };
     let payload = token.rsplit_once('.').expect("mac").0;
+    // The MAC covers the plain position, so the test seals like the server rather than signing
+    // the sealed payload (adaptation of the pre-R1 `sign(v2, payload) == token` check).
+    let (header, position) = open(&key, &b, "reader", &token);
     assert_eq!(
-        sign("atlas-delta-v2", payload),
+        seal(&key, "atlas-delta-v2", &b, "reader", &header, position),
         token,
-        "the test signs like the server"
+        "the test seals like the server"
     );
     refused(sign("atlas-delta-v1", payload), "reader", b.clone(), T).await?;
+    refused(
+        seal(&key, "atlas-delta-v1", &b, "reader", &header, position),
+        "reader",
+        b.clone(),
+        T,
+    )
+    .await?;
     let d1 = first_d1(&token);
     refused(sign("atlas-delta-v2", &d1), "reader", b.clone(), T).await?;
     // A delta cursor signed in the continuation domain is not a delta cursor either.
@@ -1104,6 +1101,150 @@ async fn continuation_tokens_resist_tampering() -> Result<()> {
     refused(token, "reader", b, T + 1).await?;
     Ok(())
 }
+async fn cursor_key(store: &Store, actor: &str, device: &str) -> Result<String> {
+    Ok(sqlx::query_scalar(
+        "SELECT cursor_key FROM sync_devices WHERE account_id=$1 AND device_id=$2",
+    )
+    .bind(actor)
+    .bind(device)
+    .fetch_one(&store.pool)
+    .await?)
+}
+/// The server's MAC framing, written out independently.
+fn tag(key: &str, domain: &str, actor: &str, device: &str, payload: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes()).expect("key");
+    mac.update(format!("{domain}\n{actor}\n{}:{device}\n{payload}", device.len()).as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|x| format!("{x:02x}"))
+        .collect()
+}
+fn pad(key: &str, actor: &str, device: &str, tag_hex: &str) -> u32 {
+    let pad = tag(key, "atlas-delta-v2-siv", actor, device, tag_hex);
+    u32::from_str_radix(&pad[..8], 16).expect("hex")
+}
+/// A continuation with `header` (`d2.{boundary}.{expiry}.{revision}.{index}`) and the plain
+/// `position`, its MAC computed in `domain`.
+fn seal(key: &str, domain: &str, actor: &str, device: &str, header: &str, position: u32) -> String {
+    let mac = tag(
+        key,
+        domain,
+        actor,
+        device,
+        &format!("{header}.{position:08x}"),
+    );
+    format!(
+        "{header}.{:08x}.{mac}",
+        position ^ pad(key, actor, device, &mac)
+    )
+}
+/// The header and plain position of a server continuation; only the device key opens it.
+fn open(key: &str, actor: &str, device: &str, token: &str) -> (String, u32) {
+    let parts: Vec<_> = token.split('.').collect();
+    let sealed = u32::from_str_radix(parts[5], 16).expect("hex");
+    (
+        parts[..5].join("."),
+        sealed ^ pad(key, actor, device, parts[6]),
+    )
+}
+fn sealed(token: &str) -> u32 {
+    u32::from_str_radix(token.split('.').nth(5).expect("position"), 16).expect("hex")
+}
+
+/// R1 (review 28 October 2026, reviewer probe in `.agtx/evidence/q23/review-20261028`): two
+/// continuations of the same revision and index, from different bounds or from a repeat after
+/// a visibility change, must not reveal how their positions differ. Positions count notices the
+/// reader cannot see, so a shared pad would expose a field that was never sent through the XOR
+/// of the public fields. A healthy store and one with such a field return the same visible
+/// pages; the device key (test only) confirms the plain positions the comparison would expose.
+#[tokio::test]
+async fn continuations_do_not_compare() -> Result<()> {
+    let fixed = |n: u128| Uuid::from_u128(n).to_string();
+    let never_sent = fixed(350);
+    let mut visible = Vec::new();
+    for hidden in [false, true] {
+        let (_d, store) = fixture().await?;
+        let (a, b) = (account(&store).await?, account(&store).await?);
+        let person = fixed(1);
+        let fields: Vec<String> = (1..=12).map(|i| fixed(i * 100)).collect();
+        let mut commands = vec![Command::CreatePerson {
+            id: person.clone(),
+            name: "Segmented".into(),
+            initial_policy: Some(share(&b)),
+        }];
+        for f in fields.iter().chain(hidden.then_some(&never_sent)) {
+            commands.push(Command::CreateField {
+                id: f.clone(),
+                person_id: person.clone(),
+                label: "Shared".into(),
+                value: "Shared value".into(),
+                initial_policy: Some(share(&b)),
+            });
+        }
+        apply(&store, &a, &commands).await?;
+        revoke(&store, &a, &person, &b).await?;
+        let start = head(&store, &b, "reader", T).await?;
+        grant(&store, &a, &person, &b).await?;
+        if hidden {
+            // Between the third and fourth visible fields; hidden before any delta request.
+            revoke(&store, &a, &never_sent, &b).await?;
+        }
+        let key = cursor_key(&store, &b, "reader").await?;
+        let piece = |m: usize| {
+            let (store, b, start) = (store.clone(), b.clone(), start.clone());
+            async move {
+                store
+                    .sync_bounded(&b, "reader", Some(&start), 1, Some(m), T)
+                    .await
+            }
+        };
+        let (four, five) = (piece(4).await?, piece(5).await?);
+        // A repeat with the same bound after a delivered field is hidden: the window moves on.
+        revoke(&store, &a, &fields[1], &b).await?;
+        let repeat = piece(4).await?;
+        let pages = [&four, &five, &repeat];
+        let text = pages
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<String, _>>()?;
+        assert!(!text.contains(&never_sent), "never disclosed in a body");
+        let header = |p: &Page| open(&key, &b, "reader", &p.next_cursor).0;
+        assert!(
+            pages.iter().all(|p| header(p) == header(&four)),
+            "same boundary, expiry, revision and index"
+        );
+        // Person, then fields in id order; the hidden field shifts every later position by one.
+        let shift = u32::from(hidden);
+        let plain = [4 + shift, 5 + shift, 5 + shift];
+        for (x, y) in [(0, 1), (0, 2)] {
+            assert_ne!(
+                sealed(&pages[x].next_cursor) ^ sealed(&pages[y].next_cursor),
+                plain[x] ^ plain[y],
+                "the public fields cancel to the positions' XOR"
+            );
+        }
+        let opened: Vec<u32> = pages
+            .iter()
+            .map(|p| open(&key, &b, "reader", &p.next_cursor).1)
+            .collect();
+        assert_eq!(opened, plain, "the device key opens those positions");
+        visible.push(
+            pages
+                .iter()
+                .map(|p| {
+                    upserts(&p.batches[0].changes)
+                        .iter()
+                        .map(|r| r.id.clone())
+                        .collect()
+                })
+                .collect::<Vec<Vec<String>>>(),
+        );
+    }
+    assert_eq!(visible[0], visible[1], "the visible pages are identical");
+    Ok(())
+}
+
 /// The `d1` payload with the continuation's boundary and expiry.
 fn first_d1(token: &str) -> String {
     let parts: Vec<_> = token.split('.').collect();
@@ -1132,15 +1273,31 @@ impl Client {
             }
         }
     }
+    /// After each whole batch or activated revision, every parent is present (revision 1).
+    fn whole(&self) {
+        if let Some(orphan) = self.live.values().find(|p| {
+            p.parent_id
+                .as_ref()
+                .is_some_and(|parent| !self.live.contains_key(parent))
+        }) {
+            panic!("{} is applied without its parent", orphan.id);
+        }
+    }
     fn receive(&mut self, page: &Page) {
         for batch in &page.batches {
             match batch.segment {
-                None => self.apply(&batch.changes),
+                None => {
+                    self.apply(&batch.changes);
+                    if self.staging {
+                        self.whole();
+                    }
+                }
                 Some(segment) if self.staging => {
                     self.staged.extend(batch.changes.iter().cloned());
                     if segment.last {
                         let staged = std::mem::take(&mut self.staged);
                         self.apply(&staged);
+                        self.whole();
                     }
                 }
                 Some(segment) => {
@@ -1163,11 +1320,13 @@ enum Action {
     AddField,
     JoinHousehold,
     LeaveHousehold,
+    /// Merge the shared person into a private one of its owner, re-parenting its fields.
+    MergePerson,
 }
 
-/// F7, F9, I5, I8: writers commit between pieces; a staging client converges to a fresh
-/// snapshot, never receives a hidden undelivered resource, and the live-applying control
-/// exposes a partial revision.
+/// F7, F9, I5, I8: writers commit between pieces, including a person merge (revision 1); a
+/// staging client converges to a fresh snapshot, never receives a hidden undelivered resource,
+/// and the live-applying control exposes a partial revision.
 #[tokio::test]
 async fn concurrent_writers_converge() -> Result<()> {
     use Action::*;
@@ -1180,6 +1339,7 @@ async fn concurrent_writers_converge() -> Result<()> {
         &[(1, AddField), (3, EditDelivered)],
         &[(1, JoinHousehold)],
         &[(1, JoinHousehold), (2, LeaveHousehold)],
+        &[(1, MergePerson)],
         &[
             (0, RevokeUndelivered),
             (1, RevokeDelivered),
@@ -1240,6 +1400,7 @@ async fn converge(schedule: &[(usize, Action)]) -> Result<()> {
     grant(&store, &a, &person, &b).await?;
     let (mut cursor, mut live_cursor) = (start, live_start);
     let mut bodies = String::new();
+    let mut merged = None;
     let mut step = 0;
     loop {
         let page = store
@@ -1290,6 +1451,34 @@ async fn converge(schedule: &[(usize, Action)]) -> Result<()> {
                         .await
                         .map(drop)?
                 }
+                MergePerson => {
+                    let target = id();
+                    apply(
+                        &store,
+                        &a,
+                        &[Command::CreatePerson {
+                            id: target.clone(),
+                            name: "Private".into(),
+                            initial_policy: None,
+                        }],
+                    )
+                    .await?;
+                    let preview = store.merge_preview(&a, &person, &target).await?;
+                    store
+                        .people_command(
+                            &a,
+                            &id(),
+                            &PeopleCommand::Merge {
+                                source_id: person.clone(),
+                                target_id: target.clone(),
+                                preview_token: preview.token,
+                                name: "Merged".into(),
+                            },
+                            T + 1,
+                        )
+                        .await?;
+                    merged = Some(target);
+                }
             }
         }
         cursor = page.next_cursor.clone();
@@ -1315,6 +1504,18 @@ async fn converge(schedule: &[(usize, Action)]) -> Result<()> {
         "{schedule:?}: staged delivery converges"
     );
     assert!(staging.staged.is_empty());
+    if let Some(target) = merged {
+        // The merge is visible to the reader: its fields now hang under the target.
+        assert!(reference.live.contains_key(&target));
+        assert!(
+            reference
+                .live
+                .values()
+                .filter(|p| p.kind == "field")
+                .all(|p| p.parent_id.as_deref() == Some(target.as_str())),
+            "the merge re-parented the fields"
+        );
+    }
     assert!(
         live.partial,
         "{schedule:?}: applying pieces live exposes a partial revision"

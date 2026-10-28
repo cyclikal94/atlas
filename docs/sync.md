@@ -65,7 +65,8 @@ before them, even if an earlier piece carried them, and they count towards the b
 resource hidden before its slice is omitted; if it was sent earlier, this revision's removal
 pass or a later batch removes it. Nothing is disclosed about a resource the reader cannot
 see and was never sent: the continuation carries a position in the revision's notice list,
-masked so that it reveals neither a resource identifier nor how many notices were skipped.
+sealed under the device's cursor key so that neither one continuation nor a comparison of
+several reveals a resource identifier or how many notices were skipped.
 
 After a non-final piece, `next_cursor` is a continuation and `has_more` is `true`. After the
 last piece it is an ordinary delta cursor at that revision, and `has_more` reports later
