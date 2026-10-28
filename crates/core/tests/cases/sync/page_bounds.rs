@@ -346,6 +346,64 @@ async fn snapshot_pages(store: Store) -> Result<()> {
     Ok(())
 }
 
+/// PB6: exactly `limit` pending fills one page that reports no more, in both phases.
+async fn exact_ceiling(store: Store) -> Result<()> {
+    let contract = contract()?;
+    let owner = account(&store).await?;
+    let person = create_person(&store, &owner).await?;
+    let start = store.sync(&owner, "exact", None, CEILING, 1000).await?;
+    assert!(!start.has_more && start.next_cursor.starts_with("d1."));
+    let published = publish(&store, &owner, &person, CEILING as i64).await?;
+    let page = store
+        .sync(&owner, "exact", Some(&start.next_cursor), CEILING, 1001)
+        .await?;
+    within_contract(&contract, &page);
+    assert_eq!(page.phase, "delta");
+    assert_eq!(page.batches.len(), CEILING);
+    assert!(
+        !page.has_more,
+        "exactly limit pending batches is the last page"
+    );
+    let revisions: Vec<i64> = page.batches.iter().map(|b| b.revision).collect();
+    assert_eq!(revisions, published);
+    let after = store
+        .sync(&owner, "exact", Some(&page.next_cursor), CEILING, 1002)
+        .await?;
+    assert!(after.batches.is_empty() && !after.has_more);
+
+    // A snapshot of exactly `limit` resources: a new account, filled up to the ceiling.
+    let owner = account(&store).await?;
+    let baseline = store.sync(&owner, "baseline", None, CEILING, 1000).await?;
+    let existing = ids(&baseline).count();
+    assert!(existing < CEILING);
+    let mut remaining = CEILING - existing;
+    while remaining > 0 {
+        let commands: Vec<Command> = (0..remaining.min(20))
+            .map(|_| Command::CreatePerson {
+                id: id(),
+                name: "Exact".into(),
+                initial_policy: None,
+            })
+            .collect();
+        remaining -= commands.len();
+        store.apply(&owner, &id(), &commands).await?;
+    }
+    let page = store.sync(&owner, "exact", None, CEILING, 1001).await?;
+    within_contract(&contract, &page);
+    assert_eq!(page.phase, "snapshot");
+    assert_eq!(page.batches.len(), 1);
+    assert_eq!(page.batches[0].changes.len(), CEILING);
+    assert!(!page.has_more, "exactly limit resources is the last page");
+    assert!(page.next_cursor.starts_with("d1."));
+    Ok(())
+}
+
+#[tokio::test]
+async fn exactly_limit_pending_is_the_last_page() -> Result<()> {
+    let (_dir, store) = local().await?;
+    exact_ceiling(store).await
+}
+
 fn ids(page: &Page) -> impl Iterator<Item = String> + '_ {
     page.batches
         .iter()

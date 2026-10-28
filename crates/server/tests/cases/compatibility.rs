@@ -730,7 +730,8 @@ async fn command_batch_probes() -> Result<Value> {
     Ok(Value::Object(results))
 }
 
-/// BE-B1: `/sync` page counts at the `limit` ceiling and default, and the rejected bounds. Records
+/// BE-B1: `/sync` page counts at the `limit` ceiling and default, and the rejected values: out of
+/// range (`422 invalid_value`) and not parseable as a whole number (`400 malformed_request`). Records
 /// only status, code, batch count and `has_more`, never cursors, revisions or IDs.
 async fn sync_page_bounds_probes() -> Result<Value> {
     use crate::support::http::request;
@@ -840,6 +841,12 @@ async fn sync_page_bounds_probes() -> Result<Value> {
             "{}",
             rejected.2
         );
+        results.insert(name.into(), shape(&rejected));
+    }
+    // A `limit` that does not parse as a whole number fails before the range check.
+    for (name, limit) in [("negative", "-1"), ("too_large", "18446744073709551616")] {
+        let rejected = get(format!("sync?limit={limit}"), auth[0].clone()).await;
+        assert_eq!(rejected.0, StatusCode::BAD_REQUEST, "{}", rejected.2);
         results.insert(name.into(), shape(&rejected));
     }
     store.pool.close().await;

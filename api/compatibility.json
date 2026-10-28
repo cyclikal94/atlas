@@ -1,6 +1,6 @@
 {
   "api_version": "0.30.0",
-  "contract_sha256": "9cadef17e7bad98358d0155df49c31fbd4e2e8c6f462492ead76a34137f5c691",
+  "contract_sha256": "9c5aef6e55d4c49285abcf0ea00c5de976a19e9595f9a2739811b61e6e2f4732",
   "behaviour": {
     "activation": {
       "activate": {
@@ -1286,11 +1286,23 @@
         "has_more": false,
         "status": 200
       },
+      "negative": {
+        "batches": null,
+        "code": "malformed_request",
+        "has_more": null,
+        "status": 400
+      },
       "over_ceiling": {
         "batches": null,
         "code": "invalid_value",
         "has_more": null,
         "status": 422
+      },
+      "too_large": {
+        "batches": null,
+        "code": "malformed_request",
+        "has_more": null,
+        "status": 400
       },
       "zero": {
         "batches": null,

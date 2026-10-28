@@ -492,6 +492,11 @@ async fn sync_limit_ceiling_default_and_rejections_over_http() -> Result<()> {
             "invalid_value",
         ),
         ("limit=-1", StatusCode::BAD_REQUEST, "malformed_request"),
+        (
+            "limit=18446744073709551616",
+            StatusCode::BAD_REQUEST,
+            "malformed_request",
+        ),
         ("limit=abc", StatusCode::BAD_REQUEST, "malformed_request"),
         ("limit=", StatusCode::BAD_REQUEST, "malformed_request"),
         (

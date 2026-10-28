@@ -1072,7 +1072,7 @@
               "minimum": 1,
               "maximum": 200,
               "default": 50,
-              "description": "Snapshot phase: resources per page. Delta phase: publication batches per page. Values outside 1 to 200 return 422 invalid_value."
+              "description": "Snapshot phase: resources per page. Delta phase: publication batches per page. A whole number outside 1 to 200 returns 422 invalid_value. A value that is not a whole number the server can parse (for example -1, abc, an empty value or an integer too large to parse), or a repeated limit parameter, returns 400 malformed_request."
             }
           }
         ]

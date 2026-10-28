@@ -43,8 +43,11 @@ retention and privacy obligations are covered by [domain tests](testing.md).
 ## Page size and limit
 
 `limit` counts resources on a snapshot page and publication batches on a delta page. It
-accepts 1 to 200 and defaults to 50; any other value is `422 invalid_value`, returned before
-any snapshot, cursor or device registration is written. A snapshot page holds exactly one
+accepts 1 to 200 and defaults to 50. The query string is parsed first: a value that is not a
+whole number the server can parse (`-1`, `abc`, an empty value or an integer too large to
+parse) or a repeated `limit` is `400 malformed_request`. A whole number outside 1 to 200,
+such as `0` or `201`, is `422 invalid_value`. Both are returned before any snapshot, cursor
+or device registration is written. A snapshot page holds exactly one
 batch of at most `limit` resources. A delta page holds at most `limit` whole publication
 batches in revision order: `limit` never splits a batch. Follow `next_cursor` while
 `has_more` is true to reach every pending batch.

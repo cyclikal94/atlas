@@ -163,7 +163,9 @@ and must not probe `GET /policies/{id}` for people it does not own. See
 (BE-B1). `SyncPage.batches.maxItems` rises from 80 to 200, the `limit` maximum, so a
 delta page requested at the ceiling is valid against the contract. It is a MINOR advance
 because an existing response schema changes, but no response does: every request accepted
-before returns the same page, and `limit` outside 1 to 200 is still `422 invalid_value`.
+before returns the same page, and every rejected `limit` keeps its answer: a whole number
+outside 1 to 200 is `422 invalid_value`, and a value that does not parse as one (such as
+`-1`) or a repeated `limit` is `400 malformed_request`.
 The `limit` parameter and the `readSync` description now state its unit in each phase. No
 schema (database) change is needed. See [sync](sync.md#page-size-and-limit). The
 compatibility baseline gains a `sync_page_bounds` probe group.
