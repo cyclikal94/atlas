@@ -1,0 +1,38 @@
+name: Test
+
+on:
+  - push
+  - pull_request
+
+jobs:
+  linux:
+    strategy:
+      matrix:
+        toolchain:
+          - "1.80"
+          - "stable"
+          - "beta"
+          - "nightly"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - run: cargo build --manifest-path examples/simple-send/Cargo.toml
+      - run: cargo test --no-default-features
+      - run: cargo doc --no-default-features
+      - run: cargo test --no-default-features --features isahc-client
+      - run: cargo doc --no-default-features --features isahc-client
+      - run: cargo test --no-default-features --features hyper-client
+      - run: cargo doc --no-default-features --features hyper-client
+      - run: cargo test --no-default-features --features isahc-client,hyper-client
+      - run: cargo doc --no-default-features --features isahc-client,hyper-client
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: vcpkg integrate install
+      - run: vcpkg install openssl:x64-windows-static-md
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test

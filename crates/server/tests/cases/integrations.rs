@@ -1158,3 +1158,236 @@ async fn worker_without_a_public_origin_sends_the_legacy_payload() -> Result<()>
     server.abort();
     Ok(())
 }
+
+/// The `t` (JWT) and `k` (public key) parameters of a `vapid t=..., k=...` header.
+fn vapid_header(headers: &HeaderMap) -> Result<(String, String)> {
+    let value = headers["authorization"].to_str()?;
+    let params = value.strip_prefix("vapid ").expect("a VAPID authorization");
+    let mut t = None;
+    let mut k = None;
+    for part in params.split(',').map(str::trim) {
+        match part.split_once('=') {
+            Some(("t", v)) => t = Some(v.to_owned()),
+            Some(("k", v)) => k = Some(v.to_owned()),
+            _ => panic!("unexpected VAPID parameter {part:?}"),
+        }
+    }
+    Ok((t.unwrap(), k.unwrap()))
+}
+
+/// BE-Q23 dependency compatibility: the VAPID JWT Atlas sends through the vendored web-push on
+/// jwt-simple 0.15 verifies under ring's independent ES256 verifier with the advertised public key;
+/// that key is the configured private key's own (ring checks the pair); and the header and claim
+/// set are unchanged: ES256 JWT with `aud` (push service), `exp` (12 hours) and `sub` (the contact).
+#[tokio::test]
+async fn vapid_jwt_verifies_independently_with_the_configured_key() -> Result<()> {
+    use ring::{
+        rand::SystemRandom,
+        signature::{
+            ECDSA_P256_SHA256_FIXED, ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair,
+            UnparsedPublicKey,
+        },
+    };
+    let received = Received::default();
+    let router = Router::new()
+        .route("/push", post(capture))
+        .with_state(received.clone());
+    let (origin, server) = serve(router).await?;
+    let config = push_config(&origin)?;
+    let advertised = config.capabilities()?["vapid_public_key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let public = URL_SAFE_NO_PAD.decode(&advertised)?;
+    assert_eq!(public.len(), 65);
+    let rng = SystemRandom::new();
+    assert!(
+        EcdsaKeyPair::from_private_key_and_public_key(
+            &ECDSA_P256_SHA256_FIXED_SIGNING,
+            &[1_u8; 32],
+            &public,
+            &rng
+        )
+        .is_ok(),
+        "the advertised key must be the configured private key's public key"
+    );
+    // The oracle refuses a mismatched pair, so the check above is meaningful.
+    let other = IntegrationConfig::new(
+        Some(&"01".repeat(32)),
+        vec![origin.clone()],
+        Some(URL_SAFE_NO_PAD.encode([2_u8; 32])),
+        Some("mailto:test@example.invalid".into()),
+    )?
+    .capabilities()?["vapid_public_key"]
+        .as_str()
+        .map(|k| URL_SAFE_NO_PAD.decode(k))
+        .unwrap()?;
+    assert_ne!(other, public);
+    assert!(
+        EcdsaKeyPair::from_private_key_and_public_key(
+            &ECDSA_P256_SHA256_FIXED_SIGNING,
+            &[1_u8; 32],
+            &other,
+            &rng
+        )
+        .is_err()
+    );
+
+    let (device, decrypt) = web_push_device(format!("{origin}/push"))?;
+    let n = notification();
+    let before = atlas_server::now();
+    assert_eq!(
+        config.deliver(&device, &n, i64::MAX, None).await?,
+        (true, false)
+    );
+    assert_eq!(
+        config.deliver(&device, &n, i64::MAX, None).await?,
+        (true, false)
+    );
+    let after = atlas_server::now();
+    let messages = received.lock().await;
+    assert_eq!(messages.len(), 2);
+    let mut tokens = Vec::new();
+    for (headers, body) in messages.iter() {
+        let (jwt, k) = vapid_header(headers)?;
+        assert_eq!(k, advertised);
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3, "{jwt}");
+        let header: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0])?)?;
+        assert_eq!(header, json!({"typ":"JWT","alg":"ES256"}));
+        let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1])?)?;
+        let mut names: Vec<&str> = claims
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["aud", "exp", "iat", "nbf", "sub"], "{claims}");
+        // web-push 0.11.0 (unchanged signer code) builds `aud` from scheme and host only, so the
+        // loopback port is dropped; real push services use the default port.
+        let endpoint = Url::parse(&origin)?;
+        assert_eq!(
+            claims["aud"],
+            json!(format!(
+                "{}://{}",
+                endpoint.scheme(),
+                endpoint.host_str().unwrap()
+            ))
+        );
+        assert_eq!(claims["sub"], json!("mailto:test@example.invalid"));
+        let exp = claims["exp"].as_i64().unwrap();
+        assert!(
+            (before + 12 * 3600..=after + 12 * 3600).contains(&exp),
+            "{claims}"
+        );
+        let signature = URL_SAFE_NO_PAD.decode(parts[2])?;
+        assert_eq!(signature.len(), 64);
+        let signed = format!("{}.{}", parts[0], parts[1]);
+        let verifier = UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, &public);
+        assert!(verifier.verify(signed.as_bytes(), &signature).is_ok());
+        let mut tampered = signed.clone().into_bytes();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        assert!(verifier.verify(&tampered, &signature).is_err());
+        assert!(
+            UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, &other)
+                .verify(signed.as_bytes(), &signature)
+                .is_err()
+        );
+        assert_eq!(decrypt(body)?, serde_json::to_vec(&n)?);
+        tokens.push(jwt);
+    }
+    assert_ne!(tokens[0], tokens[1], "ECDSA signatures are randomised");
+    drop(messages);
+    server.abort();
+    Ok(())
+}
+
+/// BE-Q23 dependency compatibility: a VAPID private key that is not a usable P-256 scalar is refused
+/// as configuration, never accepted or panicking; the valid control is accepted.
+#[test]
+fn invalid_vapid_keys_are_refused() -> Result<()> {
+    let config = |vapid: String| {
+        std::panic::catch_unwind(|| {
+            IntegrationConfig::new(
+                Some(&"01".repeat(32)),
+                vec![],
+                Some(vapid),
+                Some("mailto:test@example.invalid".into()),
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+        .map_err(|_| "panicked")
+    };
+    assert_eq!(config(URL_SAFE_NO_PAD.encode([1_u8; 32])), Ok(Ok(())));
+    // The P-256 group order n, which is not a valid scalar.
+    let order = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551";
+    let order: Vec<u8> = (0..32)
+        .map(|i| u8::from_str_radix(&order[2 * i..2 * i + 2], 16).unwrap())
+        .collect();
+    for (label, vapid) in [
+        ("zero", URL_SAFE_NO_PAD.encode([0_u8; 32])),
+        ("group order", URL_SAFE_NO_PAD.encode(&order)),
+        ("all ones", URL_SAFE_NO_PAD.encode([0xff_u8; 32])),
+        ("short", URL_SAFE_NO_PAD.encode([1_u8; 31])),
+        ("long", URL_SAFE_NO_PAD.encode([1_u8; 33])),
+        ("empty", String::new()),
+        ("not base64", "not base64!".into()),
+    ] {
+        assert_eq!(
+            config(vapid),
+            Ok(Err("invalid VAPID key".into())),
+            "{label}"
+        );
+    }
+    Ok(())
+}
+
+/// BE-Q23 dependency compatibility: web-push's own limits are unchanged — a 3052-byte payload
+/// encrypts and decrypts with the subscription's keys, 3053 bytes is too large, a topic is at most
+/// 32 URL-safe base64 characters, and the TTL is carried as set.
+#[test]
+fn web_push_message_limits_are_retained() -> Result<()> {
+    let (device, decrypt) = web_push_device("https://push.example/endpoint".into())?;
+    let Subscription::WebPush {
+        endpoint,
+        p256dh,
+        auth,
+    } = &device
+    else {
+        unreachable!()
+    };
+    let info = web_push::SubscriptionInfo::new(endpoint, p256dh, auth);
+    let build = |payload: &[u8], topic: Option<&str>| {
+        let mut builder = web_push::WebPushMessageBuilder::new(&info);
+        builder.set_payload(web_push::ContentEncoding::Aes128Gcm, payload);
+        builder.set_ttl(60);
+        if let Some(topic) = topic {
+            builder.set_topic(topic.into());
+        }
+        builder.build()
+    };
+    let largest = vec![b'a'; 3052];
+    let message = build(&largest, Some(&"A".repeat(32)))?;
+    assert_eq!(message.ttl, 60);
+    assert_eq!(message.topic.as_deref(), Some("A".repeat(32).as_str()));
+    let payload = message.payload.unwrap();
+    assert_eq!(payload.content_encoding.to_str(), "aes128gcm");
+    assert_eq!(decrypt(&payload.content)?, largest);
+    assert!(matches!(
+        build(&[b'a'; 3053], None),
+        Err(web_push::WebPushError::PayloadTooLarge)
+    ));
+    for topic in ["A".repeat(33), "not a topic".into(), "plus+".into()] {
+        assert!(
+            matches!(
+                build(b"x", Some(&topic)),
+                Err(web_push::WebPushError::InvalidTopic)
+            ),
+            "{topic:?}"
+        );
+    }
+    Ok(())
+}

@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/core", "crates/server"]
+exclude = ["vendor"]
 resolver = "3"
 
 [workspace.dependencies]
@@ -28,3 +29,7 @@ tower = { version = "0.5" }
 url = { version = "2" }
 uuid = { version = "1" }
 web-push = { version = "=0.11.0", default-features = false }
+
+[patch.crates-io]
+openidconnect = { path = "vendor/openidconnect" }
+web-push = { path = "vendor/web-push" }
