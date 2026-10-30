@@ -130,17 +130,35 @@ the previous commit at the same path.
 ```text
 cargo build --locked -p atlas-server --features sync-diagnostic --bin atlas-sync-diagnostic \
   --target-dir target/sync-diagnostic
-atlas-sync-diagnostic --fixture-dir NEW_ABSOLUTE_DIR --attempt ID --bind 127.0.0.1:0
+atlas-sync-diagnostic --fixture-dir NEW_ABSOLUTE_DIR --attempt ID --bind 127.0.0.1:0 \
+  --public-origin ORIGIN
 ```
 
-It refuses any inherited `ATLAS_*` variable, a non-loopback or non-literal bind address and an
-existing or relative fixture path. It creates the directory (mode 0700), an empty SQLite file and
-`receipt.json` (attempt, process, directory and database file identities, executable SHA-256,
-features, API version, sync start, retention), prints `ready` with that receipt, then serves the
-normal router. Retention is the production default of 90 days. There is no periodic maintenance
-or integration worker, no HTTP control route and no way to open another database. The sync time
-starts at the system time; authentication, publication timestamps and every other route keep the
-system clock.
+`--public-origin` is required. It configures the normal browser-session composition exactly as
+`ATLAS_PUBLIC_ORIGIN` does for the normal server, with the same validation: browser grants,
+activation (the only route that sets the cookie), `/browser-sessions/current`, cookie names and
+flags, and the Origin and CSRF checks are unchanged. Give the origin the client is actually served
+from (a pair runner's preview origin such as `http://127.0.0.1:PREVIEW_PORT`), not the fixture's
+bind address. It refuses any inherited `ATLAS_*` variable, a non-loopback or non-literal bind
+address, an invalid origin and an existing or relative fixture path. It creates the directory
+(mode 0700), an empty SQLite file and `receipt.json` (schema 2: attempt, process, directory and
+database file identities, executable SHA-256, features, API version, address, canonical public
+origin, sync start, retention), prints `ready` with that receipt, then serves the normal router.
+Retention is the production default of 90 days. There is no periodic maintenance or integration
+worker, no HTTP control route and no way to open another database. The sync time starts at the
+system time; authentication, publication timestamps and every other route keep the system clock.
+
+Every HTTP request and every command is admitted only while the directory, database file and
+receipt are still the ones the fixture created (by file identity and receipt digest, refusing
+symbolic links). A request is checked on arrival and again once it holds the gate; a command
+before it waits for the gate, once it holds it and, for `age_history`, once it holds the SQLite
+write lock. The first loss is terminal: restoring the files does not revive the attempt. A refused
+request is answered `503 {"code":"diagnostic_fixture_unavailable"}` before any extractor,
+authentication or handler runs, and stops the attempt even while stdin is idle (`ownership_lost`,
+then `stopped` with no cleanup). A request admitted before the loss may complete; its effects are
+not attributed to the attempt. Nothing is answered as an owned success once ownership is lost:
+the answer is `ok: false` with `ownership_lost: true`, no result and the command's `effect`.
+Admission phases are logged to stderr as `diagnostic_http` and `diagnostic_control` events.
 
 Commands are JSON lines on stdin, `{"attempt", "seq", "op", "args"}`, with `seq` counting from 1;
 each accepted command is answered on stdout. A wrong attempt, stale or skipped `seq`, unknown
@@ -151,14 +169,23 @@ payload digests, devices with key digests, sessions, receipt and resource digest
 revision and payload SHA-256, back-dated no further than `sync_now - retention`);
 `advance_clock` (forward only, at most twice the retention past the start); `collect` (the real
 `Store::collect_expired` at a time between the start and `sync_now`, answered with the states
-before and after and the removed batches; on failure it reports the partial outcome); and
-`shutdown` (`remove: true` deletes only the files the fixture created, then the directory if it
-is empty). The first `advance_clock` or `collect` ends setup. Each takes the sync gate
-exclusively, so it waits for in-flight `/sync` requests (at most 10 seconds) and holds new ones
-back. Every sync-time read is logged to stderr as `diagnostic_sync_time`.
+before and after and the removed batches; on failure it reports both states as `partial`, with
+`after: null` and `after_error` if the state after it cannot be read); and `shutdown`
+(`remove: true` deletes only the files the fixture created, then the directory if it is empty,
+and never after a loss). The first `advance_clock` or `collect` ends setup. Every command except
+`shutdown` takes the gate exclusively, so it waits for every in-flight HTTP request, not only
+`/sync` (at most 10 seconds), and holds new ones back; a clock acknowledgement therefore means
+earlier admitted requests used the old time and later ones use the new. Every answer carries
+`effect`: `none`, `applied`, `partial` (the collector failed after possibly committing earlier
+units; compare the states) or `unknown`. Every sync-time read is logged to stderr as
+`diagnostic_sync_time`.
 
-`crates/server/tests/sync_diagnostic.rs` drives the executable through this protocol: X0, X2
-with a separate unpruned account and the refusal and ownership cases. Run it with `cargo test
+`crates/server/tests/sync_diagnostic.rs` drives the executable through this protocol: X0 and X2
+(with a separate unpruned account) through both bearer and browser-cookie sessions, the browser
+composition and its refusals, launch and command refusals, HTTP and command ownership admission
+(including after waits and terminal loss), the quiescent boundaries and a partial collector
+outcome. Its schedules are ordered by the logged admission phases and by holding the fixture
+database's SQLite write lock, never by sleeps. Run it with `cargo test
 -p atlas-server --features sync-diagnostic --test sync_diagnostic`. `SYNC_DIAGNOSTIC_BIN` selects a
 separately built executable (the Cargo-built one also has `test-hooks` through the dev
 self-dependency), and `SYNC_DIAGNOSTIC_EVIDENCE=DIR` records every control line and HTTP exchange.

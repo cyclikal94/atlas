@@ -2,23 +2,24 @@
 //!
 //! The fixture executable creates one [`SyncTime`] and installs it for its process. `/sync` then
 //! reads its time from it, through the existing [`atlas_core::devices::Clock`] interface of
-//! `Store::sync_bounded`; nothing else does. The executable also wraps its router in [`gate`]. A normal build compiles none of this, and a
-//! diagnostic-feature process that installs no time (such as the crate's own tests) keeps the
-//! system clock.
+//! `Store::sync_bounded`; nothing else does. The executable's admission layer holds
+//! [`SyncTime::shared`] for every HTTP request, and its owner's commands hold
+//! [`SyncTime::exclusive`]. A normal build compiles none of this, and a diagnostic-feature process
+//! that installs no time (such as the crate's own tests) keeps the system clock.
 use anyhow::{Result, anyhow};
-use axum::{extract::Request, middleware::Next, response::Response};
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicI64, Ordering},
 };
-use tokio::sync::{OwnedRwLockWriteGuard, RwLock};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 
 static INSTALLED: OnceLock<Arc<SyncTime>> = OnceLock::new();
 
 pub struct SyncTime {
     now: AtomicI64,
-    /// Held shared by every `/sync` request for its whole duration and exclusively by the owner
-    /// while it moves time or collects, so those happen at an acknowledged quiescent boundary.
+    /// Held shared by every HTTP request for its whole duration and exclusively by the owner
+    /// while it inspects, sets up, moves time or collects, so each of those happens at an
+    /// acknowledged quiescent boundary.
     gate: Arc<RwLock<()>>,
 }
 
@@ -39,7 +40,12 @@ impl SyncTime {
         self.now.store(time, Ordering::SeqCst);
     }
 
-    /// Waits for in-flight `/sync` requests and holds new ones back until the guard drops.
+    /// Held by one HTTP request; waits while the owner holds the gate exclusively.
+    pub async fn shared(&self) -> OwnedRwLockReadGuard<()> {
+        self.gate.clone().read_owned().await
+    }
+
+    /// Waits for in-flight HTTP requests and holds new ones back until the guard drops.
     pub async fn exclusive(&self) -> OwnedRwLockWriteGuard<()> {
         self.gate.clone().write_owned().await
     }
@@ -66,18 +72,4 @@ pub(crate) fn sync_now() -> i64 {
         }
         None => crate::now(),
     }
-}
-
-/// The fixture's outermost layer: each `/sync` request holds the gate shared for its whole
-/// duration, so the owner's exclusive hold is a quiescent boundary.
-pub async fn gate(request: Request, next: Next) -> Response {
-    let held = match INSTALLED.get() {
-        Some(time) if request.uri().path() == "/api/experimental/v1/sync" => {
-            Some(time.gate.clone().read_owned().await)
-        }
-        _ => None,
-    };
-    let response = next.run(request).await;
-    drop(held);
-    response
 }
