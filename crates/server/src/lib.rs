@@ -501,3 +501,6 @@ mod auth_capacity_tests {
     }
 }
 pub mod config;
+// Last, so that a normal build's source positions are unchanged (BE-Q23 R3).
+#[cfg(feature = "sync-diagnostic")]
+pub mod diagnostic;

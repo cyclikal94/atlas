@@ -91,3 +91,11 @@ pub(crate) async fn sync(
             .await?,
     ))
 }
+
+/// BE-Q23 R3: a diagnostic build's `/sync` time. This item shadows the glob-imported system clock
+/// in this module, whose only reader is `sync` above. It comes last so that a normal build's
+/// source positions are unchanged.
+#[cfg(feature = "sync-diagnostic")]
+fn now() -> i64 {
+    diagnostic::sync_now()
+}

@@ -117,6 +117,54 @@ of a database holding up to a million timer rows. Record the
 revision, database, architecture, workload and resource limits when reporting capacity;
 results from a different implementation do not establish current throughput.
 
+## Sync diagnostic fixture (BE-Q23 R3)
+
+`atlas-sync-diagnostic` is a separately named executable for real continuation expiry (X0) and
+real pruning (X2) evidence over HTTP. It is built only with the non-default `sync-diagnostic`
+feature (`required-features`), so `cargo build -p atlas-server` and the release and image builds
+never produce it, and a normal build compiles neither it nor `crates/server/src/diagnostic.rs`.
+Its only edit to normal source is an item appended to `resource_routes.rs` that, in a diagnostic
+build, shadows the system clock for `/sync`; a normal debug build is byte-identical to one from
+the previous commit at the same path.
+
+```text
+cargo build --locked -p atlas-server --features sync-diagnostic --bin atlas-sync-diagnostic \
+  --target-dir target/sync-diagnostic
+atlas-sync-diagnostic --fixture-dir NEW_ABSOLUTE_DIR --attempt ID --bind 127.0.0.1:0
+```
+
+It refuses any inherited `ATLAS_*` variable, a non-loopback or non-literal bind address and an
+existing or relative fixture path. It creates the directory (mode 0700), an empty SQLite file and
+`receipt.json` (attempt, process, directory and database file identities, executable SHA-256,
+features, API version, sync start, retention), prints `ready` with that receipt, then serves the
+normal router. Retention is the production default of 90 days. There is no periodic maintenance
+or integration worker, no HTTP control route and no way to open another database. The sync time
+starts at the system time; authentication, publication timestamps and every other route keep the
+system clock.
+
+Commands are JSON lines on stdin, `{"attempt", "seq", "op", "args"}`, with `seq` counting from 1;
+each accepted command is answered on stdout. A wrong attempt, stale or skipped `seq`, unknown
+member or malformed line is `rejected` and consumes nothing. A line over 8 KiB, EOF, or a replaced
+directory, database or receipt stops the attempt. Operations: `inspect` (floors, batches with
+payload digests, devices with key digests, sessions, receipt and resource digests);
+`add_account` (setup only); `age_history` (setup only, once: at most 16 batches named by account,
+revision and payload SHA-256, back-dated no further than `sync_now - retention`);
+`advance_clock` (forward only, at most twice the retention past the start); `collect` (the real
+`Store::collect_expired` at a time between the start and `sync_now`, answered with the states
+before and after and the removed batches; on failure it reports the partial outcome); and
+`shutdown` (`remove: true` deletes only the files the fixture created, then the directory if it
+is empty). The first `advance_clock` or `collect` ends setup. Each takes the sync gate
+exclusively, so it waits for in-flight `/sync` requests (at most 10 seconds) and holds new ones
+back. Every sync-time read is logged to stderr as `diagnostic_sync_time`.
+
+`crates/server/tests/sync_diagnostic.rs` drives the executable through this protocol: X0, X2
+with a separate unpruned account and the refusal and ownership cases. Run it with `cargo test
+-p atlas-server --features sync-diagnostic --test sync_diagnostic`. `SYNC_DIAGNOSTIC_BIN` selects a
+separately built executable (the Cargo-built one also has `test-hooks` through the dev
+self-dependency), and `SYNC_DIAGNOSTIC_EVIDENCE=DIR` records every control line and HTTP exchange.
+Using a diagnostic build for browser pairing needs its own reviewed provenance and approval;
+these backend results are not browser recovery evidence.
+
 ## Deployment and recovery checks
 
 After building the server, `python3 scripts/test_recovery.py` (with
