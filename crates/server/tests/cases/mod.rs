@@ -3,6 +3,7 @@ mod browser;
 mod calendars;
 mod commands;
 mod compatibility;
+mod dependency_graph;
 mod devices;
 mod integrations;
 mod labels;

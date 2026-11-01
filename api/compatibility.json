@@ -1,6 +1,6 @@
 {
-  "api_version": "0.29.0",
-  "contract_sha256": "369ca0de5ab0cd5983252b55d4a546263819c236fa285a386b0dd374bf82b6e0",
+  "api_version": "0.29.1",
+  "contract_sha256": "4174bccbe556238a0ef707b0de495ea5fe719897db174dcab3dabcc5de1660ec",
   "behaviour": {
     "activation": {
       "activate": {
@@ -176,6 +176,544 @@
         "outcome": null,
         "set_cookie": false,
         "status": 401
+      }
+    },
+    "dependency_graph": {
+      "chain_and_shared_prerequisite": {
+        "body": {
+          "coverage": "complete",
+          "direct_prerequisites": [
+            "a7d82053-d5f8-5732-98c7-b0263ae73c8d",
+            "c0314199-b728-5b77-bcb3-24f795195996"
+          ],
+          "edges": [
+            {
+              "dependant_id": "3e4cfcc1-5d17-5bdf-8409-febbd36bd9fb",
+              "prerequisite_id": "a7d82053-d5f8-5732-98c7-b0263ae73c8d"
+            },
+            {
+              "dependant_id": "3e4cfcc1-5d17-5bdf-8409-febbd36bd9fb",
+              "prerequisite_id": "c0314199-b728-5b77-bcb3-24f795195996"
+            },
+            {
+              "dependant_id": "a7d82053-d5f8-5732-98c7-b0263ae73c8d",
+              "prerequisite_id": "c8d7ec10-30a5-5d72-9acf-b0566e752fa8"
+            },
+            {
+              "dependant_id": "c0314199-b728-5b77-bcb3-24f795195996",
+              "prerequisite_id": "c8d7ec10-30a5-5d72-9acf-b0566e752fa8"
+            },
+            {
+              "dependant_id": "c8d7ec10-30a5-5d72-9acf-b0566e752fa8",
+              "prerequisite_id": "e209972a-eba9-5c2d-bb7d-2574a971f9f5"
+            }
+          ],
+          "max_depth": 200,
+          "nodes": [
+            {
+              "can_edit": true,
+              "dependency_state": "waiting",
+              "depth": 0,
+              "occurrence_id": "3e4cfcc1-5d17-5bdf-8409-febbd36bd9fb",
+              "outcome": "unknown",
+              "prerequisites": "expanded",
+              "relation": "root",
+              "restricted_prerequisites": false,
+              "slot": {
+                "date": null,
+                "instant": null,
+                "intended_time": null,
+                "key": "once",
+                "timezone": "Europe/London"
+              },
+              "strict": false,
+              "task_id": "00000000-0000-4000-8000-0000000d0005",
+              "version": 2
+            },
+            {
+              "can_edit": true,
+              "dependency_state": "waiting",
+              "depth": 1,
+              "occurrence_id": "a7d82053-d5f8-5732-98c7-b0263ae73c8d",
+              "outcome": "unknown",
+              "prerequisites": "expanded",
+              "relation": "direct",
+              "restricted_prerequisites": false,
+              "slot": {
+                "date": null,
+                "instant": null,
+                "intended_time": null,
+                "key": "once",
+                "timezone": "Europe/London"
+              },
+              "strict": false,
+              "task_id": "00000000-0000-4000-8000-0000000d0003",
+              "version": 2
+            },
+            {
+              "can_edit": true,
+              "dependency_state": "waiting",
+              "depth": 1,
+              "occurrence_id": "c0314199-b728-5b77-bcb3-24f795195996",
+              "outcome": "unknown",
+              "prerequisites": "expanded",
+              "relation": "direct",
+              "restricted_prerequisites": false,
+              "slot": {
+                "date": null,
+                "instant": null,
+                "intended_time": null,
+                "key": "once",
+                "timezone": "Europe/London"
+              },
+              "strict": false,
+              "task_id": "00000000-0000-4000-8000-0000000d0004",
+              "version": 2
+            },
+            {
+              "can_edit": true,
+              "dependency_state": "waiting",
+              "depth": 2,
+              "occurrence_id": "c8d7ec10-30a5-5d72-9acf-b0566e752fa8",
+              "outcome": "unknown",
+              "prerequisites": "expanded",
+              "relation": "transitive",
+              "restricted_prerequisites": false,
+              "slot": {
+                "date": null,
+                "instant": null,
+                "intended_time": null,
+                "key": "once",
+                "timezone": "Europe/London"
+              },
+              "strict": false,
+              "task_id": "00000000-0000-4000-8000-0000000d0002",
+              "version": 2
+            },
+            {
+              "can_edit": true,
+              "dependency_state": "ready",
+              "depth": 3,
+              "occurrence_id": "e209972a-eba9-5c2d-bb7d-2574a971f9f5",
+              "outcome": "unknown",
+              "prerequisites": "expanded",
+              "relation": "transitive",
+              "restricted_prerequisites": false,
+              "slot": {
+                "date": null,
+                "instant": null,
+                "intended_time": null,
+                "key": "once",
+                "timezone": "Europe/London"
+              },
+              "strict": false,
+              "task_id": "00000000-0000-4000-8000-0000000d0001",
+              "version": 1
+            }
+          ],
+          "restricted": false,
+          "root_id": "3e4cfcc1-5d17-5bdf-8409-febbd36bd9fb",
+          "tasks": [
+            {
+              "id": "00000000-0000-4000-8000-0000000d0001",
+              "title": "Buy food"
+            },
+            {
+              "id": "00000000-0000-4000-8000-0000000d0002",
+              "title": "Set the table"
+            },
+            {
+              "id": "00000000-0000-4000-8000-0000000d0003",
+              "title": "Cook"
+            },
+            {
+              "id": "00000000-0000-4000-8000-0000000d0004",
+              "title": "Pour drinks"
+            },
+            {
+              "id": "00000000-0000-4000-8000-0000000d0005",
+              "title": "Serve dinner"
+            }
+          ]
+        },
+        "cache_control": "private, no-store",
+        "set_cookie": false,
+        "status": 200
+      },
+      "depth_limited_partial": {
+        "body": {
+          "coverage": "partial",
+          "direct_prerequisites": [
+            "a7d82053-d5f8-5732-98c7-b0263ae73c8d",
+            "c0314199-b728-5b77-bcb3-24f795195996"
+          ],
+          "edges": [
+            {
+              "dependant_id": "3e4cfcc1-5d17-5bdf-8409-febbd36bd9fb",
+              "prerequisite_id": "a7d82053-d5f8-5732-98c7-b0263ae73c8d"
+            },
+            {
+              "dependant_id": "3e4cfcc1-5d17-5bdf-8409-febbd36bd9fb",
+              "prerequisite_id": "c0314199-b728-5b77-bcb3-24f795195996"
+            }
+          ],
+          "max_depth": 1,
+          "nodes": [
+            {
+              "can_edit": true,
+              "dependency_state": "waiting",
+              "depth": 0,
+              "occurrence_id": "3e4cfcc1-5d17-5bdf-8409-febbd36bd9fb",
+              "outcome": "unknown",
+              "prerequisites": "expanded",
+              "relation": "root",
+              "restricted_prerequisites": false,
+              "slot": {
+                "date": null,
+                "instant": null,
+                "intended_time": null,
+                "key": "once",
+                "timezone": "Europe/London"
+              },
+              "strict": false,
+              "task_id": "00000000-0000-4000-8000-0000000d0005",
+              "version": 2
+            },
+            {
+              "can_edit": true,
+              "dependency_state": "unknown",
+              "depth": 1,
+              "occurrence_id": "a7d82053-d5f8-5732-98c7-b0263ae73c8d",
+              "outcome": "unknown",
+              "prerequisites": "unexpanded",
+              "relation": "direct",
+              "restricted_prerequisites": null,
+              "slot": {
+                "date": null,
+                "instant": null,
+                "intended_time": null,
+                "key": "once",
+                "timezone": "Europe/London"
+              },
+              "strict": false,
+              "task_id": "00000000-0000-4000-8000-0000000d0003",
+              "version": 2
+            },
+            {
+              "can_edit": true,
+              "dependency_state": "unknown",
+              "depth": 1,
+              "occurrence_id": "c0314199-b728-5b77-bcb3-24f795195996",
+              "outcome": "unknown",
+              "prerequisites": "unexpanded",
+              "relation": "direct",
+              "restricted_prerequisites": null,
+              "slot": {
+                "date": null,
+                "instant": null,
+                "intended_time": null,
+                "key": "once",
+                "timezone": "Europe/London"
+              },
+              "strict": false,
+              "task_id": "00000000-0000-4000-8000-0000000d0004",
+              "version": 2
+            }
+          ],
+          "restricted": false,
+          "root_id": "3e4cfcc1-5d17-5bdf-8409-febbd36bd9fb",
+          "tasks": [
+            {
+              "id": "00000000-0000-4000-8000-0000000d0003",
+              "title": "Cook"
+            },
+            {
+              "id": "00000000-0000-4000-8000-0000000d0004",
+              "title": "Pour drinks"
+            },
+            {
+              "id": "00000000-0000-4000-8000-0000000d0005",
+              "title": "Serve dinner"
+            }
+          ]
+        },
+        "cache_control": "private, no-store",
+        "set_cookie": false,
+        "status": 200
+      },
+      "depth_over": {
+        "body": {
+          "code": "invalid_value",
+          "details": [],
+          "message": "Check the request fields and values."
+        },
+        "cache_control": "private, no-store",
+        "set_cookie": false,
+        "status": 422
+      },
+      "depth_zero": {
+        "body": {
+          "code": "invalid_value",
+          "details": [],
+          "message": "Check the request fields and values."
+        },
+        "cache_control": "private, no-store",
+        "set_cookie": false,
+        "status": 422
+      },
+      "empty": {
+        "body": {
+          "coverage": "complete",
+          "direct_prerequisites": [],
+          "edges": [],
+          "max_depth": 200,
+          "nodes": [
+            {
+              "can_edit": true,
+              "dependency_state": "ready",
+              "depth": 0,
+              "occurrence_id": "e209972a-eba9-5c2d-bb7d-2574a971f9f5",
+              "outcome": "unknown",
+              "prerequisites": "expanded",
+              "relation": "root",
+              "restricted_prerequisites": false,
+              "slot": {
+                "date": null,
+                "instant": null,
+                "intended_time": null,
+                "key": "once",
+                "timezone": "Europe/London"
+              },
+              "strict": false,
+              "task_id": "00000000-0000-4000-8000-0000000d0001",
+              "version": 1
+            }
+          ],
+          "restricted": false,
+          "root_id": "e209972a-eba9-5c2d-bb7d-2574a971f9f5",
+          "tasks": [
+            {
+              "id": "00000000-0000-4000-8000-0000000d0001",
+              "title": "Buy food"
+            }
+          ]
+        },
+        "cache_control": "private, no-store",
+        "set_cookie": false,
+        "status": 200
+      },
+      "hidden_root": {
+        "body": {
+          "code": "not_found",
+          "details": [],
+          "message": "The resource is not available."
+        },
+        "cache_control": "private, no-store",
+        "set_cookie": false,
+        "status": 404
+      },
+      "not_an_integer": {
+        "body": {
+          "code": "malformed_request",
+          "details": [],
+          "message": "Check the request fields and values."
+        },
+        "cache_control": "private, no-store",
+        "set_cookie": false,
+        "status": 400
+      },
+      "owner_unrestricted": {
+        "body": {
+          "coverage": "complete",
+          "direct_prerequisites": [
+            "0fd562d5-0458-50e2-baa5-3ec8fea08944",
+            "e054fa07-28b0-5ab8-98f5-1651eed8b75a"
+          ],
+          "edges": [
+            {
+              "dependant_id": "4e8168e3-97f9-58eb-b043-5b14460eabf6",
+              "prerequisite_id": "0fd562d5-0458-50e2-baa5-3ec8fea08944"
+            },
+            {
+              "dependant_id": "4e8168e3-97f9-58eb-b043-5b14460eabf6",
+              "prerequisite_id": "e054fa07-28b0-5ab8-98f5-1651eed8b75a"
+            }
+          ],
+          "max_depth": 200,
+          "nodes": [
+            {
+              "can_edit": true,
+              "dependency_state": "waiting",
+              "depth": 0,
+              "occurrence_id": "4e8168e3-97f9-58eb-b043-5b14460eabf6",
+              "outcome": "unknown",
+              "prerequisites": "expanded",
+              "relation": "root",
+              "restricted_prerequisites": false,
+              "slot": {
+                "date": null,
+                "instant": null,
+                "intended_time": null,
+                "key": "once",
+                "timezone": "Europe/London"
+              },
+              "strict": false,
+              "task_id": "00000000-0000-4000-8000-0000000d0008",
+              "version": 2
+            },
+            {
+              "can_edit": true,
+              "dependency_state": "ready",
+              "depth": 1,
+              "occurrence_id": "0fd562d5-0458-50e2-baa5-3ec8fea08944",
+              "outcome": "unknown",
+              "prerequisites": "expanded",
+              "relation": "direct",
+              "restricted_prerequisites": false,
+              "slot": {
+                "date": null,
+                "instant": null,
+                "intended_time": null,
+                "key": "once",
+                "timezone": "Europe/London"
+              },
+              "strict": false,
+              "task_id": "00000000-0000-4000-8000-0000000d0007",
+              "version": 1
+            },
+            {
+              "can_edit": true,
+              "dependency_state": "ready",
+              "depth": 1,
+              "occurrence_id": "e054fa07-28b0-5ab8-98f5-1651eed8b75a",
+              "outcome": "unknown",
+              "prerequisites": "expanded",
+              "relation": "direct",
+              "restricted_prerequisites": false,
+              "slot": {
+                "date": null,
+                "instant": null,
+                "intended_time": null,
+                "key": "once",
+                "timezone": "Europe/London"
+              },
+              "strict": false,
+              "task_id": "00000000-0000-4000-8000-0000000d0006",
+              "version": 1
+            }
+          ],
+          "restricted": false,
+          "root_id": "4e8168e3-97f9-58eb-b043-5b14460eabf6",
+          "tasks": [
+            {
+              "id": "00000000-0000-4000-8000-0000000d0006",
+              "title": "Surprise"
+            },
+            {
+              "id": "00000000-0000-4000-8000-0000000d0007",
+              "title": "Visible step"
+            },
+            {
+              "id": "00000000-0000-4000-8000-0000000d0008",
+              "title": "Shared plan"
+            }
+          ]
+        },
+        "cache_control": "private, no-store",
+        "set_cookie": false,
+        "status": 200
+      },
+      "restricted": {
+        "body": {
+          "coverage": "complete",
+          "direct_prerequisites": [
+            "0fd562d5-0458-50e2-baa5-3ec8fea08944"
+          ],
+          "edges": [
+            {
+              "dependant_id": "4e8168e3-97f9-58eb-b043-5b14460eabf6",
+              "prerequisite_id": "0fd562d5-0458-50e2-baa5-3ec8fea08944"
+            }
+          ],
+          "max_depth": 200,
+          "nodes": [
+            {
+              "can_edit": false,
+              "dependency_state": "waiting",
+              "depth": 0,
+              "occurrence_id": "4e8168e3-97f9-58eb-b043-5b14460eabf6",
+              "outcome": "unknown",
+              "prerequisites": "expanded",
+              "relation": "root",
+              "restricted_prerequisites": true,
+              "slot": {
+                "date": null,
+                "instant": null,
+                "intended_time": null,
+                "key": "once",
+                "timezone": "Europe/London"
+              },
+              "strict": false,
+              "task_id": "00000000-0000-4000-8000-0000000d0008",
+              "version": 2
+            },
+            {
+              "can_edit": false,
+              "dependency_state": "ready",
+              "depth": 1,
+              "occurrence_id": "0fd562d5-0458-50e2-baa5-3ec8fea08944",
+              "outcome": "unknown",
+              "prerequisites": "expanded",
+              "relation": "direct",
+              "restricted_prerequisites": false,
+              "slot": {
+                "date": null,
+                "instant": null,
+                "intended_time": null,
+                "key": "once",
+                "timezone": "Europe/London"
+              },
+              "strict": false,
+              "task_id": "00000000-0000-4000-8000-0000000d0007",
+              "version": 1
+            }
+          ],
+          "restricted": true,
+          "root_id": "4e8168e3-97f9-58eb-b043-5b14460eabf6",
+          "tasks": [
+            {
+              "id": "00000000-0000-4000-8000-0000000d0007",
+              "title": "Visible step"
+            },
+            {
+              "id": "00000000-0000-4000-8000-0000000d0008",
+              "title": "Shared plan"
+            }
+          ]
+        },
+        "cache_control": "private, no-store",
+        "set_cookie": false,
+        "status": 200
+      },
+      "unauthenticated": {
+        "body": {
+          "code": "unauthenticated",
+          "details": [],
+          "message": "A valid session is required."
+        },
+        "cache_control": "private, no-store",
+        "set_cookie": false,
+        "status": 401
+      },
+      "unknown_parameter": {
+        "body": {
+          "code": "malformed_request",
+          "details": [],
+          "message": "Check the request fields and values."
+        },
+        "cache_control": "private, no-store",
+        "set_cookie": false,
+        "status": 400
       }
     },
     "error_mapping": {

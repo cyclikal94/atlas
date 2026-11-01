@@ -2,7 +2,7 @@
   "openapi": "3.1.1",
   "info": {
     "title": "Atlas API",
-    "version": "0.29.0",
+    "version": "0.29.1",
     "description": "Pre-release API. Breaking changes and explicit database resets are permitted until a supported release."
   },
   "servers": [
@@ -14018,6 +14018,239 @@
         "summary": "Preview visible prerequisite completion"
       }
     },
+    "/occurrences/{id}/dependency-graph": {
+      "get": {
+        "operationId": "getDependencyGraph",
+        "x-error-codes": {
+          "400": [
+            "malformed_request"
+          ],
+          "401": [
+            "unauthenticated"
+          ],
+          "403": [
+            "forbidden",
+            "credential_mismatch"
+          ],
+          "404": [
+            "not_found"
+          ],
+          "409": [
+            "conflict",
+            "operation_conflict",
+            "defaults_changed",
+            "materialisation_required"
+          ],
+          "422": [
+            "invalid_value"
+          ],
+          "503": [
+            "slice_capacity",
+            "temporarily_unavailable"
+          ],
+          "500": [
+            "internal_error"
+          ]
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "in": "query",
+            "name": "max_depth",
+            "description": "Deepest level below the root that may be returned (the root is depth 0). An integer outside 1 to 200 is `invalid_value`; a value that is not an integer, or an unknown parameter, is `malformed_request`.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 200
+            }
+          }
+        ],
+        "description": "Returns the caller-authorised upstream prerequisite graph of one occurrence, read from one database snapshot, for display and for editing direct prerequisites. Online-only: not part of `/sync`, served `private, no-store`. `edges` are exactly the stored direct relationships between returned occurrences, from prerequisite to dependant; node and list order carry no relationship meaning. A node is `expanded` only with every edge to its visible direct prerequisites; an `unexpanded` node (at `max_depth` or beyond the fixed 200-node budget) has none of its edges, and `coverage` is `partial` exactly when any node is unexpanded. To see further, request the graph rooted at that node; separate responses are separate snapshots. Occurrences the caller cannot see are never returned, expanded or counted, nor is anything reachable only through them; a hidden direct prerequisite only sets `restricted_prerequisites` on its visible dependant and `restricted` on the graph. `dependency_state` uses the caller's view of direct prerequisites only, as completion enforces. `set_dependencies` replaces the whole stored set, including prerequisites the caller cannot see: when the root's `restricted_prerequisites` is true, saving removes them, so a client must warn before saving or not offer it. This read carries no completion authority; completing still uses `previewDependencyCompletion` and its token. After a `conflict`, read both again. Requires API 0.29.1 or later.",
+        "summary": "Read the visible dependency graph of an occurrence",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DependencyGraph"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "malformed_request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "unauthenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "conflict, operation_conflict, defaults_changed, materialisation_required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "invalid_value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "slice_capacity, temporarily_unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "internal_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/occurrences/{id}/timers": {
       "get": {
         "operationId": "listOwnTimerSessions",
@@ -24270,6 +24503,366 @@
         ],
         "additionalProperties": false,
         "description": "Who can actually see a field, as opposed to its own sharing configuration (`audience`). Exact counts need every input to that answer: both policies and the current membership of every household either one is shared with. When any input is unavailable to the reader the result is `partial` with both counts null, and nothing the reader cannot read changes it."
+      },
+      "DependencyGraph": {
+        "description": "The caller-authorised upstream prerequisite graph of one occurrence (`getDependencyGraph`), from one snapshot.",
+        "type": "object",
+        "properties": {
+          "root_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "nodes": {
+            "description": "Visible occurrences, root first, then in breadth-first discovery order by ascending id. Order carries no relationship meaning: use `edges`.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DependencyGraphNode"
+            },
+            "minItems": 1,
+            "maxItems": 200
+          },
+          "edges": {
+            "description": "Every stored direct relationship from an `expanded` node to its visible prerequisites, sorted by `dependant_id` then `prerequisite_id`. No edge is derived from order or transitivity.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DependencyEdge"
+            },
+            "maxItems": 6400
+          },
+          "tasks": {
+            "description": "One entry per task definition with an occurrence in `nodes`, sorted by `id`. Several occurrences of one recurring task share one entry.",
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DependencyGraphTask"
+            },
+            "minItems": 1,
+            "maxItems": 200
+          },
+          "direct_prerequisites": {
+            "description": "The root's visible stored direct prerequisites, ascending: the editor's authoritative current list.",
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "maxItems": 32
+          },
+          "coverage": {
+            "description": "`partial` exactly when some node is `unexpanded`. Says nothing about access.",
+            "enum": [
+              "complete",
+              "partial"
+            ]
+          },
+          "restricted": {
+            "description": "True exactly when some expanded node has `restricted_prerequisites`.",
+            "type": "boolean"
+          },
+          "max_depth": {
+            "description": "The effective depth limit.",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200
+          }
+        },
+        "required": [
+          "root_id",
+          "nodes",
+          "edges",
+          "tasks",
+          "direct_prerequisites",
+          "coverage",
+          "restricted",
+          "max_depth"
+        ],
+        "additionalProperties": false,
+        "examples": [
+          {
+            "root_id": "6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e01",
+            "nodes": [
+              {
+                "occurrence_id": "6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e01",
+                "task_id": "1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e01",
+                "slot": {
+                  "key": "once",
+                  "date": "2026-09-08",
+                  "intended_time": null,
+                  "timezone": "Europe/London",
+                  "instant": null
+                },
+                "version": 3,
+                "can_edit": true,
+                "strict": true,
+                "depth": 0,
+                "relation": "root",
+                "outcome": "incomplete",
+                "prerequisites": "expanded",
+                "restricted_prerequisites": false,
+                "dependency_state": "waiting"
+              },
+              {
+                "occurrence_id": "6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e02",
+                "task_id": "1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e02",
+                "slot": {
+                  "key": "once",
+                  "date": "2026-09-08",
+                  "intended_time": null,
+                  "timezone": "Europe/London",
+                  "instant": null
+                },
+                "version": 2,
+                "can_edit": true,
+                "strict": false,
+                "depth": 1,
+                "relation": "direct",
+                "outcome": "incomplete",
+                "prerequisites": "expanded",
+                "restricted_prerequisites": false,
+                "dependency_state": "ready"
+              },
+              {
+                "occurrence_id": "6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e03",
+                "task_id": "1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e03",
+                "slot": {
+                  "key": "once",
+                  "date": "2026-09-08",
+                  "intended_time": null,
+                  "timezone": "Europe/London",
+                  "instant": null
+                },
+                "version": 2,
+                "can_edit": true,
+                "strict": false,
+                "depth": 1,
+                "relation": "direct",
+                "outcome": "complete",
+                "prerequisites": "expanded",
+                "restricted_prerequisites": false,
+                "dependency_state": "satisfied"
+              },
+              {
+                "occurrence_id": "6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e04",
+                "task_id": "1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e04",
+                "slot": {
+                  "key": "once",
+                  "date": "2026-09-08",
+                  "intended_time": null,
+                  "timezone": "Europe/London",
+                  "instant": null
+                },
+                "version": 1,
+                "can_edit": true,
+                "strict": false,
+                "depth": 2,
+                "relation": "transitive",
+                "outcome": "complete",
+                "prerequisites": "expanded",
+                "restricted_prerequisites": false,
+                "dependency_state": "satisfied"
+              }
+            ],
+            "edges": [
+              {
+                "prerequisite_id": "6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e02",
+                "dependant_id": "6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e01"
+              },
+              {
+                "prerequisite_id": "6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e03",
+                "dependant_id": "6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e01"
+              },
+              {
+                "prerequisite_id": "6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e04",
+                "dependant_id": "6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e02"
+              },
+              {
+                "prerequisite_id": "6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e04",
+                "dependant_id": "6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e03"
+              }
+            ],
+            "tasks": [
+              {
+                "id": "1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e01",
+                "title": "Serve dinner"
+              },
+              {
+                "id": "1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e02",
+                "title": "Cook"
+              },
+              {
+                "id": "1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e03",
+                "title": "Pour drinks"
+              },
+              {
+                "id": "1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e04",
+                "title": "Set the table"
+              }
+            ],
+            "direct_prerequisites": [
+              "6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e02",
+              "6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e03"
+            ],
+            "coverage": "complete",
+            "restricted": false,
+            "max_depth": 200
+          }
+        ]
+      },
+      "DependencyGraphNode": {
+        "description": "One visible occurrence in a dependency graph.",
+        "type": "object",
+        "properties": {
+          "occurrence_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "task_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "slot": {
+            "$ref": "#/components/schemas/TaskSlot"
+          },
+          "version": {
+            "description": "The occurrence resource version: `expected_version` for `set_dependencies` on this node.",
+            "type": "integer",
+            "minimum": 1
+          },
+          "can_edit": {
+            "description": "Whether the caller may set this node's dependencies. The command remains the authority.",
+            "type": "boolean"
+          },
+          "strict": {
+            "description": "Whether an advisory override is refused for this node.",
+            "type": "boolean"
+          },
+          "depth": {
+            "description": "Shortest distance from the root over `edges`.",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 200
+          },
+          "relation": {
+            "description": "`direct` for a stored direct prerequisite of the root, even if it is also reachable transitively.",
+            "enum": [
+              "root",
+              "direct",
+              "transitive"
+            ]
+          },
+          "outcome": {
+            "$ref": "#/components/schemas/TaskOutcome"
+          },
+          "prerequisites": {
+            "description": "`expanded`: every edge to this node's visible direct prerequisites is in `edges`. `unexpanded`: none of them is.",
+            "enum": [
+              "expanded",
+              "unexpanded"
+            ]
+          },
+          "restricted_prerequisites": {
+            "description": "On an expanded node, whether one or more stored direct prerequisites are hidden from the caller (no id, count or progress is given). Null when unexpanded.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "dependency_state": {
+            "description": "From the caller's view and direct prerequisites only: `satisfied` (own outcome complete), `waiting` (a visible direct prerequisite is not satisfied), `restricted` (every visible one is satisfied but one or more is hidden), `ready` (none unsatisfied or hidden), `unknown` (unexpanded and not satisfied). Concerns prerequisites only; whether the caller can act is `OccurrenceView.actionable`.",
+            "enum": [
+              "satisfied",
+              "waiting",
+              "restricted",
+              "ready",
+              "unknown"
+            ]
+          }
+        },
+        "required": [
+          "occurrence_id",
+          "task_id",
+          "slot",
+          "version",
+          "can_edit",
+          "strict",
+          "depth",
+          "relation",
+          "outcome",
+          "prerequisites",
+          "restricted_prerequisites",
+          "dependency_state"
+        ],
+        "additionalProperties": false,
+        "examples": [
+          {
+            "occurrence_id": "6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e02",
+            "task_id": "1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e02",
+            "slot": {
+              "key": "once",
+              "date": "2026-09-08",
+              "intended_time": null,
+              "timezone": "Europe/London",
+              "instant": null
+            },
+            "version": 2,
+            "can_edit": true,
+            "strict": false,
+            "depth": 1,
+            "relation": "direct",
+            "outcome": "incomplete",
+            "prerequisites": "expanded",
+            "restricted_prerequisites": false,
+            "dependency_state": "ready"
+          }
+        ]
+      },
+      "DependencyEdge": {
+        "description": "One stored direct relationship: `dependant_id` requires `prerequisite_id`.",
+        "type": "object",
+        "properties": {
+          "prerequisite_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "dependant_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        "required": [
+          "prerequisite_id",
+          "dependant_id"
+        ],
+        "additionalProperties": false,
+        "examples": [
+          {
+            "prerequisite_id": "6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e02",
+            "dependant_id": "6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e01"
+          }
+        ]
+      },
+      "DependencyGraphTask": {
+        "description": "A task definition with one or more occurrences in a dependency graph.",
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title"
+        ],
+        "additionalProperties": false,
+        "examples": [
+          {
+            "id": "1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e01",
+            "title": "Serve dinner"
+          }
+        ]
       }
     }
   }

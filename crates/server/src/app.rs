@@ -141,6 +141,10 @@ impl App {
                 "/api/experimental/v1/occurrences/{id}/dependencies",
                 get(tasks::dependencies),
             )
+            .route(
+                "/api/experimental/v1/occurrences/{id}/dependency-graph",
+                get(tasks::dependency_graph),
+            )
             .route("/api/experimental/v1/daily", get(tasks::daily))
             .route(
                 "/api/experimental/v1/occurrences/{id}/timers",

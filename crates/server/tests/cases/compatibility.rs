@@ -2527,6 +2527,179 @@ async fn people_summary_probes() -> Result<Value> {
     Ok(Value::Object(results))
 }
 
+/// BE-DEPENDENCY-GRAPH: the dependency-graph read. Task ids are fixed and the tasks are created
+/// at a fixed time, so occurrence ids, slots, versions and outcomes are the same in every
+/// recording; no account id appears in a graph body.
+async fn dependency_graph_probes() -> Result<Value> {
+    use crate::support::http::request;
+    use atlas_core::policy::{Policy, PrincipalGrant};
+    use atlas_core::tasks::{
+        Carry, Definition, Goal, Participation, Schedule, TaskCommand, occurrence_id,
+    };
+    use atlas_server::hash_password;
+
+    const CREATED: i64 = 1788868800;
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let store = Store::connect(&url).await?;
+    store.migrate().await?;
+    let hash = hash_password("graph-probe-123".into()).await?;
+    let app = App::new(store.clone()).await?.router();
+    let mut accounts = BTreeMap::new();
+    for name in ["alice", "bob"] {
+        let id = Uuid::new_v4().to_string();
+        store
+            .add_account(&id, &format!("graph-probe-{name}"), &hash)
+            .await?;
+        let login = request(
+            &app,
+            "POST",
+            "sessions",
+            &[],
+            json!({"username":format!("graph-probe-{name}"),"password":"graph-probe-123","device_id":"probe"}),
+        )
+        .await;
+        assert_eq!(login.0, StatusCode::OK, "{}", login.2);
+        accounts.insert(
+            name,
+            (
+                id,
+                format!("Bearer {}", login.2["access_token"].as_str().unwrap()),
+            ),
+        );
+    }
+    let (alice, bob) = (accounts["alice"].clone(), accounts["bob"].clone());
+    let create = |n: u32, title: &'static str, shared: bool| {
+        let (store, alice, bob) = (store.clone(), alice.0.clone(), bob.0.clone());
+        async move {
+            let task = format!("00000000-0000-4000-8000-0000000d{n:04}");
+            store
+                .task_command(
+                    &alice,
+                    &Uuid::new_v4().to_string(),
+                    &TaskCommand::CreateTask {
+                        id: task.clone(),
+                        execution_id: format!("00000000-0000-4000-8000-0000000e{n:04}"),
+                        title: title.into(),
+                        anchor: None,
+                        initial_policy: shared.then(|| Policy {
+                            grants: vec![PrincipalGrant::Account {
+                                id: bob,
+                                edit: false,
+                            }],
+                            exclude_accounts: vec![],
+                        }),
+                        definition: Definition {
+                            schedule: Schedule {
+                                start_date: None,
+                                time: None,
+                                timezone: "Europe/London".into(),
+                                repeat: None,
+                            },
+                            goal: Goal::Checkbox,
+                            carry: Carry::RetainOne,
+                            participation: Participation::Personal,
+                            open_days_before: 0,
+                            close_days_after: 1,
+                            allow_streak_exclusions: false,
+                        },
+                    },
+                    None,
+                    CREATED,
+                )
+                .await?;
+            occurrence_id(&task, "once")
+        }
+    };
+    let link = |dependant: String, prerequisites: Vec<String>| {
+        let (store, alice) = (store.clone(), alice.0.clone());
+        async move {
+            store
+                .task_command(
+                    &alice,
+                    &Uuid::new_v4().to_string(),
+                    &TaskCommand::SetDependencies {
+                        occurrence_id: dependant,
+                        expected_version: 1,
+                        prerequisites,
+                        strict: false,
+                    },
+                    None,
+                    CREATED,
+                )
+                .await
+        }
+    };
+    // root → {cook, drinks} → table → shop; shared(Bob) → {private, open(Bob)}.
+    let shop = create(1, "Buy food", false).await?;
+    let table = create(2, "Set the table", false).await?;
+    let cook = create(3, "Cook", false).await?;
+    let drinks = create(4, "Pour drinks", false).await?;
+    let root = create(5, "Serve dinner", false).await?;
+    let private = create(6, "Surprise", false).await?;
+    let open = create(7, "Visible step", true).await?;
+    let shared = create(8, "Shared plan", true).await?;
+    link(table.clone(), vec![shop.clone()]).await?;
+    link(cook.clone(), vec![table.clone()]).await?;
+    link(drinks.clone(), vec![table.clone()]).await?;
+    link(root.clone(), vec![cook.clone(), drinks.clone()]).await?;
+    link(shared.clone(), vec![private.clone(), open.clone()]).await?;
+    let get = |who: Option<&(String, String)>, path: String| {
+        let app = app.clone();
+        let auth = who.map(|w| w.1.clone());
+        async move {
+            let headers: Vec<(&str, &str)> = auth
+                .as_deref()
+                .map(|a| vec![("authorization", a)])
+                .unwrap_or_default();
+            request(&app, "GET", &path, &headers, Value::Null).await
+        }
+    };
+    let shape = |reply: &(StatusCode, axum::http::HeaderMap, Value)| {
+        let mut body = reply.2.clone();
+        if let Some(map) = body.as_object_mut() {
+            map.remove("request_id");
+        }
+        json!({
+            "status": reply.0.as_u16(),
+            "cache_control": reply.1.get("cache-control").map(|v| v.to_str().unwrap()),
+            "set_cookie": reply.1.contains_key("set-cookie"),
+            "body": body,
+        })
+    };
+    let path = |o: &str, query: &str| format!("occurrences/{o}/dependency-graph{query}");
+    let mut results = serde_json::Map::new();
+    for (name, who, request_path) in [
+        (
+            "chain_and_shared_prerequisite",
+            Some(&alice),
+            path(&root, ""),
+        ),
+        (
+            "depth_limited_partial",
+            Some(&alice),
+            path(&root, "?max_depth=1"),
+        ),
+        ("empty", Some(&alice), path(&shop, "")),
+        ("owner_unrestricted", Some(&alice), path(&shared, "")),
+        ("restricted", Some(&bob), path(&shared, "")),
+        ("hidden_root", Some(&bob), path(&root, "")),
+        ("depth_zero", Some(&alice), path(&root, "?max_depth=0")),
+        ("depth_over", Some(&alice), path(&root, "?max_depth=201")),
+        (
+            "not_an_integer",
+            Some(&alice),
+            path(&root, "?max_depth=deep"),
+        ),
+        ("unknown_parameter", Some(&alice), path(&root, "?limit=5")),
+        ("unauthenticated", None, path(&root, "")),
+    ] {
+        results.insert(name.into(), shape(&get(who, request_path).await));
+    }
+    let restricted = serde_json::to_string(&results["restricted"])?;
+    assert!(!restricted.contains(&private) && !restricted.contains("Surprise"));
+    Ok(Value::Object(results))
+}
+
 async fn observe(app: &Router) -> Value {
     json!({
         "activation": activation_probes().await.expect("activation-grant protocol probes"),
@@ -2543,6 +2716,7 @@ async fn observe(app: &Router) -> Value {
         "independent_timers": independent_timer_probes().await.expect("BE-B6 independent-timer probes"),
         "labels_and_capacity": labels_and_capacity_probes().await.expect("BE-Q25 label, naming and capacity probes"),
         "people_summaries": people_summary_probes().await.expect("BE-PEOPLE-SUMMARY viewer-safe summary probes"),
+        "dependency_graph": dependency_graph_probes().await.expect("BE-DEPENDENCY-GRAPH dependency-graph probes"),
         "health": probe(app, "/health", &["api_version"]).await,
         "me_unauthenticated": probe(app, "/api/experimental/v1/me", &["request_id"]).await,
         "ready": probe(app, "/ready", &[]).await,

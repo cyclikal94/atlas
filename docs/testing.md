@@ -108,7 +108,10 @@ snapshot against separate `defaults` and `households` reads, and
 `crates/core/examples/people_summary_load.rs` for People summary page latency per filter
 (with merged aliases), the per-page statement count, the field-audience page of a 99-field
 person (effective access for every recipient) and the PostgreSQL plans of the filter
-predicates, and
+predicates,
+`crates/core/examples/dependency_graph_load.rs` for the latency and per-read statement count
+of the largest dependency graphs the 200-node budget allows (a 250-step chain and a 32 × 32
+fan, plus the `max_depth=1` editor read), and
 `crates/core/examples/timer_list_load.rs` for the account-wide timer list (pages over 1k to
 100k finished sessions, the access-check cost, query plans with and without the
 `timer_account_stopped` index) and, with `ATLAS_LOAD_MODE=migrate`, the `1003 → 1004` upgrade

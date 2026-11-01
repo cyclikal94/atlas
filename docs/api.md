@@ -159,6 +159,15 @@ and must not probe `GET /policies/{id}` for people it does not own. See
 [people](people.md#viewer-safe-summaries). The compatibility baseline gains a
 `people_summaries` probe group.
 
+`0.29.1` adds `GET /occurrences/{id}/dependency-graph` (`getDependencyGraph`), the
+caller-authorised prerequisite graph of one occurrence (BE-DEPENDENCY-GRAPH), and its strict
+schemas `DependencyGraph`, `DependencyGraphNode`, `DependencyEdge` and `DependencyGraphTask`.
+No existing response, command or behaviour changes: the completion preview
+`previewDependencyCompletion`, its token, `set_dependencies` and `complete_dependencies` are
+as before, and edges remain outside `/sync`. A client must call the read only once the
+server reports `0.29.1` or later. See [tasks](tasks.md#dependency-graph). The compatibility
+baseline gains a `dependency_graph` probe group.
+
 Mutations require an account-scoped UUID `Idempotency-Key` and explicit version
 preconditions where defined. Commands that replace existing authored text also carry the
 resource's sharing revision (`expected_policy_version`), so a write cannot commit under
@@ -189,7 +198,7 @@ statuses and [sync](sync.md) for client recovery.
 `GET /health` returns the version of the API contract the running server was built with:
 
 ```json
-{"status": "ok", "api_version": "0.28.0"}
+{"status": "ok", "api_version": "0.29.1"}
 ```
 
 `api_version` is exactly `info.version` in [the contract](../api/openapi.json), read from
