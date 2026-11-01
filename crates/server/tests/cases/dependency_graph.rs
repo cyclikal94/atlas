@@ -368,6 +368,32 @@ fn the_contract_describes_a_safe_authenticated_read_and_leaves_the_preview_alone
     );
     let operation = &path["get"];
     assert_eq!(operation["operationId"], "getDependencyGraph");
+    // Revision 1 (R1): views are replaced whole, and versions are not graph revisions.
+    let described = operation["description"].as_str().unwrap();
+    for rule in [
+        "never union nodes or edges from separate responses",
+        "discard out-of-order responses",
+        "never what has gone",
+        "not a graph revision",
+    ] {
+        assert!(
+            described.contains(rule),
+            "operation description lacks {rule:?}"
+        );
+    }
+    let schemas = &contract["components"]["schemas"];
+    assert!(
+        schemas["DependencyGraphNode"]["properties"]["version"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Not a graph revision")
+    );
+    assert!(
+        schemas["DependencyGraph"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("never merge separate responses")
+    );
     let preview = &contract["paths"]["/occurrences/{id}/dependencies"]["get"];
     assert_eq!(operation["x-error-codes"], preview["x-error-codes"]);
     let statuses = |op: &Value| {
@@ -506,5 +532,54 @@ async fn revocation_is_immediate_over_http() -> Result<()> {
         StatusCode::NOT_FOUND,
         "not_found",
     );
+    Ok(())
+}
+
+/// Revision 1 (R1): through the router, one occurrence at one version carries different
+/// request-relative fields in views rooted at different nodes, so responses are views to be
+/// replaced whole, never merged by occurrence id and version.
+#[tokio::test]
+async fn views_rooted_elsewhere_differ_at_the_same_version_over_http() -> Result<()> {
+    let s = scene().await?;
+    let a = s.alice_token.as_str();
+    let shallow = get(&s, Some(a), &graph_path(&s.root, "?max_depth=1")).await;
+    assert_eq!(shallow.0, StatusCode::OK, "{}", shallow.2);
+    conforms("DependencyGraph", &shallow.2);
+    let from_cook = get(&s, Some(a), &graph_path(&s.cook, "")).await;
+    assert_eq!(from_cook.0, StatusCode::OK, "{}", from_cook.2);
+    conforms("DependencyGraph", &from_cook.2);
+    let find = |g: &Value, o: &str| {
+        g["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["occurrence_id"] == o)
+            .cloned()
+            .unwrap_or_else(|| panic!("{o} is not a node"))
+    };
+    let (under_root, own) = (find(&shallow.2, &s.cook), find(&from_cook.2, &s.cook));
+    assert_eq!(under_root["version"], own["version"]);
+    let relative = |n: &Value| {
+        json!([
+            n["relation"],
+            n["depth"],
+            n["prerequisites"],
+            n["restricted_prerequisites"],
+            n["dependency_state"]
+        ])
+    };
+    assert_eq!(
+        relative(&under_root),
+        json!(["direct", 1, "unexpanded", null, "unknown"])
+    );
+    assert_eq!(
+        relative(&own),
+        json!(["root", 0, "expanded", false, "waiting"])
+    );
+    assert_eq!(shallow.2["coverage"], "partial");
+    assert_eq!(from_cook.2["coverage"], "complete");
+    // The table is in Cook's view but not in the shallow one, which lists nothing as removed.
+    assert_eq!(find(&from_cook.2, &s.table)["relation"], "direct");
+    assert!(!shallow.2.to_string().contains(&s.table));
     Ok(())
 }

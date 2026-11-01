@@ -14074,7 +14074,7 @@
             }
           }
         ],
-        "description": "Returns the caller-authorised upstream prerequisite graph of one occurrence, read from one database snapshot, for display and for editing direct prerequisites. Online-only: not part of `/sync`, served `private, no-store`. `edges` are exactly the stored direct relationships between returned occurrences, from prerequisite to dependant; node and list order carry no relationship meaning. A node is `expanded` only with every edge to its visible direct prerequisites; an `unexpanded` node (at `max_depth` or beyond the fixed 200-node budget) has none of its edges, and `coverage` is `partial` exactly when any node is unexpanded. To see further, request the graph rooted at that node; separate responses are separate snapshots. Occurrences the caller cannot see are never returned, expanded or counted, nor is anything reachable only through them; a hidden direct prerequisite only sets `restricted_prerequisites` on its visible dependant and `restricted` on the graph. `dependency_state` uses the caller's view of direct prerequisites only, as completion enforces. `set_dependencies` replaces the whole stored set, including prerequisites the caller cannot see: when the root's `restricted_prerequisites` is true, saving removes them, so a client must warn before saving or not offer it. This read carries no completion authority; completing still uses `previewDependencyCompletion` and its token. After a `conflict`, read both again. Requires API 0.29.1 or later.",
+        "description": "Returns the caller-authorised upstream prerequisite graph of one occurrence, read from one database snapshot, for display and for editing direct prerequisites. Online-only: not part of `/sync`, served `private, no-store`. `edges` are exactly the stored direct relationships between returned occurrences, from prerequisite to dependant; node and list order carry no relationship meaning. A node is `expanded` only with every edge to its visible direct prerequisites; an `unexpanded` node (at `max_depth` or beyond the fixed 200-node budget) has none of its edges, and `coverage` is `partial` exactly when any node is unexpanded. To see further, open a separate view rooted at that node. Each response is a whole view of one root at one `max_depth` for the calling account: replace a view only with a whole response to its latest request (discard out-of-order responses, and every view when the account changes) and never union nodes or edges from separate responses. A response lists only what is visible now, never what has gone; `relation`, `depth`, `prerequisites`, `restricted_prerequisites`, `dependency_state` and `coverage` are relative to the request; and a node's `version` is its edit precondition, not a graph revision, so completion, progress, titles and access can change without it. Occurrences the caller cannot see are never returned, expanded or counted, nor is anything reachable only through them; a hidden direct prerequisite only sets `restricted_prerequisites` on its visible dependant and `restricted` on the graph. `dependency_state` uses the caller's view of direct prerequisites only, as completion enforces. `set_dependencies` replaces the whole stored set, including prerequisites the caller cannot see: when the root's `restricted_prerequisites` is true, saving removes them, so a client must warn before saving or not offer it. This read carries no completion authority; completing still uses `previewDependencyCompletion` and its token. After a `conflict`, read both again. Requires API 0.29.1 or later.",
         "summary": "Read the visible dependency graph of an occurrence",
         "responses": {
           "200": {
@@ -24505,7 +24505,7 @@
         "description": "Who can actually see a field, as opposed to its own sharing configuration (`audience`). Exact counts need every input to that answer: both policies and the current membership of every household either one is shared with. When any input is unavailable to the reader the result is `partial` with both counts null, and nothing the reader cannot read changes it."
       },
       "DependencyGraph": {
-        "description": "The caller-authorised upstream prerequisite graph of one occurrence (`getDependencyGraph`), from one snapshot.",
+        "description": "The caller-authorised upstream prerequisite graph of one occurrence (`getDependencyGraph`), from one snapshot. A whole view: replace it with a newer whole response; never merge separate responses.",
         "type": "object",
         "properties": {
           "root_id": {
@@ -24723,7 +24723,7 @@
             "$ref": "#/components/schemas/TaskSlot"
           },
           "version": {
-            "description": "The occurrence resource version: `expected_version` for `set_dependencies` on this node.",
+            "description": "The occurrence resource version: `expected_version` for `set_dependencies` on this node. Not a graph revision: completion, progress, title and access changes do not advance it, so it cannot order or merge separate responses.",
             "type": "integer",
             "minimum": 1
           },

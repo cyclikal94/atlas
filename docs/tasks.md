@@ -282,11 +282,41 @@ budget is fixed. Nodes are discovered breadth-first in ascending ID order. A nod
 them is returned; otherwise it is `unexpanded` and none of its edges are returned. A node
 that does not fit does not stop smaller expansions later. `coverage` is `partial` exactly
 when some node is unexpanded, so a client can never mistake a cut-off graph for a whole
-one; to see further, request the graph rooted at an unexpanded node. Separate requests
-are separate snapshots: merge them by occurrence ID, prefer the node with the higher
-`version`, and read the root again after sync reports a change to an included occurrence
-or its progress. Stored cycles cannot arise through the API, and even a damaged stored
-cycle returns each node once.
+one. Stored cycles cannot arise through the API, and even a damaged stored cycle returns
+each node once.
+
+Each response is a whole *view*: one account's graph of one root at one `max_depth`, from
+one snapshot. A client replaces a view only with a whole newer response to the same
+request, and never unions nodes or edges from separate responses, because nothing in a
+response can order or reconcile it with another:
+
+- A node's `version` is its edit precondition (`expected_version`), not a graph revision.
+  Completion, progress, a title change or an access change elsewhere alters `outcome`,
+  `dependency_state`, `tasks` and which nodes are returned without changing any returned
+  `version`. Equal versions therefore do not mean equal nodes, and a higher version does
+  not make the rest of its response newer.
+- A response lists only what is visible now and never what has gone. After a revocation or
+  a removed relationship the occurrences simply are not there; only whole replacement
+  drops them.
+- `relation`, `depth`, `prerequisites`, `restricted_prerequisites`, `dependency_state` and
+  `coverage` are relative to the request. The same occurrence is `direct` at depth 1 and
+  `unexpanded` in one view and the `expanded` root at depth 0 in another.
+
+To see further below an unexpanded node, open a separate view rooted at it (for example as
+a navigation step) and keep each view as its own response. A client:
+
+1. Keeps views in memory for the signed-in account only, keyed by root and `max_depth`,
+   like other `no-store` reads, and discards all of them when the account signs out or
+   changes.
+2. Gives each request a generation number per view, and applies a response only if it
+   answers that view's latest request and the same account is still signed in. Any other
+   response, including one that arrives out of order, is discarded.
+3. Reads a displayed view again after its own task or sharing commands, after a
+   `conflict`, whenever sync reports a change, and when the view is shown again. Sync does
+   not report every revocation (for example of an occurrence the device never received),
+   so a displayed view is a point-in-time snapshot until it is read again.
+4. Removes a view whose read answers `not_found`. A view opened from it is separate and is
+   read again on its own.
 
 Visibility follows the ordinary rules. An occurrence the caller cannot see is never
 returned, expanded or counted towards the budget, and neither is anything reachable only

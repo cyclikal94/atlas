@@ -1391,3 +1391,165 @@ async fn c8_concurrent_opposite_edges_cannot_create_a_cycle_on_either_engine() -
     }
     Ok(())
 }
+
+// C9 views: whole responses, not merges (revision 1, review finding R1) ---------------------
+//
+// The documented client contract replaces a view only with a whole newer response and never
+// unions separate responses. These cases pin the facts that make a version-keyed merge unsafe:
+// versions are edit preconditions rather than graph revisions, responses never list what has
+// gone, and several node fields are relative to the request.
+
+fn versions(g: &DependencyGraph) -> BTreeMap<String, i64> {
+    g.nodes
+        .iter()
+        .map(|n| (n.occurrence_id.clone(), n.version))
+        .collect()
+}
+
+/// R → P → Q, all owned by `a`, each shared read-only with `with` when given.
+async fn chain(s: &Store, a: &str, with: Option<&str>) -> Result<(String, String, String)> {
+    let policy = || with.map(|b| grant(&[b], false));
+    let q = make(s, a, "Queue the order", policy()).await?;
+    let p = make(s, a, "Pay the deposit", policy()).await?;
+    let r = make(s, a, "Reserve the room", policy()).await?;
+    set(s, a, &p, vec![q.clone()], false).await?;
+    set(s, a, &r, vec![p.clone()], false).await?;
+    Ok((r, p, q))
+}
+
+#[tokio::test]
+async fn c9_completion_changes_states_but_no_version() -> Result<()> {
+    let (s, _dir) = setup().await?;
+    let a = account(&s).await?;
+    let (r, p, q) = chain(&s, &a, None).await?;
+    let before = graph(&s, &a, &r, 200).await?;
+    verify(&s, &a, &before, &none()).await?;
+    assert_eq!(node(&before, &r).dependency_state, DependencyState::Waiting);
+    assert_eq!(node(&before, &p).dependency_state, DependencyState::Waiting);
+    complete(&s, &a, &p, CompletionMode::AdvisoryOverride).await?;
+    let after = graph(&s, &a, &r, 200).await?;
+    verify(&s, &a, &after, &none()).await?;
+    assert_eq!(node(&after, &r).dependency_state, DependencyState::Ready);
+    assert_eq!(
+        node(&after, &p).dependency_state,
+        DependencyState::Satisfied
+    );
+    assert_eq!(node(&after, &p).outcome, Outcome::Complete);
+    assert_eq!(node(&after, &q).dependency_state, DependencyState::Ready);
+    // Every version is unchanged, yet two nodes differ: equal versions do not mean equal nodes,
+    // so preferring the higher version (or either one on a tie) can keep the stale state.
+    assert_eq!(versions(&before), versions(&after));
+    assert_eq!(edge_set(&before), edge_set(&after));
+    for o in [&r, &p] {
+        assert_ne!(node(&before, o), node(&after, o), "{o}");
+    }
+    // Whole replacement is exactly the current view: re-reading gives the same response.
+    assert_eq!(graph(&s, &a, &r, 200).await?, after);
+    Ok(())
+}
+
+#[tokio::test]
+async fn c9_a_view_rooted_elsewhere_reports_request_relative_fields() -> Result<()> {
+    let (s, _dir) = setup().await?;
+    let a = account(&s).await?;
+    let (r, p, q) = chain(&s, &a, None).await?;
+    let shallow = graph(&s, &a, &r, 1).await?;
+    verify(&s, &a, &shallow, &none()).await?;
+    assert_eq!(ids(&shallow), [r.clone(), p.clone()]);
+    assert_eq!(shallow.coverage, GraphCoverage::Partial);
+    let under_r = node(&shallow, &p);
+    assert_eq!(
+        (
+            under_r.relation,
+            under_r.depth,
+            under_r.prerequisites,
+            under_r.restricted_prerequisites,
+            under_r.dependency_state
+        ),
+        (
+            GraphRelation::Direct,
+            1,
+            NodeExpansion::Unexpanded,
+            None,
+            DependencyState::Unknown
+        )
+    );
+    // "Open from here": a separate, complete view rooted at the unexpanded node.
+    let from_p = graph(&s, &a, &p, 200).await?;
+    verify(&s, &a, &from_p, &none()).await?;
+    assert_eq!(from_p.root_id, p);
+    assert_eq!(from_p.coverage, GraphCoverage::Complete);
+    assert_eq!(edge_set(&from_p), BTreeSet::from([pair(&q, &p)]));
+    let own = node(&from_p, &p);
+    assert_eq!(
+        (
+            own.relation,
+            own.depth,
+            own.prerequisites,
+            own.restricted_prerequisites,
+            own.dependency_state
+        ),
+        (
+            GraphRelation::Root,
+            0,
+            NodeExpansion::Expanded,
+            Some(false),
+            DependencyState::Waiting
+        )
+    );
+    // Same occurrence, same version, different request-relative fields.
+    assert_eq!(under_r.version, own.version);
+    assert_ne!(under_r, own);
+    let full = graph(&s, &a, &r, 200).await?;
+    verify(&s, &a, &full, &none()).await?;
+    let (deep, near) = (node(&full, &q), node(&from_p, &q));
+    assert_eq!((deep.relation, deep.depth), (GraphRelation::Transitive, 2));
+    assert_eq!((near.relation, near.depth), (GraphRelation::Direct, 1));
+    assert_eq!(deep.version, near.version);
+    // Opening a view changes no other view: the parent re-reads identically.
+    assert_eq!(graph(&s, &a, &r, 1).await?, shallow);
+    Ok(())
+}
+
+#[tokio::test]
+async fn c9_revocation_shrinks_a_fresh_view_with_no_version_change() -> Result<()> {
+    let (s, _dir) = setup().await?;
+    let (a, b) = (account(&s).await?, account(&s).await?);
+    let (r, p, q) = chain(&s, &a, Some(&b)).await?;
+    let before = graph(&s, &b, &r, 200).await?;
+    verify(&s, &b, &before, &none()).await?;
+    assert_eq!(ids(&before), [r.clone(), p.clone(), q.clone()]);
+    assert!(!before.restricted);
+    // B also opened a view rooted at P.
+    let from_p = graph(&s, &b, &p, 200).await?;
+    verify(&s, &b, &from_p, &none()).await?;
+    assert_eq!(ids(&from_p), [p.clone(), q.clone()]);
+    // A revokes B's access to P's task. Q is still shared, but reachable only through P.
+    replace(&s, &a, &lineage(&s, &p).await?[0], Policy::default()).await?;
+    let after = graph(&s, &b, &r, 200).await?;
+    verify(&s, &b, &after, &BTreeSet::from([p.clone()])).await?;
+    assert_eq!(ids(&after), std::slice::from_ref(&r));
+    assert!(after.edges.is_empty() && after.direct_prerequisites.is_empty());
+    assert!(after.restricted);
+    assert_eq!(after.nodes[0].dependency_state, DependencyState::Restricted);
+    // Nothing in the fresh response marks P or Q as removed, and the remaining node's version
+    // is unchanged: only whole replacement drops them.
+    assert_eq!(after.nodes[0].version, node(&before, &r).version);
+    let body = serde_json::to_string(&after)?;
+    for gone in [p.as_str(), q.as_str(), "Pay the deposit", "Queue the order"] {
+        assert!(!body.contains(gone), "{gone} still in the fresh view");
+    }
+    // The view opened from P is gone too, as `not_found`.
+    assert_eq!(
+        graph(&s, &b, &p, 200).await.unwrap_err().to_string(),
+        "not_found"
+    );
+    // Control: an actual change to R's own prerequisites advances R's version, which is what
+    // the version is for (the editor's `expected_version`).
+    set(&s, &a, &r, vec![], false).await?;
+    let edited = graph(&s, &a, &r, 200).await?;
+    verify(&s, &a, &edited, &none()).await?;
+    assert!(edited.nodes[0].version > before.nodes[0].version);
+    assert!(edited.edges.is_empty() && edited.nodes.len() == 1);
+    Ok(())
+}
