@@ -196,6 +196,15 @@ def run(call, accounts, tokens):
             {k: v for k, v in detail.items() if k != 'request_id'}
     stale = call('GET', f'{V1}/people/{person}/activity?after={uuid.uuid4()}', carol, expected=422)
     assert stale['code'] == 'invalid_value'
+    # A cursor at an event carol cannot see (the private field's, the hidden merge source's) is the
+    # same error as a missing one, while the owner can use it (BE-PEOPLE-ACTIVITY review R1).
+    without_id = lambda body: {k: v for k, v in body.items() if k != 'request_id'}
+    hidden_events = [item['id'] for item in merged if item['target']['id'] in (private, source)]
+    assert len(hidden_events) == 3, hidden_events
+    for event in hidden_events:
+        refused = call('GET', f'{V1}/people/{person}/activity?after={event}', carol, expected=422)
+        assert without_id(refused) == without_id(stale), refused
+        call('GET', f'{V1}/people/{person}/activity?after={event}', alice)
 
     names = {person: 'PERSON', shared: 'SHARED_FIELD', source: 'MERGED_SOURCE',
              accounts['alice']: 'ALICE', accounts['bob']: 'BOB', accounts['carol']: 'CAROL'}

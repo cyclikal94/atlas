@@ -157,13 +157,38 @@ def seed(server, database):
     return accounts, reads(server, server.login('alice'))
 
 
+def _pages(call, token, path):
+    """Every item of a `next_after` listing, followed to the end at the largest page size."""
+    items, after = [], None
+    while True:
+        separator = '&' if '?' in path else '?'
+        page = call('GET', V1 + path + f'{separator}limit=100' + (f'&after={after}' if after else ''), token)
+        items.extend(page['items'])
+        if page['next_after'] is None:
+            return items, page
+        after = page['next_after']
+
+
+def activity(call, token):
+    """Every visible person's whole activity timeline (BE-PEOPLE-ACTIVITY), in person-id order."""
+    people, _ = _pages(call, token, '/people')
+    timelines = []
+    for person in sorted(p['id'] for p in people):
+        items, last = _pages(call, token, f'/people/{person}/activity')
+        timelines.append({'person_id': last['person_id'], 'items': items,
+                          'coverage_started_at': last['coverage_started_at']})
+    return {'items': timelines}
+
+
 def reads(server, token):
-    """The account's timer list and both sent histories: what a client sees after a restore."""
+    """The account's timer list, both sent histories and its people's activity timelines: what a
+    client sees after a restore."""
     call = server.call
     return {
         'timers': call('GET', V1 + '/timer-sessions?limit=200', token),
         'requests': call('GET', V1 + '/people/requests/sent?limit=200', token),
         'invitations': call('GET', V1 + '/invitations/sent?limit=200', token),
+        'activity': activity(call, token),
     }
 
 
@@ -398,6 +423,7 @@ def main():
         with Server(restored, root / 'restored.log') as server:
             server.call('GET', '/ready')
             token = server.login('alice')
+            assert any(t['items'] for t in source_reads['activity']['items']), 'the source has activity'
             assert reads(server, token) == source_reads
             running = [i for i in source_reads['timers']['items'] if i['stopped_at'] is None]
             _, occurrence = timers.seconds_task(server.call, token, 'Restored')

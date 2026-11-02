@@ -171,6 +171,7 @@ def cmd_serve(source, restored):
                     assert running < after and len(after) == len(running) + 1, (running, after)
         assert seen['source'] == seen['restored'], 'the restored server serves different history'
         assert seen['source']['timers']['items'] and seen['source']['requests']['items'] and seen['source']['invitations']['items']
+        assert any(t['items'] for t in seen['source']['activity']['items']), 'the source has activity'
         print(json.dumps({'served_after_restore': {k: len(v['items']) for k, v in seen['restored'].items()}}))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
