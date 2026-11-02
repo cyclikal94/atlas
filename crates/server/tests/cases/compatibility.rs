@@ -2700,6 +2700,22 @@ async fn people_activity_probes() -> Result<Value> {
     ] {
         results.insert(name.into(), shape(&get(who, path).await));
     }
+    // A cursor at an event the reader cannot see is the same error as a foreign one.
+    let hidden_event = events
+        .items
+        .iter()
+        .find(|e| e.target.id == hidden_field)
+        .expect("an event about the hidden field")
+        .id
+        .clone();
+    let hidden_cursor = get(Some(2), format!("{base}?after={hidden_event}")).await;
+    let foreign_cursor = get(Some(2), format!("{base}?after={}", id())).await;
+    assert_eq!(
+        redact(&hidden_cursor.2, &names),
+        redact(&foreign_cursor.2, &names),
+        "a hidden and a missing cursor are indistinguishable"
+    );
+    results.insert("hidden_cursor".into(), shape(&hidden_cursor));
     let invisible = get(Some(2), format!("people/{private}/activity")).await;
     let missing = get(Some(2), format!("people/{}/activity", id())).await;
     assert_eq!(

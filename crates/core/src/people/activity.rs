@@ -377,12 +377,16 @@ impl Store {
             .map(|i| format!("${}", i + 1))
             .collect::<Vec<_>>()
             .join(",");
-        // The cursor is an event of this person the reader was given. Its position is used
-        // whether or not it is still visible; nothing else about it is returned. A missing event
-        // and another person's event are the same error.
+        let mut visible: BTreeMap<String, Option<Projection>> = BTreeMap::new();
+        // A cursor is accepted only while its event is one this read would itself return: an
+        // event of this person's timeline whose own target the reader can see now, judged in
+        // this snapshot by the same rule as every returned row. An event that has become hidden
+        // (revoked or narrowed field access, an exclusion, a merge source the reader cannot see)
+        // is the same error as a missing event and another person's event, so the cursor never
+        // reveals that a hidden event exists or belongs to this timeline.
         let mut position = if let Some(after) = after {
             let mut query = sqlx::query(sqlx::AssertSqlSafe(format!(
-                "SELECT revision,ordinal FROM person_activity_events WHERE person_id IN ({members_sql}) AND id=${}",
+                "SELECT revision,ordinal,target_id FROM person_activity_events WHERE person_id IN ({members_sql}) AND id=${}",
                 members.len() + 1
             )));
             for member in &members {
@@ -393,11 +397,17 @@ impl Store {
                 .fetch_optional(&mut *tx)
                 .await?
                 .ok_or_else(|| anyhow!(ErrorCode::InvalidValue))?;
+            let target: String = row.get(2);
+            let mut found =
+                Self::subset_batch(&mut tx, actor, &BTreeSet::from([target.clone()])).await?;
+            let projection = found.remove(&target);
+            let shown = projection.is_some();
+            visible.insert(target, projection);
+            ensure!(shown, ErrorCode::InvalidValue);
             Some((row.get::<i64, _>(0), row.get::<i64, _>(1)))
         } else {
             None
         };
-        let mut visible: BTreeMap<String, Option<Projection>> = BTreeMap::new();
         let mut kept: Vec<(Candidate, Projection)> = Vec::new();
         'scan: loop {
             let n = members.len();

@@ -1359,6 +1359,95 @@ async fn a_1006_database_upgrades_to_1007_in_place_without_inventing_activity() 
 
 /// Both shapes refuse a dangling reference, an unknown type, a non-boolean flag, an out-of-range
 /// ordinal, a second event at one position and a second coverage row.
+const FRESH_SQLITE: &str = include_str!("../../../src/storage/schema/sqlite.sql");
+const FRESH_POSTGRES: &str = include_str!("../../../src/storage/schema/postgres.sql");
+const UPGRADE_1007_SQLITE: &str =
+    include_str!("../../../src/storage/schema/upgrade_1007_sqlite.sql");
+const UPGRADE_1007_POSTGRES: &str =
+    include_str!("../../../src/storage/schema/upgrade_1007_postgres.sql");
+
+/// The value expression of the one `person_activity_coverage` insert in `source`.
+fn coverage_expression(source: &str) -> &str {
+    let inserts: Vec<&str> = source
+        .lines()
+        .filter(|line| line.starts_with("INSERT INTO person_activity_coverage"))
+        .collect();
+    assert_eq!(inserts.len(), 1, "exactly one coverage insert");
+    inserts[0]
+        .split_once("VALUES (1,")
+        .and_then(|(_, rest)| rest.trim().strip_suffix(");"))
+        .expect("VALUES (1, <expression>);")
+        .trim()
+}
+
+/// R2 (review 2 November 2026): the coverage start is whole seconds *truncated*, like SQLite's
+/// `strftime('%s')` and every event's `occurred_at` (Rust `as_secs`). A bare PostgreSQL cast of
+/// the fractional epoch rounds, putting the start up to half a second in the future. Evaluates
+/// the exact expression of both the fresh schema and the `1007` upgrade at fixed fractional
+/// instants, so the result does not depend on when the test runs.
+#[tokio::test]
+async fn the_coverage_start_truncates_fractional_seconds_on_both_ddl_paths() -> Result<()> {
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let store = Store::connect(&url).await?;
+    let postgres = crate::support::database::postgres();
+    let (clock, sources) = if postgres {
+        (
+            "now()",
+            [
+                ("fresh", FRESH_POSTGRES),
+                ("upgrade", UPGRADE_1007_POSTGRES),
+            ],
+        )
+    } else {
+        (
+            "'now'",
+            [("fresh", FRESH_SQLITE), ("upgrade", UPGRADE_1007_SQLITE)],
+        )
+    };
+    let instant = |time: &str| {
+        if postgres {
+            format!("'2026-11-02 {time}+00'::timestamptz")
+        } else {
+            format!("'2026-11-02 {time}'")
+        }
+    };
+    // 2026-11-02 12:00:00 UTC.
+    const NOON: i64 = 1_793_620_800;
+    let cases = [
+        ("12:00:00", NOON),
+        ("12:00:00.4", NOON),
+        ("12:00:00.5", NOON),
+        ("12:00:00.6", NOON),
+        ("12:00:59.999", NOON + 59),
+    ];
+    for (name, source) in sources {
+        let expression = coverage_expression(source);
+        assert_eq!(
+            expression.matches(clock).count(),
+            1,
+            "{name}: one clock read"
+        );
+        for (time, expected) in cases {
+            let sql = format!("SELECT {}", expression.replace(clock, &instant(time)));
+            let got: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+                .fetch_one(&store.pool)
+                .await?;
+            assert_eq!(got, expected, "{name} at {time}: {expression}");
+        }
+    }
+    // Negative control: the probe does see the difference a rounding cast makes.
+    if postgres {
+        let rounded: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT CAST(EXTRACT(EPOCH FROM {}) AS bigint)",
+            instant("12:00:00.6")
+        )))
+        .fetch_one(&store.pool)
+        .await?;
+        assert_eq!(rounded, NOON + 1);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn the_activity_tables_enforce_their_constraints_on_both_shapes() -> Result<()> {
     let (_dir, url) = crate::support::database::database_url().await?;

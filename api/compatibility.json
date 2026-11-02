@@ -1,6 +1,6 @@
 {
   "api_version": "0.29.2",
-  "contract_sha256": "65eb43b9948d87a754731d77056536c92bcef7c0efcfb3d7d4936d82fb783675",
+  "contract_sha256": "4985944722a545d98c9269370536ed6f36f75f1cdb637c8809116cb96ba56fc2",
   "behaviour": {
     "activation": {
       "activate": {
@@ -858,6 +858,15 @@
         "status": 200
       },
       "foreign_cursor": {
+        "body": {
+          "code": "invalid_value",
+          "details": [],
+          "message": "Check the request fields and values."
+        },
+        "cache_control": "private, no-store",
+        "status": 422
+      },
+      "hidden_cursor": {
         "body": {
           "code": "invalid_value",
           "details": [],

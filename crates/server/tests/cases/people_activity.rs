@@ -465,3 +465,91 @@ async fn devices_of_one_account_read_one_timeline_and_a_retry_adds_nothing() -> 
     assert_eq!(bobs.2["items"][0]["actor"], json!({"kind": "someone_else"}));
     Ok(())
 }
+
+/// One activity read of `s.shared` with `after` as the cursor.
+async fn cursor(s: &Scene, token: &str, after: &str) -> Reply {
+    get(
+        s,
+        Some(token),
+        &format!("people/{}/activity?after={after}", s.shared),
+    )
+    .await
+}
+
+/// The owner replaces the shared field's policy.
+async fn replace_field_policy(s: &Scene, policy: Policy) -> Result<i64> {
+    let version = s.w.store.resource_policy(&s.alice, &s.field).await?.version;
+    s.w.store
+        .management(
+            &s.alice,
+            &id(),
+            &[atlas_core::households::ManagementCommand::ReplacePolicy {
+                id: s.field.clone(),
+                expected_version: version,
+                policy,
+            }],
+            now(),
+        )
+        .await
+}
+
+/// R1 (review 2 November 2026): over HTTP, an event the reader cannot currently see is the same
+/// `422 invalid_value` as a missing cursor, byte for byte apart from the request id, whether it
+/// was never visible or became hidden after the reader was given it.
+#[tokio::test]
+async fn a_hidden_event_is_the_same_invalid_cursor_as_a_missing_one() -> Result<()> {
+    let s = scene().await?;
+    let base = format!("people/{}/activity", s.shared);
+    let owner =
+        s.w.store
+            .person_activity(&s.alice, &s.shared, None, 100)
+            .await?;
+    let event_of = |target: &str| {
+        owner
+            .items
+            .iter()
+            .find(|e| e.target.id == target)
+            .map(|e| e.id.clone())
+            .expect("an event about the target")
+    };
+    let (field_event, private_event) = (event_of(&s.field), event_of(&s.private_field));
+    let missing = cursor(&s, &s.bob_token, &id()).await;
+    assert_error(&missing, StatusCode::UNPROCESSABLE_ENTITY, "invalid_value");
+    let missing = strip(missing.2);
+    // Positive control: Bob was given the field's event and can page after it.
+    let visible = cursor(&s, &s.bob_token, &field_event).await;
+    assert_eq!(visible.0, StatusCode::OK, "{}", visible.2);
+    conforms("PersonActivityPage", &visible.2);
+    // An event Bob never could see.
+    let never = cursor(&s, &s.bob_token, &private_event).await;
+    assert_error(&never, StatusCode::UNPROCESSABLE_ENTITY, "invalid_value");
+    assert_eq!(strip(never.2), missing);
+    // The owner can use both.
+    for event in [&field_event, &private_event] {
+        assert_eq!(cursor(&s, &s.alice_phone, event).await.0, StatusCode::OK);
+    }
+    // Revoking only the field: Bob keeps the person, and the event Bob was given is now invalid.
+    replace_field_policy(&s, Policy::default()).await?;
+    let page = get(&s, Some(&s.bob_token), &base).await;
+    assert_eq!(page.0, StatusCode::OK);
+    assert_eq!(page.2["items"].as_array().unwrap().len(), 1, "{}", page.2);
+    let revoked = cursor(&s, &s.bob_token, &field_event).await;
+    assert_error(&revoked, StatusCode::UNPROCESSABLE_ENTITY, "invalid_value");
+    assert_eq!(strip(revoked.2), missing);
+    // Regaining it restores the cursor.
+    replace_field_policy(
+        &s,
+        Policy {
+            grants: vec![PrincipalGrant::Account {
+                id: s.bob.clone(),
+                edit: true,
+            }],
+            exclude_accounts: vec![],
+        },
+    )
+    .await?;
+    let regained = cursor(&s, &s.bob_token, &field_event).await;
+    assert_eq!(regained.0, StatusCode::OK);
+    assert_eq!(strip(regained.2), strip(visible.2));
+    Ok(())
+}

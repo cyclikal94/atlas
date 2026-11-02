@@ -9,7 +9,8 @@
 //! (the person, 99 field creations and 4,900 edits, one in every 98 on field 0). A second person
 //! has three people merged into it, each with ten fields and ten edits. Uses a disposable SQLite
 //! file, or a fresh schema in the disposable PostgreSQL database named by ATLAS_TEST_POSTGRES_URL.
-//! `ATLAS_LOAD_ITERATIONS` (default 200) sets the timed reads per case.
+//! `ATLAS_LOAD_ITERATIONS` (default 200) sets the timed reads per case, for the first page and,
+//! when there is one, for the page after it (`second_page`, which resolves a cursor).
 use anyhow::{Result, ensure};
 use atlas_core::{
     Command, Store,
@@ -106,12 +107,33 @@ async fn timed(
 ) -> Result<(serde_json::Value, usize)> {
     let mut samples = Vec::with_capacity(iterations);
     let mut items = 0;
+    let mut cursor = None;
     for _ in 0..iterations {
         let started = Instant::now();
         let page = s.person_activity(reader, person, None, 50).await?;
         samples.push(started.elapsed().as_secs_f64() * 1000.0);
         items = page.items.len();
+        cursor = page.next_after;
     }
+    // The page after the first one: the cursor is resolved and its own event's visibility checked
+    // before the scan continues (BE-PEOPLE-ACTIVITY R1).
+    let mut cursor_samples = Vec::with_capacity(iterations);
+    if let Some(after) = &cursor {
+        for _ in 0..iterations {
+            let started = Instant::now();
+            s.person_activity(reader, person, Some(after), 50).await?;
+            cursor_samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+    let cursor_page = if cursor_samples.is_empty() {
+        serde_json::Value::Null
+    } else {
+        json!({
+            "p50_ms": round(percentile(&mut cursor_samples, 0.5)),
+            "p95_ms": round(percentile(&mut cursor_samples, 0.95)),
+            "max_ms": round(percentile(&mut cursor_samples, 1.0)),
+        })
+    };
     // A complete walk at the default size, for the total cost of reading everything.
     let started = Instant::now();
     let (mut after, mut pages, mut walked) = (None::<String>, 0, 0);
@@ -136,6 +158,7 @@ async fn timed(
             "walk_pages": pages,
             "walk_items": walked,
             "walk_ms": round(walk_ms),
+            "second_page": cursor_page,
         }),
         walked,
     ))

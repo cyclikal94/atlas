@@ -167,7 +167,8 @@ PATCH change; the write side effects (events inserted in the same transaction as
 supported change) are not observable by any existing route. It needs database schema
 `1007`, which adds the metadata-only event table and the coverage start; no earlier activity
 exists. Events store no names, labels or values; every read applies current access to each
-event, names only the reader, the person's current owner or its currently linked account,
+event (including to the `after` cursor, which is valid only while its own event is visible to
+the reader), names only the reader, the person's current owner or its currently linked account,
 and omits sharing changes. A client must call the read only once the server reports `0.29.2`
 or later. See [people](people.md#activity-timeline). The compatibility baseline gains a
 `people_activity` probe group. `0.29.1` and `0.30.0` are claimed by other unintegrated

@@ -293,7 +293,11 @@ reconstructed, so present older history as unknown, not empty. Order is commit o
 do not re-sort by it. `next_after` is the last item's id, present only when a further
 visible item exists. A new event always sorts before every existing cursor, so following
 `next_after` never repeats or gains items; `after` must be an event of this person's
-timeline, and any other value (missing, another person's, malformed) is `422 invalid_value`.
+timeline that the caller can currently see, judged in the same snapshot and by the same rule as
+the returned rows. Any other value (missing, another person's, malformed, or an event hidden from
+the caller now, including one it was given before a revoke, an exclusion or a merge of a source it
+cannot see) is the same `422 invalid_value`, so a saved cursor never reveals that a hidden event
+exists.
 
 **For WEB-19.** Show no sharing rows and no old values; say "Recorded since …" from
 `coverage_started_at`; deduplicate by event `id`, which is stable across reads, retries and

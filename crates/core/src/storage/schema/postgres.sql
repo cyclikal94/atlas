@@ -1209,6 +1209,6 @@ ALTER TABLE ONLY timer_sessions
 
 
 
-INSERT INTO person_activity_coverage(id, started_at) VALUES (1, CAST(EXTRACT(EPOCH FROM now()) AS bigint));
+INSERT INTO person_activity_coverage(id, started_at) VALUES (1, CAST(floor(EXTRACT(EPOCH FROM now())) AS bigint));
 INSERT INTO sync_clock(id,revision,resource_count) VALUES(1,0,0);
 INSERT INTO atlas_schema(version) VALUES(1007);

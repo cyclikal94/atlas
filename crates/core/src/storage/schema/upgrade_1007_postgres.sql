@@ -60,4 +60,7 @@ ALTER TABLE ONLY person_activity_events
 ALTER TABLE ONLY person_activity_events
     ADD CONSTRAINT person_activity_events_target_id_fkey FOREIGN KEY (target_id) REFERENCES resources(id);
 
-INSERT INTO person_activity_coverage(id, started_at) VALUES (1, CAST(EXTRACT(EPOCH FROM now()) AS bigint));
+-- Whole seconds, truncated like SQLite's strftime('%s') and every event's `occurred_at`: a
+-- bare cast of the fractional epoch rounds, and could put the coverage start up to half a second
+-- in the future, after a change committed in the same second.
+INSERT INTO person_activity_coverage(id, started_at) VALUES (1, CAST(floor(EXTRACT(EPOCH FROM now())) AS bigint));

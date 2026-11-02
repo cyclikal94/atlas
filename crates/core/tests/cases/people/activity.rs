@@ -1467,6 +1467,149 @@ async fn a9_history_follows_current_access_on_every_read() -> Result<()> {
     Ok(())
 }
 
+/// The error a cursor read returns, or `None` when the read succeeds. Includes the rendered
+/// message so a hidden, a missing and a foreign cursor can be compared exactly.
+async fn cursor_error(
+    s: &Store,
+    reader: &str,
+    person: &str,
+    after: &str,
+) -> Option<(Option<ErrorCode>, String)> {
+    match s.person_activity(reader, person, Some(after), 50).await {
+        Ok(_) => None,
+        Err(error) => Some((code(&error), format!("{error:#}"))),
+    }
+}
+
+/// R1 (review 2 November 2026): a cursor is accepted only while its event is one the reader can
+/// currently see. Otherwise a saved event ID would tell a reader that a now-hidden event exists in
+/// this timeline (200) rather than not (422).
+#[tokio::test]
+async fn a9_a_cursor_is_accepted_only_while_its_event_is_visible_to_the_reader() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (alice, carol) = (account(&s).await?, account(&s).await?);
+    let home = household(&s, &alice, &carol).await?;
+    let shared = grants(&[(&carol, false)]);
+    let p = create_person(&s, &alice, "Morgan", shared.clone()).await?;
+    let f = create_field(&s, &alice, &p, "Hobby", shared.clone()).await?;
+    edit(&s, &alice, &f, "Hobby", "Rowing").await?;
+    create_field(&s, &alice, &p, "Pets", shared.clone()).await?;
+    let other = create_person(&s, &alice, "Other", shared.clone()).await?;
+
+    let all = walk(&s, &carol, &p, 50).await?;
+    assert_eq!(
+        types(&all),
+        [
+            T::FieldCreated,
+            T::FieldEdited,
+            T::FieldCreated,
+            T::PersonCreated
+        ]
+    );
+    let (edited, person_created) = (all[1].id.clone(), all[3].id.clone());
+    assert_eq!(all[1].target.id, f);
+    // Positive control: a visible cursor continues strictly after its position.
+    let rest = s.person_activity(&carol, &p, Some(&edited), 50).await?;
+    assert_eq!(ids_of(&rest.items), ids_of(&all[2..]));
+    // The uniform invalid-cursor result: a missing event and another person's event.
+    let missing = cursor_error(&s, &carol, &p, &id()).await;
+    assert_eq!(
+        missing.as_ref().map(|e| e.0),
+        Some(Some(ErrorCode::InvalidValue))
+    );
+    let foreign = walk(&s, &carol, &other, 50).await?[0].id.clone();
+    assert_eq!(cursor_error(&s, &carol, &p, &foreign).await, missing);
+
+    // Each way of losing the field while keeping the person: the field's events become an
+    // invalid cursor for Carol, exactly as a missing one, while the owner can still use them and
+    // the person's own event stays a valid cursor for Carol.
+    let hiders = [
+        Policy::default(),
+        Policy {
+            grants: vec![PrincipalGrant::Household {
+                id: home.clone(),
+                edit: false,
+            }],
+            exclude_accounts: vec![carol.clone()],
+        },
+    ];
+    for hider in hiders {
+        replace_policy(&s, &alice, &f, hider.clone()).await?;
+        assert_eq!(
+            types(&walk(&s, &carol, &p, 50).await?),
+            [T::FieldCreated, T::PersonCreated],
+            "{hider:?}"
+        );
+        for event in [&all[1].id, &all[2].id] {
+            assert_eq!(
+                cursor_error(&s, &carol, &p, event).await,
+                missing,
+                "{hider:?}"
+            );
+            assert!(cursor_error(&s, &alice, &p, event).await.is_none());
+        }
+        let after_person = s
+            .person_activity(&carol, &p, Some(&person_created), 50)
+            .await?;
+        assert!(after_person.items.is_empty());
+        // Regaining access makes the cursor valid again, with the same continuation.
+        replace_policy(&s, &alice, &f, shared.clone()).await?;
+        let regained = s.person_activity(&carol, &p, Some(&edited), 50).await?;
+        assert_eq!(regained.items, rest.items);
+    }
+
+    // The cursor is judged in the read's own snapshot: a revoke that commits while the read is
+    // paused after its person gate does not affect that read, only the next one.
+    let mut gate = s.hooks().arm(BETWEEN);
+    let read = {
+        let (s, carol, p, edited) = (s.clone(), carol.clone(), p.clone(), edited.clone());
+        tokio::spawn(async move { s.person_activity(&carol, &p, Some(&edited), 50).await })
+    };
+    gate.reached().await;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        replace_policy(&s, &alice, &f, Policy::default()).await
+    })
+    .await
+    .expect("the writer was not blocked by the paused reader")?;
+    gate.release();
+    assert_eq!(read.await??.items, rest.items);
+    assert_eq!(cursor_error(&s, &carol, &p, &edited).await, missing);
+    replace_policy(&s, &alice, &f, shared.clone()).await?;
+
+    // A merged source Carol cannot see: its events are omitted from her page, and are an invalid
+    // cursor for her too; the merge event itself is visible and a valid cursor.
+    let source = create_person(&s, &alice, "Secret", Policy::default()).await?;
+    let source_field = create_field(&s, &alice, &source, "Old note", Policy::default()).await?;
+    merge(&s, &alice, &source, &p, "Morgan").await?;
+    let source_events: Vec<Raw> = raw(&s)
+        .await?
+        .into_iter()
+        .filter(|r| r.target_id == source || r.target_id == source_field)
+        .collect();
+    assert_eq!(source_events.len(), 2);
+    for event in &source_events {
+        assert_eq!(cursor_error(&s, &carol, &p, &event.id).await, missing);
+        assert!(cursor_error(&s, &alice, &p, &event.id).await.is_none());
+    }
+    let for_carol = walk(&s, &carol, &p, 50).await?;
+    assert_eq!(for_carol[0].event_type, T::PersonMerged);
+    let after_merge = s
+        .person_activity(&carol, &p, Some(&for_carol[0].id), 50)
+        .await?;
+    assert_eq!(ids_of(&after_merge.items), ids_of(&for_carol[1..]));
+
+    // Losing the person is `not_found` whatever the cursor.
+    replace_policy(&s, &alice, &p, Policy::default()).await?;
+    for after in [edited.as_str(), source_events[0].id.as_str()] {
+        let error = s
+            .person_activity(&carol, &p, Some(after), 50)
+            .await
+            .unwrap_err();
+        assert_eq!(code(&error), Some(ErrorCode::NotFound));
+    }
+    Ok(())
+}
+
 // A10 -----------------------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1625,6 +1768,88 @@ async fn a10_accepting_a_link_into_an_existing_person_is_a_merge() -> Result<()>
     assert!(
         matches!(&for_alice[0].actor, ActivityAccount::Account { account_id, .. } if *account_id == dave)
     );
+    Ok(())
+}
+
+/// Accepting a cross-owner merge request (`RespondRequest` on a `Proposal::Merge`) records one
+/// merge, attributed to the accepting recipient, and a replay records nothing more. Requesting
+/// the merge records nothing.
+#[tokio::test]
+async fn a10_accepting_a_cross_owner_merge_request_records_one_merge() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (a, b) = (account(&s).await?, account(&s).await?);
+    let source = create_person(&s, &a, "Morgan", grants(&[(&b, false)])).await?;
+    let target = create_person(&s, &b, "Morgan", grants(&[(&a, false)])).await?;
+    let preview = s.merge_preview(&a, &source, &target).await?;
+    assert!(
+        preview.requires_approval,
+        "a cross-owner merge needs approval"
+    );
+    let before_request = count(&s).await?;
+    let request = id();
+    s.people_command(
+        &a,
+        &id(),
+        &PeopleCommand::RequestMerge {
+            id: request.clone(),
+            source_id: source.clone(),
+            target_id: target.clone(),
+            preview_token: preview.token,
+            name: "Morgan".into(),
+        },
+        NOW,
+    )
+    .await?;
+    assert_eq!(
+        count(&s).await?,
+        before_request,
+        "a request records nothing"
+    );
+    let token = s.recipient_merge_preview(&b, &request, NOW).await?.token;
+    let accept = PeopleCommand::RespondRequest {
+        id: request,
+        accept: true,
+        recipient_preview_token: Some(token),
+    };
+    let operation = id();
+    s.people_command(&b, &operation, &accept, NOW).await?;
+    let rows: Vec<Raw> = raw(&s).await?.into_iter().skip(before_request).collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let merged = &rows[0];
+    assert_eq!(
+        (
+            merged.event_type.as_str(),
+            merged.person_id.as_str(),
+            merged.target_id.as_str(),
+            merged.actor_id.as_str(),
+            merged.merged_from.as_deref(),
+        ),
+        (
+            "person_merged",
+            target.as_str(),
+            target.as_str(),
+            b.as_str(),
+            Some(source.as_str())
+        )
+    );
+    s.people_command(&b, &operation, &accept, NOW).await?;
+    assert_eq!(
+        count(&s).await?,
+        before_request + 1,
+        "a replay records nothing"
+    );
+    // Both parties read the combined timeline, through either ID, newest first.
+    for reader in [&a, &b] {
+        for via in [&source, &target] {
+            let items = walk(&s, reader, via, 50).await?;
+            assert_eq!(
+                types(&items),
+                [T::PersonMerged, T::PersonCreated, T::PersonCreated],
+                "{reader} via {via}"
+            );
+            assert_eq!(items[0].id, merged.id);
+        }
+    }
     Ok(())
 }
 
