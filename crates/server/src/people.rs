@@ -189,3 +189,30 @@ pub(super) async fn field_audiences(
             .await?,
     )?))
 }
+
+/// `GET /people/{id}/activity` paging. An unknown member is a malformed request.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ActivityFilter {
+    after: Option<String>,
+    limit: Option<u16>,
+}
+pub(super) async fn activity(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    query: Result<Query<ActivityFilter>, QueryRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (actor, _) = identity(&app, &headers).await?;
+    let Query(filter) = query.map_err(|_| anyhow!(ErrorCode::MalformedRequest))?;
+    Ok(Json(serde_json::to_value(
+        app.store
+            .person_activity(
+                &actor,
+                &id,
+                filter.after.as_deref(),
+                filter.limit.unwrap_or(50),
+            )
+            .await?,
+    )?))
+}

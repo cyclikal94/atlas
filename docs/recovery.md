@@ -54,16 +54,17 @@ restore the saved database with its matching executable and keys.
 
 ## Release compatibility
 
-Atlas is unreleased. The current backup format is 1 and the current schema is 1006. A
-bundle records the schema it holds. Backup and restore accept 1000 to 1006: 1000 to 1005
+Atlas is unreleased. The current backup format is 1 and the current schema is 1007. A
+bundle records the schema it holds. Backup and restore accept 1000 to 1007: 1000 to 1006
 are previous baselines, which are what a "back up before upgrading" bundle contains (the
-executable upgrades them in place when restore prepares it), and 1006 is current;
+executable upgrades them in place when restore prepares it), and 1007 is current;
 incompatible experimental schemas, including any version above the current one, are
 rejected by both commands. The accepted range is `SUPPORTED_SCHEMAS` in
 `scripts/backup.py`. A test in `atlas-core` fails when that range stops matching the
 server's migration chain, so a schema change cannot ship without the tool learning it.
 A restore keeps every durable table row for row, including timer history, the durable
-sent-request and sent-invitation histories, person attributions, receipts and the
+sent-request and sent-invitation histories, person attributions, People activity events and
+their coverage start, receipts and the
 device-retirement ledger;
 only the login, delivery and sync state listed above is reset. `scripts/test_recovery.py`
 (SQLite) and `scripts/test-postgres-release.sh` (PostgreSQL) prove this against real

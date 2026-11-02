@@ -19,7 +19,7 @@ use crate::support::retirement::{
     ORIGIN, PASSWORD, Reply, World, attempt, bearer, id, login, world,
 };
 
-fn contract() -> Value {
+pub(crate) fn contract() -> Value {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../api/openapi.json");
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
 }
@@ -28,7 +28,12 @@ const UUID_PATTERN: &str = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-
 
 /// A JSON Schema check for the keywords these responses use. An unsupported keyword that applies
 /// to a value fails loudly rather than passing silently.
-fn check(contract: &Value, schema: &Value, value: &Value, at: &str) -> Result<(), String> {
+pub(crate) fn check(
+    contract: &Value,
+    schema: &Value,
+    value: &Value,
+    at: &str,
+) -> Result<(), String> {
     let fail = |why: String| Err(format!("{at}: {why} in {value}"));
     if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
         let name = reference.trim_start_matches("#/components/schemas/");
@@ -177,7 +182,7 @@ fn check(contract: &Value, schema: &Value, value: &Value, at: &str) -> Result<()
     Ok(())
 }
 
-fn conforms(schema: &str, body: &Value) {
+pub(crate) fn conforms(schema: &str, body: &Value) {
     let contract = contract();
     if let Err(why) = check(
         &contract,

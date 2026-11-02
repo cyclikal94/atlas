@@ -2,7 +2,7 @@
   "openapi": "3.1.1",
   "info": {
     "title": "Atlas API",
-    "version": "0.29.0",
+    "version": "0.29.2",
     "description": "Pre-release API. Breaking changes and explicit database resets are permitted until a supported release."
   },
   "servers": [
@@ -17167,6 +17167,223 @@
           ]
         }
       }
+    },
+    "/people/{id}/activity": {
+      "get": {
+        "operationId": "getPersonActivity",
+        "summary": "List a person's recorded activity",
+        "description": "Authenticated like every other protected read. Online-only and identity-bound: not part of `/sync`, not cacheable (`Cache-Control: private, no-store`), never an access grant. Read in one database snapshot. One page, newest first in commit order, of the metadata-only events recorded for the person (and every person merged into it) since `coverage_started_at`: additions, renames, archive and restore of the person and of its fields, field edits (which parts changed, never their content), account link and unlink, and merges. Sharing and audience changes, request lifecycle, task and list changes are not recorded, and nothing earlier than `coverage_started_at` exists or is reconstructed. Every read applies the reader's current access: the person must be visible (otherwise `not_found`, exactly as `GET /people/{id}`), and each event is returned only while the reader can currently see the person or field it is about; a merge's source is named only while it is visible. Hidden events never count toward `limit`, `next_after` or anything else. Labels are the items' current labels; no earlier name, label or value is stored or returned. An actor or linked account is named only when it is the reader (`you`), the person's current owner or its currently linked account; anyone else is `someone_else`, without an identifier. Freshness: re-read from the first page when `/sync` delivers a change to the person or any of its fields, after a command receipt, after snapshot or access-epoch recovery and on re-authentication; a `404` means access was lost (clear any held history); `invalid_value` for `after` means restart from the first page. Event `id`s are stable across reads, retries and devices.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "A person id; a merged person's old id resolves to the person it was merged into."
+          },
+          {
+            "in": "query",
+            "name": "after",
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "The `next_after` of the previous page: an event of this person's timeline. Any other value is `invalid_value`."
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 50
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonActivityPage"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "malformed_request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "unauthenticated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "forbidden, credential_mismatch",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "not_found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "invalid_value",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "internal_error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "slice_capacity, temporarily_unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "X-Request-ID": {
+                "description": "Server-generated ID correlated with sanitised logs and error bodies.",
+                "schema": {
+                  "type": "string",
+                  "format": "uuid"
+                }
+              }
+            }
+          }
+        },
+        "x-error-codes": {
+          "400": [
+            "malformed_request"
+          ],
+          "401": [
+            "unauthenticated"
+          ],
+          "403": [
+            "forbidden",
+            "credential_mismatch"
+          ],
+          "404": [
+            "not_found"
+          ],
+          "422": [
+            "invalid_value"
+          ],
+          "500": [
+            "internal_error"
+          ],
+          "503": [
+            "slice_capacity",
+            "temporarily_unavailable"
+          ]
+        }
+      }
     }
   },
   "components": {
@@ -24225,6 +24442,255 @@
           "next_after",
           "home",
           "preferences_version"
+        ],
+        "additionalProperties": false
+      },
+      "ActivityAccount": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "const": "you"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "const": "account"
+              },
+              "account_id": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              },
+              "username": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "account_id",
+              "username"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "const": "someone_else"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "additionalProperties": false
+          }
+        ],
+        "description": "An account as this reader may see it. `account` only for the person's current owner or currently linked account; any other account is `someone_else`, carrying no identifier, so two such accounts are indistinguishable."
+      },
+      "ActivityTarget": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "person",
+              "field"
+            ]
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 300,
+            "description": "The item's current label, not the label it had when the event happened."
+          },
+          "archived": {
+            "type": "boolean",
+            "description": "Current."
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "current",
+              "merged"
+            ],
+            "description": "`merged` for a person id that now resolves to `canonical_person_id`."
+          },
+          "canonical_person_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "Present only when `state` is `merged`."
+          },
+          "field_kind": {
+            "type": "string",
+            "enum": [
+              "text",
+              "quantity",
+              "date",
+              "url",
+              "boolean",
+              "choices",
+              "checklist"
+            ],
+            "description": "The field value's current kind. Fields only."
+          }
+        },
+        "required": [
+          "kind",
+          "id",
+          "label",
+          "archived",
+          "state"
+        ],
+        "additionalProperties": false,
+        "description": "The person or field the event is about, as the reader can currently see it."
+      },
+      "PersonActivityEvent": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "Stable event identity: deduplicate by it across reads, retries and devices."
+          },
+          "occurred_at": {
+            "type": "integer",
+            "description": "Server Unix seconds at commit. Informational: ordering is commit order, and replicas' clocks may differ."
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "person_created",
+              "person_renamed",
+              "person_archived",
+              "person_restored",
+              "person_linked",
+              "person_unlinked",
+              "person_merged",
+              "field_created",
+              "field_edited",
+              "field_archived",
+              "field_restored"
+            ]
+          },
+          "summary": {
+            "type": "string",
+            "enum": [
+              "Added this person",
+              "Renamed this person",
+              "Archived this person",
+              "Restored this person",
+              "Linked this person to an account",
+              "Unlinked this person from an account",
+              "Merged another profile into this person",
+              "Added a field",
+              "Edited a field",
+              "Archived a field",
+              "Restored a field"
+            ],
+            "description": "A fixed UK-English phrase for `type`. It never contains user content; presentation belongs to the client."
+          },
+          "actor": {
+            "$ref": "#/components/schemas/ActivityAccount"
+          },
+          "target": {
+            "$ref": "#/components/schemas/ActivityTarget"
+          },
+          "changed": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "label",
+                "value"
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 2,
+            "description": "`field_edited` only: which parts changed, never their content."
+          },
+          "account": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/ActivityAccount"
+              }
+            ],
+            "description": "`person_linked` and `person_unlinked` only: the linked or previously linked account."
+          },
+          "merged_from": {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/SummaryPersonRef"
+              }
+            ],
+            "description": "`person_merged` only, and only while the reader can see the person merged in; otherwise omitted."
+          }
+        },
+        "required": [
+          "id",
+          "occurred_at",
+          "type",
+          "summary",
+          "actor",
+          "target"
+        ],
+        "additionalProperties": false
+      },
+      "PersonActivityPage": {
+        "type": "object",
+        "properties": {
+          "person_id": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+            "description": "The canonical person (the path id may be a merged id)."
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PersonActivityEvent"
+            },
+            "maxItems": 100,
+            "description": "Newest first."
+          },
+          "next_after": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The last item's id, only when a further visible item exists."
+          },
+          "coverage_started_at": {
+            "type": "integer",
+            "description": "Unix seconds when this database began recording activity (its schema 1007 upgrade or creation). Nothing earlier was recorded."
+          }
+        },
+        "required": [
+          "person_id",
+          "items",
+          "next_after",
+          "coverage_started_at"
         ],
         "additionalProperties": false
       },

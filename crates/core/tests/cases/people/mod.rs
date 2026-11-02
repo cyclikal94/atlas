@@ -1,3 +1,4 @@
+mod activity;
 mod duplicates;
 mod request_retention;
 mod sent_history;

@@ -1,4 +1,5 @@
 use crate::error::ErrorCode;
+use crate::people::{ActivityLog, ActivityType};
 use crate::{Projection, Store, content, identifier, policy::Policy, receipt_digest};
 use anyhow::{Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
@@ -218,6 +219,7 @@ impl Store {
         accounts.insert(actor.into());
         before.entry(actor.into()).or_default();
         let mut result_person = person_id.clone();
+        let mut activity = ActivityLog::default();
         match command {
             PeopleCommand::CancelRequest { id } => {
                 sqlx::query("UPDATE people_requests SET state='cancelled' WHERE id=$1 AND sender_id=$2 AND state='pending'").bind(id).bind(actor).execute(&mut *tx).await?;
@@ -268,6 +270,9 @@ impl Store {
                     .bind(actor)
                     .execute(&mut *tx)
                     .await?;
+                    // The referencer created the person, already linked to the referenced account.
+                    activity.person(&person_id, ActivityType::PersonCreated);
+                    activity.link(&person_id, account_id, true);
                 }
                 ensure!(sqlx::query_scalar::<_,i64>("SELECT COUNT(*) FROM resource_exclusions WHERE resource_id=$1 AND account_id=$2").bind(&person_id).bind(actor).fetch_one(&mut *tx).await?==0, ErrorCode::NotFound);
                 if Self::subset(&mut tx, actor, &BTreeSet::from([person_id.clone()]))
@@ -386,6 +391,7 @@ impl Store {
                             &mut touched,
                         )
                         .await?;
+                        activity.merge(&person_id, source);
                     }
                 }
             }
@@ -436,6 +442,8 @@ impl Store {
                                     &mut touched,
                                 )
                                 .await?;
+                                // Linking into the account's existing person is a merge.
+                                activity.merge(target, &source);
                                 result_person = target.clone();
                             } else {
                                 Self::freeze_fields(&mut tx, &touched, &before).await?;
@@ -448,6 +456,7 @@ impl Store {
                                     .await?;
                                 Self::value(&mut tx, &source, &p.label, &p.value.to_string())
                                     .await?;
+                                activity.link(&source, actor, true);
                             }
                         }
                         Proposal::Merge {
@@ -491,6 +500,7 @@ impl Store {
                                 &mut touched,
                             )
                             .await?;
+                            activity.merge(&target_id, &source_id);
                         }
                     }
                 }
@@ -517,11 +527,17 @@ impl Store {
                         .fetch_optional(&mut *tx)
                         .await?;
                 ensure!(subject.as_deref() == Some(actor), ErrorCode::Forbidden);
-                let version: i64 = sqlx::query_scalar("SELECT version FROM resources WHERE id=$1")
+                let row = sqlx::query("SELECT version,label FROM resources WHERE id=$1")
                     .bind(&person_id)
                     .fetch_one(&mut *tx)
                     .await?;
-                ensure!(version == *expected_version, ErrorCode::Conflict);
+                ensure!(
+                    row.get::<i64, _>(0) == *expected_version,
+                    ErrorCode::Conflict
+                );
+                if row.get::<String, _>(1) != *name {
+                    activity.person(&person_id, ActivityType::PersonRenamed);
+                }
                 Self::value(&mut tx, &person_id, name, "").await?;
             }
             PeopleCommand::Unlink {
@@ -547,6 +563,11 @@ impl Store {
                     .bind(&person_id)
                     .execute(&mut *tx)
                     .await?;
+                activity.link(
+                    &person_id,
+                    subject.as_deref().expect("checked above"),
+                    false,
+                );
                 sqlx::query("UPDATE resources SET version=version+1 WHERE id=$1")
                     .bind(&person_id)
                     .execute(&mut *tx)
@@ -558,6 +579,8 @@ impl Store {
             before.entry(account.clone()).or_default();
         }
         let revision = Self::publish(&mut tx, &accounts, &touched, &before, true).await?;
+        hook!(self, "people_activity.before_record", &mut tx);
+        Self::record_activity(&mut tx, actor, revision, now, &activity).await?;
         sqlx::query(
             "INSERT INTO receipts(account_id,operation_id,payload,revision) VALUES ($1,$2,$3,$4)",
         )

@@ -2527,6 +2527,190 @@ async fn people_summary_probes() -> Result<Value> {
     Ok(Value::Object(results))
 }
 
+/// BE-PEOPLE-ACTIVITY: `GET /people/{id}/activity` shapes, actor kinds, hidden-field omission, the
+/// continuation, `not_found` parity, cursor and limit errors. Event ids and times are random or
+/// wall-clock, so they are replaced by placeholders; the order is commit order, so it is fixed.
+async fn people_activity_probes() -> Result<Value> {
+    use crate::support::http::request;
+    use crate::support::retirement::{PASSWORD, Reply, bearer, id, login, world};
+    use atlas_core::{
+        Command,
+        policy::{Policy, PrincipalGrant},
+    };
+
+    fn redact(value: &Value, names: &BTreeMap<String, &str>) -> Value {
+        match value {
+            Value::String(s) => names
+                .get(s)
+                .map_or_else(|| value.clone(), |name| json!(name)),
+            Value::Array(items) => Value::Array(items.iter().map(|v| redact(v, names)).collect()),
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .filter(|(k, _)| k.as_str() != "request_id")
+                    .map(|(k, v)| {
+                        let v = match k.as_str() {
+                            "occurred_at" | "coverage_started_at" => json!("UNIX_SECONDS"),
+                            _ => redact(v, names),
+                        };
+                        (k.clone(), v)
+                    })
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+    let w = world(false).await?;
+    let alice = w.alice.clone();
+    let bob: String = sqlx::query_scalar("SELECT id FROM accounts WHERE username='device-bob'")
+        .fetch_one(&w.store.pool)
+        .await?;
+    let carol = id();
+    w.store
+        .add_account(
+            &carol,
+            "activity-carol",
+            &atlas_server::hash_password(PASSWORD.into()).await?,
+        )
+        .await?;
+    let shared = "00000000-0000-4000-8000-00000000ac01".to_owned();
+    let private = "00000000-0000-4000-8000-00000000ac02".to_owned();
+    let field = "00000000-0000-4000-8000-00000000ac03".to_owned();
+    let hidden_field = "00000000-0000-4000-8000-00000000ac04".to_owned();
+    let to = |grants: &[(&str, bool)]| Policy {
+        grants: grants
+            .iter()
+            .map(|(id, edit)| PrincipalGrant::Account {
+                id: (*id).into(),
+                edit: *edit,
+            })
+            .collect(),
+        exclude_accounts: vec![],
+    };
+    w.store
+        .apply(
+            &alice,
+            &id(),
+            &[
+                Command::CreatePerson {
+                    id: shared.clone(),
+                    name: "Morgan".into(),
+                    initial_policy: Some(to(&[(&bob, true), (&carol, false)])),
+                },
+                Command::CreateField {
+                    id: field.clone(),
+                    person_id: shared.clone(),
+                    label: "Hobby".into(),
+                    value: "Surfing".into(),
+                    initial_policy: Some(to(&[(&bob, true), (&carol, false)])),
+                },
+                Command::CreateField {
+                    id: hidden_field.clone(),
+                    person_id: shared.clone(),
+                    label: "Medical note".into(),
+                    value: "private".into(),
+                    initial_policy: Some(Policy::default()),
+                },
+                Command::CreatePerson {
+                    id: private.clone(),
+                    name: "Private".into(),
+                    initial_policy: Some(Policy::default()),
+                },
+            ],
+        )
+        .await?;
+    for (actor, resource, label) in [
+        (&bob, &field, "Pastime"),
+        (&alice, &hidden_field, "Medical"),
+    ] {
+        let (version, policy_version): (i64, i64) =
+            sqlx::query_as("SELECT version,policy_version FROM resources WHERE id=$1")
+                .bind(resource)
+                .fetch_one(&w.store.pool)
+                .await?;
+        w.store
+            .apply(
+                actor,
+                &id(),
+                &[Command::Edit {
+                    id: resource.clone(),
+                    expected_version: version,
+                    expected_policy_version: Some(policy_version),
+                    label: label.into(),
+                    value: "changed".into(),
+                }],
+            )
+            .await?;
+    }
+    let mut names: BTreeMap<String, &str> = [
+        (alice.clone(), "ALICE"),
+        (bob.clone(), "BOB"),
+        (carol.clone(), "CAROL"),
+        (shared.clone(), "SHARED_PERSON"),
+        (private.clone(), "PRIVATE_PERSON"),
+        (field.clone(), "SHARED_FIELD"),
+        (hidden_field.clone(), "HIDDEN_FIELD"),
+    ]
+    .into_iter()
+    .collect();
+    let events = w.store.person_activity(&alice, &shared, None, 100).await?;
+    let event_names: Vec<String> = (0..events.items.len())
+        .map(|i| format!("EVENT_{i}"))
+        .collect();
+    for (event, name) in events.items.iter().zip(&event_names) {
+        names.insert(event.id.clone(), name.as_str());
+    }
+    let tokens = [
+        bearer(&login(&w.app, "device-alice", "phone").await),
+        bearer(&login(&w.app, "device-bob", "laptop").await),
+        bearer(&login(&w.app, "activity-carol", "tablet").await),
+    ];
+    let get = |who: Option<usize>, path: String| {
+        let app = w.app.clone();
+        let auth = who.map(|i| tokens[i].clone());
+        async move {
+            let headers: Vec<(&str, &str)> = auth
+                .as_deref()
+                .map(|a| vec![("authorization", a)])
+                .unwrap_or_default();
+            request(&app, "GET", &path, &headers, Value::Null).await
+        }
+    };
+    let shape = |reply: &Reply| {
+        json!({
+            "status": reply.0.as_u16(),
+            "cache_control": reply.1.get("cache-control").map(|v| v.to_str().unwrap()),
+            "body": redact(&reply.2, &names),
+        })
+    };
+    let base = format!("people/{shared}/activity");
+    let mut results = serde_json::Map::new();
+    for (name, who, path) in [
+        ("owner_timeline", Some(0), base.clone()),
+        ("editor_timeline", Some(1), base.clone()),
+        ("reader_timeline", Some(2), base.clone()),
+        ("reader_first_page", Some(2), format!("{base}?limit=1")),
+        ("foreign_cursor", Some(0), format!("{base}?after={}", id())),
+        ("limit_over", Some(0), format!("{base}?limit=101")),
+        (
+            "unknown_parameter",
+            Some(0),
+            format!("{base}?archived=true"),
+        ),
+        ("unauthenticated", None, base.clone()),
+    ] {
+        results.insert(name.into(), shape(&get(who, path).await));
+    }
+    let invisible = get(Some(2), format!("people/{private}/activity")).await;
+    let missing = get(Some(2), format!("people/{}/activity", id())).await;
+    assert_eq!(
+        redact(&invisible.2, &names),
+        redact(&missing.2, &names),
+        "an invisible and a nonexistent person are indistinguishable"
+    );
+    results.insert("not_found".into(), shape(&invisible));
+    Ok(Value::Object(results))
+}
+
 async fn observe(app: &Router) -> Value {
     json!({
         "activation": activation_probes().await.expect("activation-grant protocol probes"),
@@ -2543,6 +2727,7 @@ async fn observe(app: &Router) -> Value {
         "independent_timers": independent_timer_probes().await.expect("BE-B6 independent-timer probes"),
         "labels_and_capacity": labels_and_capacity_probes().await.expect("BE-Q25 label, naming and capacity probes"),
         "people_summaries": people_summary_probes().await.expect("BE-PEOPLE-SUMMARY viewer-safe summary probes"),
+        "people_activity": people_activity_probes().await.expect("BE-PEOPLE-ACTIVITY timeline probes"),
         "health": probe(app, "/health", &["api_version"]).await,
         "me_unauthenticated": probe(app, "/api/experimental/v1/me", &["request_id"]).await,
         "ready": probe(app, "/ready", &[]).await,

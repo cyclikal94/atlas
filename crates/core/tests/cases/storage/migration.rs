@@ -1,12 +1,13 @@
-//! N1: the additive `1000 -> 1006` upgrade chain and the reset error for anything it cannot walk.
+//! N1: the additive `1000 -> 1007` upgrade chain and the reset error for anything it cannot walk.
 //!
 //! Every legacy baseline is rooted on a *frozen*, genuine schema captured from a release
 //! (`tests/fixtures/schema_100N_*.sql`), never on the current schema. Deriving a legacy database
 //! from the current schema by dropping objects would silently carry whatever the current step
 //! creates (the `1004` timer indexes, the `1005` session labels and device profiles, the `1006`
-//! person attributions) and could not prove a step's `DROP`. `1000`–`1003` are rooted on the frozen
-//! `1003` schema, `1004` on the frozen `1004` schema (BE-Q25) and `1005` on the frozen `1005`
-//! schema (BE-PEOPLE-SUMMARY).
+//! person attributions, the `1007` activity tables) and could not prove a step's `DROP`.
+//! `1000`–`1003` are rooted on the frozen `1003` schema, `1004` on the frozen `1004` schema
+//! (BE-Q25), `1005` on the frozen `1005` schema (BE-PEOPLE-SUMMARY) and `1006` on the frozen `1006`
+//! schema (BE-PEOPLE-ACTIVITY).
 use std::collections::BTreeMap;
 
 use anyhow::Result;
@@ -20,8 +21,10 @@ const FROZEN_1004_SQLITE: &str = include_str!("../../fixtures/schema_1004_sqlite
 const FROZEN_1004_POSTGRES: &str = include_str!("../../fixtures/schema_1004_postgres.sql");
 const FROZEN_1005_SQLITE: &str = include_str!("../../fixtures/schema_1005_sqlite.sql");
 const FROZEN_1005_POSTGRES: &str = include_str!("../../fixtures/schema_1005_postgres.sql");
+const FROZEN_1006_SQLITE: &str = include_str!("../../fixtures/schema_1006_sqlite.sql");
+const FROZEN_1006_POSTGRES: &str = include_str!("../../fixtures/schema_1006_postgres.sql");
 /// The version `migrate()` ends at.
-const CURRENT: i64 = 1006;
+const CURRENT: i64 = 1007;
 
 async fn version(store: &Store) -> Result<Vec<i64>> {
     Ok(
@@ -84,6 +87,21 @@ async fn baseline_1005(url: &str) -> Result<Store> {
     .execute(&store.pool)
     .await?;
     assert_eq!(version(&store).await?, [1005]);
+    Ok(store)
+}
+
+/// A database exactly as the `1006` release left it (BE-PEOPLE-SUMMARY's person attributions
+/// present, BE-PEOPLE-ACTIVITY's activity tables absent).
+async fn baseline_1006(url: &str) -> Result<Store> {
+    let store = Store::connect(url).await?;
+    sqlx::raw_sql(if crate::support::database::postgres() {
+        FROZEN_1006_POSTGRES
+    } else {
+        FROZEN_1006_SQLITE
+    })
+    .execute(&store.pool)
+    .await?;
+    assert_eq!(version(&store).await?, [1006]);
     Ok(store)
 }
 
@@ -1053,7 +1071,8 @@ async fn a_1005_database_upgrades_to_1006_in_place_without_inventing_attribution
     }
 
     store.migrate().await?;
-    assert_eq!(version(&store).await?, [1006]);
+    // The chain continues through 1007; the 1007 step is asserted by its own cases below.
+    assert_eq!(version(&store).await?, [CURRENT]);
     assert_eq!(
         row_digests_over(&store, &old_columns).await?,
         before,
@@ -1089,7 +1108,7 @@ async fn a_1005_database_upgrades_to_1006_in_place_without_inventing_attribution
     store.migrate().await?;
     let restarted = Store::connect(&url).await?;
     restarted.migrate().await?;
-    assert_eq!(version(&restarted).await?, [1006]);
+    assert_eq!(version(&restarted).await?, [CURRENT]);
     assert_eq!(row_digests_over(&restarted, &old_columns).await?, before);
 
     // The upgraded shape is exactly a fresh database's.
@@ -1158,8 +1177,304 @@ async fn two_processes_upgrading_from_1005_at_once_both_succeed() -> Result<()> 
     let (a, b) = tokio::join!(first.migrate(), second.migrate());
     a?;
     b?;
-    assert_eq!(version(&first).await?, [1006]);
+    assert_eq!(version(&first).await?, [CURRENT]);
     assert!(table_exists(&first, "person_attributions").await?);
+    assert_eq!(row_digests_over(&first, &old_columns).await?, before);
+    Ok(())
+}
+
+// ----------------------------------------------------------------- 1006 -> 1007 (BE-PEOPLE-ACTIVITY)
+
+/// The exact columns of the activity tables, in declaration order. No column can hold a name,
+/// label, value or summary (Kieran, 1 November 2026: no old values).
+const EVENT_COLUMNS: [&str; 12] = [
+    "id",
+    "revision",
+    "ordinal",
+    "person_id",
+    "target_id",
+    "event_type",
+    "actor_id",
+    "account_id",
+    "merged_from",
+    "label_changed",
+    "value_changed",
+    "occurred_at",
+];
+
+fn wall_clock() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs() as i64
+}
+
+async fn coverage(store: &Store) -> Result<Vec<i64>> {
+    Ok(
+        sqlx::query_scalar("SELECT started_at FROM person_activity_coverage ORDER BY id")
+            .fetch_all(&store.pool)
+            .await?,
+    )
+}
+
+async fn event_count(store: &Store) -> Result<i64> {
+    Ok(
+        sqlx::query_scalar("SELECT COUNT(*) FROM person_activity_events")
+            .fetch_one(&store.pool)
+            .await?,
+    )
+}
+
+/// The negative control for the `1007` cases: the frozen `1006` schema has no activity tables.
+#[tokio::test]
+async fn the_frozen_1006_baseline_has_no_activity_tables() -> Result<()> {
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let store = baseline_1006(&url).await?;
+    assert!(!table_exists(&store, "person_activity_events").await?);
+    assert!(!table_exists(&store, "person_activity_coverage").await?);
+    assert!(
+        table_exists(&store, "person_attributions").await?,
+        "it is 1006"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_1006_database_upgrades_to_1007_in_place_without_inventing_activity() -> Result<()> {
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let store = baseline_1006(&url).await?;
+    let seed = seed(&store, true).await?;
+    add_session(&store, &seed.account, "phone", FAR).await?;
+    // A pre-1007 person with a field and an attribution: none of it may become an event.
+    let field = id();
+    sqlx::query("INSERT INTO resources(id,owner_id,parent_id,kind,label,value) VALUES ($1,$2,$3,'field','Birthday','{\"kind\":\"text\",\"text\":\"1 May\"}')")
+        .bind(&field)
+        .bind(&seed.account)
+        .bind(&seed.busy)
+        .execute(&store.pool)
+        .await?;
+    sqlx::query("INSERT INTO person_attributions(person_id,added_by) VALUES ($1,$2)")
+        .bind(&seed.busy)
+        .bind(&seed.account)
+        .execute(&store.pool)
+        .await?;
+    let old_columns = columns(&store).await?;
+    let before = row_digests(&store).await?;
+    for table in [
+        "resources",
+        "accounts",
+        "person_attributions",
+        "people_request_history",
+        "sessions",
+        "receipts",
+    ] {
+        assert!(!before[table].is_empty(), "{table} is seeded");
+    }
+
+    let started = wall_clock();
+    store.migrate().await?;
+    let finished = wall_clock();
+    assert_eq!(version(&store).await?, [1007]);
+    assert_eq!(
+        row_digests_over(&store, &old_columns).await?,
+        before,
+        "the step rewrites no existing value"
+    );
+    // No earlier record proves an earlier change, so the step records none.
+    assert_eq!(event_count(&store).await?, 0);
+    let recorded = coverage(&store).await?;
+    assert_eq!(recorded.len(), 1, "exactly one coverage row");
+    assert!(
+        (started..=finished).contains(&recorded[0]),
+        "coverage starts at the upgrade: {started} <= {} <= {finished}",
+        recorded[0]
+    );
+    // The pre-1007 person reads as an empty timeline that says when recording began.
+    let page = store
+        .person_activity(&seed.account, &seed.busy, None, 50)
+        .await?;
+    assert!(page.items.is_empty());
+    assert_eq!(page.next_after, None);
+    assert_eq!(page.coverage_started_at, recorded[0]);
+
+    // Idempotent, also through a restarted connection: coverage is not reset.
+    store.migrate().await?;
+    let restarted = Store::connect(&url).await?;
+    restarted.migrate().await?;
+    assert_eq!(version(&restarted).await?, [1007]);
+    assert_eq!(row_digests_over(&restarted, &old_columns).await?, before);
+    assert_eq!(coverage(&restarted).await?, recorded);
+
+    // The upgraded shape is exactly a fresh database's.
+    let (_fresh_dir, fresh_url) = crate::support::database::database_url().await?;
+    let fresh = Store::connect(&fresh_url).await?;
+    let fresh_started = wall_clock();
+    fresh.migrate().await?;
+    assert_eq!(indexes(&store, None).await?, indexes(&fresh, None).await?);
+    for table in ["person_activity_events", "person_activity_coverage"] {
+        assert_eq!(shape(&fresh, table).await?, shape(&store, table).await?);
+    }
+    assert_eq!(
+        columns(&fresh).await?,
+        columns(&store).await?,
+        "every table has the same columns in the same order"
+    );
+    let fresh_coverage = coverage(&fresh).await?;
+    assert_eq!(fresh_coverage.len(), 1);
+    assert!((fresh_started..=wall_clock()).contains(&fresh_coverage[0]));
+    assert_eq!(
+        columns(&store).await?["person_activity_events"],
+        EVENT_COLUMNS,
+        "metadata only: no name, label, value or summary column"
+    );
+    assert_eq!(
+        columns(&store).await?["person_activity_coverage"],
+        ["id", "started_at"]
+    );
+
+    // After the upgrade a supported change records, and the earlier history stays empty.
+    store
+        .task_command(
+            &seed.account,
+            &id(),
+            &atlas_core::tasks::TaskCommand::Archive {
+                id: seed.busy.clone(),
+                expected_version: 1,
+                archived: true,
+            },
+            None,
+            1,
+        )
+        .await?;
+    let page = store
+        .person_activity(&seed.account, &seed.busy, None, 50)
+        .await?;
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(
+        page.items[0].event_type,
+        atlas_core::people::ActivityType::PersonArchived
+    );
+    Ok(())
+}
+
+/// Both shapes refuse a dangling reference, an unknown type, a non-boolean flag, an out-of-range
+/// ordinal, a second event at one position and a second coverage row.
+#[tokio::test]
+async fn the_activity_tables_enforce_their_constraints_on_both_shapes() -> Result<()> {
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let upgraded = baseline_1006(&url).await?;
+    upgraded.migrate().await?;
+    let (_fresh_dir, fresh_url) = crate::support::database::database_url().await?;
+    let fresh = Store::connect(&fresh_url).await?;
+    fresh.migrate().await?;
+    for db in [&upgraded, &fresh] {
+        let account = id();
+        db.add_account(&account, &format!("u{}", account.replace('-', "")), "x")
+            .await?;
+        let person = id();
+        sqlx::query(
+            "INSERT INTO resources(id,owner_id,kind,label,value) VALUES ($1,$2,'person','P','')",
+        )
+        .bind(&person)
+        .bind(&account)
+        .execute(&db.pool)
+        .await?;
+        let insert = |event: &str,
+                      revision: i64,
+                      ordinal: i64,
+                      target: &str,
+                      actor: &str,
+                      linked: Option<&str>,
+                      merged: Option<&str>,
+                      flag: i64| {
+            sqlx::query("INSERT INTO person_activity_events(id,revision,ordinal,person_id,target_id,event_type,actor_id,account_id,merged_from,label_changed,value_changed,occurred_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,1)")
+                .bind(id())
+                .bind(revision)
+                .bind(ordinal)
+                .bind(person.clone())
+                .bind(target.to_owned())
+                .bind(event.to_owned())
+                .bind(actor.to_owned())
+                .bind(linked.map(str::to_owned))
+                .bind(merged.map(str::to_owned))
+                .bind(flag)
+                .execute(&db.pool)
+        };
+        insert("person_created", 7, 0, &person, &account, None, None, 0).await?;
+        let missing = id();
+        for statement in [
+            insert("person_created", 8, 0, &missing, &account, None, None, 0),
+            insert("person_created", 9, 0, &person, &missing, None, None, 0),
+            insert(
+                "person_linked",
+                10,
+                0,
+                &person,
+                &account,
+                Some(&missing),
+                None,
+                0,
+            ),
+            insert(
+                "person_merged",
+                11,
+                0,
+                &person,
+                &account,
+                None,
+                Some(&missing),
+                0,
+            ),
+        ] {
+            let error = statement.await.expect_err("a dangling reference");
+            assert!(foreign_key_violation(&error), "{error}");
+        }
+        let error = insert("person_created", 7, 0, &person, &account, None, None, 0)
+            .await
+            .expect_err("one event per position");
+        assert!(unique_violation(&error), "{error}");
+        for statement in [
+            insert("person_shared", 12, 0, &person, &account, None, None, 0),
+            insert("person_created", 13, 100, &person, &account, None, None, 0),
+            insert("person_created", 14, -1, &person, &account, None, None, 0),
+            insert("field_edited", 15, 0, &person, &account, None, None, 2),
+        ] {
+            let error = statement.await.expect_err("a CHECK violation");
+            assert!(
+                error
+                    .as_database_error()
+                    .is_some_and(|e| e.is_check_violation()),
+                "{error}"
+            );
+        }
+        let error = sqlx::query("INSERT INTO person_activity_coverage(id,started_at) VALUES (1,5)")
+            .execute(&db.pool)
+            .await
+            .expect_err("one coverage row");
+        assert!(unique_violation(&error), "{error}");
+        check_violation(
+            db,
+            "INSERT INTO person_activity_coverage(id,started_at) VALUES (2,5)",
+        )
+        .await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn two_processes_upgrading_from_1006_at_once_both_succeed() -> Result<()> {
+    let (_dir, url) = crate::support::database::database_url().await?;
+    let first = baseline_1006(&url).await?;
+    seed(&first, true).await?;
+    let old_columns = columns(&first).await?;
+    let before = row_digests(&first).await?;
+    let second = Store::connect(&url).await?;
+    let (a, b) = tokio::join!(first.migrate(), second.migrate());
+    a?;
+    b?;
+    assert_eq!(version(&first).await?, [1007]);
+    assert_eq!(coverage(&first).await?.len(), 1);
+    assert_eq!(event_count(&first).await?, 0);
     assert_eq!(row_digests_over(&first, &old_columns).await?, before);
     Ok(())
 }

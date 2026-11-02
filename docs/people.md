@@ -222,6 +222,95 @@ owner has left (only the person depends on that household):
 {"id": "5e4d3c2b-1a09-4f8e-9d7c-6b5a4f3e2d1c", "version": 1, "policy_version": 1, "archived": false, "owner_is_you": true, "your_access": "owner", "audience": {"disclosure": "complete", "in_home": false, "households": [], "your_direct_grant": null, "direct_grant_count": 1, "excluded_count": 0}, "effective": {"disclosure": "partial", "account_count": null, "limited_count": null}}
 ```
 
+## Activity timeline
+
+Since API `0.29.2` (schema `1007`) `GET /people/{id}/activity?after=&limit=` returns one
+page (1–100 items, default 50) of a person's recorded activity, newest first, as a
+`PersonActivityPage`. It is an authenticated online read like the summaries: not part of
+`/sync`, not cacheable and never an access grant, read from one database snapshot. A merged
+person's old id resolves to the canonical person, as on `GET /people/{id}`, and a person the
+caller cannot see and an id that names nothing are the same `404 not_found`.
+
+**What is recorded.** Each supported change appends metadata-only events in the same
+transaction as the change, after it is published and before its receipt, so a failed or
+rolled-back write records nothing and a replayed operation (same key, same body) records
+nothing more. Events written by one operation share its commit and keep command order.
+
+| `type` | Written by | When |
+| --- | --- | --- |
+| `person_created` | `create_person`; `reference_account` when it creates the account's identity | always |
+| `person_renamed` | `edit` of a person; `rename_profile` | the name actually changes |
+| `person_archived`, `person_restored` | `archive` of a person | the flag actually changes |
+| `person_linked` | accepting a link request; `reference_account` when it creates (after `person_created`) | always; `account` is the linked account |
+| `person_unlinked` | `unlink` | always; `account` is the previously linked account |
+| `person_merged` | `merge`; accepting a merge request; accepting a link into the account's existing person | always, on the canonical person; `merged_from` is the source |
+| `field_created` | `create_field`; `put_field` without `expected_version` | the parent is a person |
+| `field_edited` | `edit` of a field; `put_field` with `expected_version` | the parent is a person and the label or value actually changes; `changed` says which |
+| `field_archived`, `field_restored` | `archive` of a field | the parent is a person and the flag actually changes |
+
+Nothing else is recorded: no request, cancellation, decline or expiry (sent history covers
+requests), no grant, revoke, policy, exclusion or household change (**sharing changes are
+excluded**, so a client must not show a sharing row), no `reference_account` of an existing
+identity, no task, list or task-field change, and no no-op write. A merge's renaming of the
+target and archiving of the source are part of its one `person_merged` event.
+
+**What is stored and returned.** Kieran's 1 November 2026 decisions apply. An event holds
+its type, the person and item it is about, the acting account, a linked account or merge
+source where relevant, which parts of a field changed, and the commit time. **No name,
+label, value or summary is stored**, so no earlier content can be shown, redacted or
+leaked: `target.label` is the item's *current* label (a field renamed to remove sensitive
+wording shows the new label on its old events) and `summary` is a fixed UK-English phrase
+for the type. Value history is a separate, unscheduled feature; nothing overwritten before
+it exists can be recovered. Events are kept for the lifetime of the person or field; Atlas
+has no resource or account deletion, and any future hard delete must remove or handle these
+rows in the same transaction (their foreign keys refuse anything else).
+
+**Who can see an event.** Every read applies the caller's current access, never access held
+when the event happened:
+
+- The person must be visible now, otherwise `404 not_found`.
+- Each event is returned only while the caller can see the item it is about now, under the
+  same visibility rule as sync (ancestors and exclusions included). A field shared with
+  fewer people than its person keeps its history from those it is not shared with. Events
+  about a person merged in follow that person's frozen pre-merge audience, so a merge never
+  widens history about its source; `merged_from` is omitted unless the source is visible.
+- Revoking access, leaving a household, an exclusion or a narrower field policy hides the
+  affected events on the next read. Gaining access shows the item's earlier events: Atlas
+  keeps no record of when access was granted, so "only since access began" is not offered.
+- Hidden events never count toward `limit` or `next_after`, and there is no total or
+  "hidden" indicator. `coverage_started_at` is the same for every caller of a database.
+- An actor (and a linked or unlinked `account`) is named only when it is the caller
+  (`{"kind":"you"}`), the person's current owner or its currently linked account
+  (`{"kind":"account","account_id":…,"username":…}`), identities every viewer of the person
+  already sees. Anyone else is `{"kind":"someone_else"}`, with no identifier, so two such
+  accounts are indistinguishable. Naming follows current state: after a link moves
+  ownership, the previous owner becomes `someone_else` to third parties.
+
+**Coverage, ordering and paging.** `coverage_started_at` is when this database began
+recording (its `1006 → 1007` upgrade or its creation); nothing earlier is recorded or
+reconstructed, so present older history as unknown, not empty. Order is commit order;
+`occurred_at` is the server's commit time and may disagree slightly between replicas, so
+do not re-sort by it. `next_after` is the last item's id, present only when a further
+visible item exists. A new event always sorts before every existing cursor, so following
+`next_after` never repeats or gains items; `after` must be an event of this person's
+timeline, and any other value (missing, another person's, malformed) is `422 invalid_value`.
+
+**For WEB-19.** Show no sharing rows and no old values; say "Recorded since …" from
+`coverage_started_at`; deduplicate by event `id`, which is stable across reads, retries and
+devices; refresh from the first page when `/sync` delivers a change to the person or any
+of its fields, after a command receipt, after snapshot or access-epoch recovery and on
+re-authentication; on `404` treat access as lost and discard held history; on
+`invalid_value` for `after` restart from the first page; render `target.label` as the
+item's current label, not a historical one.
+
+A reader's page after a field edit by a grantee and a merge of a person the reader never
+saw:
+
+<!-- experimental-schema: PersonActivityPage -->
+```json
+{"person_id": "6f1d2c3b-4a59-4e6f-8a7b-9c0d1e2f3a4b", "items": [{"id": "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d", "occurred_at": 1793577600, "type": "person_merged", "summary": "Merged another profile into this person", "actor": {"kind": "account", "account_id": "7e6d5c4b-3a29-4f18-8e07-d6c5b4a39281", "username": "alice"}, "target": {"kind": "person", "id": "6f1d2c3b-4a59-4e6f-8a7b-9c0d1e2f3a4b", "label": "Morgan Lee", "archived": false, "state": "current"}}, {"id": "1b2c3d4e-5f6a-4b7c-9d8e-0f1a2b3c4d5e", "occurred_at": 1793574000, "type": "field_edited", "summary": "Edited a field", "actor": {"kind": "someone_else"}, "target": {"kind": "field", "id": "2c3d4e5f-6a7b-4c8d-8e9f-1a2b3c4d5e6f", "label": "Hobby", "archived": false, "state": "current", "field_kind": "text"}, "changed": ["value"]}], "next_after": "1b2c3d4e-5f6a-4b7c-9d8e-0f1a2b3c4d5e", "coverage_started_at": 1793491200}
+```
+
 ## Merge privacy and offline identities
 
 `POST /people/merge-preview` takes `source_id` and `target_id`. The caller must own at

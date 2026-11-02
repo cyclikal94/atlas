@@ -159,6 +159,20 @@ and must not probe `GET /policies/{id}` for people it does not own. See
 [people](people.md#viewer-safe-summaries). The compatibility baseline gains a
 `people_summaries` probe group.
 
+`0.29.2` adds the People activity timeline (BE-PEOPLE-ACTIVITY) and changes no existing
+response or request: one authenticated read, `GET /people/{id}/activity`
+(`getPersonActivity`), and its strict schemas `PersonActivityPage`, `PersonActivityEvent`,
+`ActivityTarget` and `ActivityAccount`. A new operation and unreferenced schemas are a
+PATCH change; the write side effects (events inserted in the same transaction as a
+supported change) are not observable by any existing route. It needs database schema
+`1007`, which adds the metadata-only event table and the coverage start; no earlier activity
+exists. Events store no names, labels or values; every read applies current access to each
+event, names only the reader, the person's current owner or its currently linked account,
+and omits sharing changes. A client must call the read only once the server reports `0.29.2`
+or later. See [people](people.md#activity-timeline). The compatibility baseline gains a
+`people_activity` probe group. `0.29.1` and `0.30.0` are claimed by other unintegrated
+branches; integration re-sequences versions as described above.
+
 Mutations require an account-scoped UUID `Idempotency-Key` and explicit version
 preconditions where defined. Commands that replace existing authored text also carry the
 resource's sharing revision (`expected_policy_version`), so a write cannot commit under

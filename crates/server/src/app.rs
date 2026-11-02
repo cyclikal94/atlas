@@ -166,6 +166,10 @@ impl App {
                 get(people::field_audiences),
             )
             .route(
+                "/api/experimental/v1/people/{id}/activity",
+                get(people::activity),
+            )
+            .route(
                 "/api/experimental/v1/people-commands",
                 post(people::command),
             )

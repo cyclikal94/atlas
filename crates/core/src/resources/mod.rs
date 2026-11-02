@@ -1,5 +1,6 @@
 mod fields;
 use crate::error::ErrorCode;
+use crate::people::{ActivityLog, ActivityType, value_differs};
 use crate::{
     Change, Command, Notice, Projection, RESOURCE_ORDER, Store, content, identifier, policy,
     projection_row, receipt_digest, unix_now,
@@ -162,6 +163,7 @@ impl Store {
             before.insert(account.clone(), Self::subset(tx, account, &touched).await?);
         }
         let mut access_changed = false;
+        let mut activity = ActivityLog::default();
         for command in commands {
             match command {
                 Command::CreatePerson {
@@ -180,6 +182,7 @@ impl Store {
                     .bind(actor)
                     .execute(&mut **tx)
                     .await?;
+                    activity.person(id, ActivityType::PersonCreated);
                     Self::put_policy(
                         tx,
                         actor,
@@ -226,6 +229,7 @@ impl Store {
                     )
                     .await?;
                     Self::put_policy(tx, actor, id, &policy).await?;
+                    activity.field(person_id, id, ActivityType::FieldCreated);
                 }
                 Command::Edit {
                     id,
@@ -272,6 +276,19 @@ impl Store {
                     } else {
                         "null".to_owned()
                     };
+                    // Only metadata is recorded: whether the label or value changed, never either.
+                    if p.kind == "person" {
+                        if p.label != *label {
+                            activity.person(id, ActivityType::PersonRenamed);
+                        }
+                    } else if let Some(person) = Self::field_person(tx, p).await? {
+                        activity.field_edit(
+                            &person,
+                            id,
+                            p.label != *label,
+                            value_differs(&p.value, &value)?,
+                        );
+                    }
                     sqlx::query(
                         "UPDATE resources SET label=$1,value=$2,version=version+1 WHERE id=$3",
                     )
@@ -348,6 +365,7 @@ impl Store {
             ensure!(count <= 10000, ErrorCode::SliceCapacity);
         }
         let revision = Self::publish(tx, &accounts, &touched, &before, access_changed).await?;
+        Self::record_activity(tx, actor, revision, unix_now()?, &activity).await?;
         sqlx::query(
             "INSERT INTO receipts(account_id,operation_id,payload,revision) VALUES ($1,$2,$3,$4)",
         )
