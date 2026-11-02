@@ -1610,6 +1610,104 @@ async fn a9_a_cursor_is_accepted_only_while_its_event_is_visible_to_the_reader()
     Ok(())
 }
 
+/// Design assessment Q1 (2 November 2026): the case above loses a field through `ReplacePolicy`
+/// and an exclusion. These are the other two ways a reader loses a field while keeping the person:
+/// leaving the household the field is shared with, and a direct `Revoke` of the reader's grant.
+/// Either makes the field's saved cursor exactly the invalid cursor a missing one is, while the
+/// owner keeps it and an unaffected field's cursor stays valid.
+#[tokio::test]
+async fn a9_a_saved_cursor_is_refused_after_household_departure_or_a_direct_revoke() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (alice, carol) = (account(&s).await?, account(&s).await?);
+    let home = household(&s, &alice, &carol).await?;
+    let p = create_person(&s, &alice, "Morgan", grants(&[(&carol, false)])).await?;
+    let by_home = create_field(
+        &s,
+        &alice,
+        &p,
+        "Hobby",
+        Policy {
+            grants: vec![PrincipalGrant::Household {
+                id: home.clone(),
+                edit: false,
+            }],
+            exclude_accounts: vec![],
+        },
+    )
+    .await?;
+    edit(&s, &alice, &by_home, "Hobby", "Rowing").await?;
+    let direct = create_field(&s, &alice, &p, "Pets", grants(&[(&carol, false)])).await?;
+    edit(&s, &alice, &direct, "Pets", "Cat").await?;
+
+    let all = walk(&s, &carol, &p, 50).await?;
+    assert_eq!(
+        types(&all),
+        [
+            T::FieldEdited,
+            T::FieldCreated,
+            T::FieldEdited,
+            T::FieldCreated,
+            T::PersonCreated
+        ]
+    );
+    let edit_of = |field: &str| {
+        all.iter()
+            .find(|e| e.target.id == field && e.event_type == T::FieldEdited)
+            .expect("an edit event")
+            .id
+            .clone()
+    };
+    let (home_cursor, direct_cursor) = (edit_of(&by_home), edit_of(&direct));
+    let person_created = all[4].id.clone();
+    let missing = cursor_error(&s, &carol, &p, &id()).await;
+    assert_eq!(
+        missing.as_ref().map(|e| e.0),
+        Some(Some(ErrorCode::InvalidValue))
+    );
+    // Positive controls: both cursors are valid for Carol before either loss.
+    for cursor in [&home_cursor, &direct_cursor] {
+        assert!(cursor_error(&s, &carol, &p, cursor).await.is_none());
+    }
+
+    // A direct revoke of Carol's grant on one field.
+    let (_, policy_version) = versions(&s, &direct).await?;
+    s.apply(
+        &alice,
+        &id(),
+        &[Command::Revoke {
+            id: direct.clone(),
+            expected_version: policy_version,
+            account_id: carol.clone(),
+        }],
+    )
+    .await?;
+    assert_eq!(cursor_error(&s, &carol, &p, &direct_cursor).await, missing);
+    assert!(cursor_error(&s, &alice, &p, &direct_cursor).await.is_none());
+    assert!(cursor_error(&s, &carol, &p, &home_cursor).await.is_none());
+
+    // Carol leaves the household the other field is shared with.
+    let expected_version = household_version(&s, &carol, &home).await?;
+    manage(
+        &s,
+        &carol,
+        M::RemoveHouseholdMember {
+            household_id: home.clone(),
+            account_id: carol.clone(),
+            expected_version,
+        },
+    )
+    .await?;
+    assert_eq!(types(&walk(&s, &carol, &p, 50).await?), [T::PersonCreated]);
+    assert_eq!(cursor_error(&s, &carol, &p, &home_cursor).await, missing);
+    assert!(cursor_error(&s, &alice, &p, &home_cursor).await.is_none());
+    // The person is still visible to Carol, so its own event remains a valid cursor.
+    let after_person = s
+        .person_activity(&carol, &p, Some(&person_created), 50)
+        .await?;
+    assert!(after_person.items.is_empty());
+    Ok(())
+}
+
 // A10 -----------------------------------------------------------------------------------------
 
 #[tokio::test]
