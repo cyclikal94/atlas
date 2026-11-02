@@ -1567,3 +1567,132 @@ async fn two_processes_upgrading_from_1006_at_once_both_succeed() -> Result<()> 
     assert_eq!(row_digests_over(&first, &old_columns).await?, before);
     Ok(())
 }
+
+/// The `migrate()` lock key (`storage/mod.rs`).
+const MIGRATION_LOCK: i64 = 728_194_620;
+
+/// A `Store` on `url` whose PostgreSQL sessions are named `name`, so `pg_locks` can tell its
+/// lock waits apart from those of other cases sharing the cluster. SQLite ignores the name.
+async fn named_store(url: &str, name: &str) -> Result<Store> {
+    if !crate::support::database::postgres() {
+        return Store::connect(url).await;
+    }
+    let mut url = url::Url::parse(url)?;
+    url.query_pairs_mut().append_pair("application_name", name);
+    Store::connect(url.as_str()).await
+}
+
+/// Design assessment H3 (2 November 2026): the case above runs two `Store`s (two connection pools
+/// in one process) at once but never forces them to contend. Here a third connection takes the
+/// migration lock first and applies the `1007` upgrade inside its open transaction, so both
+/// upgraders must queue behind it. When it commits, the queued upgraders must add nothing (the
+/// stored coverage start is the holder's); when it rolls back, exactly one of them must apply the
+/// upgrade. On PostgreSQL the queue is witnessed in `pg_locks` before release. SQLite's busy wait
+/// is not observable, so there the case asserts only that both upgraders are still unfinished when
+/// the lock is released, plus the outcome. Separate OS processes are not exercised here; that
+/// remains the release runner's (`scripts/test_replicas.py`).
+#[tokio::test]
+async fn upgraders_queued_behind_a_held_1007_upgrade_add_nothing_or_take_over_after_rollback()
+-> Result<()> {
+    use sqlx::Connection;
+    let postgres = crate::support::database::postgres();
+    for commit in [true, false] {
+        let (_dir, url) = crate::support::database::database_url().await?;
+        let first = baseline_1006(&url).await?;
+        seed(&first, true).await?;
+        let old_columns = columns(&first).await?;
+        let before = row_digests(&first).await?;
+
+        let mut holder = first.pool.acquire().await?;
+        let mut tx = if postgres {
+            holder.begin().await?
+        } else {
+            holder.begin_with("BEGIN IMMEDIATE").await?
+        };
+        if postgres {
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(MIGRATION_LOCK)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::raw_sql(if postgres {
+            UPGRADE_1007_POSTGRES
+        } else {
+            UPGRADE_1007_SQLITE
+        })
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE atlas_schema SET version=1007 WHERE version=1006")
+            .execute(&mut *tx)
+            .await?;
+        let held: i64 = sqlx::query_scalar("SELECT started_at FROM person_activity_coverage")
+            .fetch_one(&mut *tx)
+            .await?;
+
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let names = [format!("h3a{tag}"), format!("h3b{tag}")];
+        let a = named_store(&url, &names[0]).await?;
+        let b = named_store(&url, &names[1]).await?;
+        let upgraders = [
+            tokio::spawn(async move { a.migrate().await }),
+            tokio::spawn(async move { b.migrate().await }),
+        ];
+        if postgres {
+            // Both upgraders' lock requests are queued, ungranted, behind the holder.
+            let mut queued = 0;
+            for _ in 0..1000 {
+                queued = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM pg_locks l JOIN pg_stat_activity s ON s.pid = l.pid \
+                     WHERE l.locktype = 'advisory' AND l.objid = $1 AND NOT l.granted \
+                     AND s.application_name IN ($2, $3)",
+                )
+                .bind(MIGRATION_LOCK)
+                .bind(&names[0])
+                .bind(&names[1])
+                .fetch_one(&first.pool)
+                .await?;
+                if queued == 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                queued, 2,
+                "commit={commit}: both upgraders wait for the migration lock"
+            );
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert!(
+            upgraders.iter().all(|u| !u.is_finished()),
+            "commit={commit}: no upgrader finishes while the lock is held"
+        );
+        if commit {
+            tx.commit().await?;
+        } else {
+            tx.rollback().await?;
+        }
+        drop(holder);
+        for upgrader in upgraders {
+            upgrader.await??;
+        }
+
+        assert_eq!(version(&first).await?, [1007], "commit={commit}");
+        let stored = coverage(&first).await?;
+        assert_eq!(stored.len(), 1, "commit={commit}: one coverage row");
+        if commit {
+            assert_eq!(
+                stored,
+                [held],
+                "queued upgraders keep the holder's coverage start"
+            );
+        }
+        assert_eq!(event_count(&first).await?, 0, "commit={commit}");
+        assert_eq!(
+            row_digests_over(&first, &old_columns).await?,
+            before,
+            "commit={commit}"
+        );
+    }
+    Ok(())
+}
