@@ -898,6 +898,58 @@ async fn a2_a_statement_failing_just_before_recording_rolls_back_the_change() ->
     Ok(())
 }
 
+/// A failure *after* the events are written (the write's own `people_results` insert collides)
+/// must still remove them: they belong to the write's transaction, not to a separate commit. The
+/// colliding row has no receipt, so the operation is not treated as a replay and runs in full.
+#[tokio::test]
+async fn a2_a_failure_after_recording_rolls_the_events_back_with_the_change() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (a, b) = (account(&s).await?, account(&s).await?);
+    let p = create_person(&s, &a, "Morgan", Policy::default()).await?;
+    link(&s, &a, &b, &p).await?;
+    let n = count(&s).await?;
+    let version = s.person_detail(&b, &p).await?.person.version;
+    let operation = id();
+    let command = PeopleCommand::Unlink {
+        person_id: p.clone(),
+        expected_version: version,
+    };
+    sqlx::query("INSERT INTO people_results(account_id,operation_id,person_id) VALUES ($1,$2,$3)")
+        .bind(&b)
+        .bind(&operation)
+        .bind(&p)
+        .execute(&s.pool)
+        .await?;
+    let reached = s.hooks().count("people_activity.before_record");
+    s.people_command(&b, &operation, &command, NOW)
+        .await
+        .expect_err("the result insert after recording collides");
+    assert_eq!(
+        s.hooks().count("people_activity.before_record"),
+        reached + 1,
+        "the write reached the recording step before it failed"
+    );
+    assert_eq!(
+        count(&s).await?,
+        n,
+        "the recorded event rolled back with the change"
+    );
+    assert_eq!(
+        s.person_detail(&b, &p).await?.linked_account_id.as_deref(),
+        Some(b.as_str()),
+        "the unlink rolled back"
+    );
+    // Positive control: without the collision the same operation records once.
+    sqlx::query("DELETE FROM people_results WHERE account_id=$1 AND operation_id=$2")
+        .bind(&b)
+        .bind(&operation)
+        .execute(&s.pool)
+        .await?;
+    s.people_command(&b, &operation, &command, NOW).await?;
+    assert_eq!(added(&s, n).await?, [("person_unlinked".into(), p.clone())]);
+    Ok(())
+}
+
 // A3 ------------------------------------------------------------------------------------------
 
 #[tokio::test]
