@@ -555,3 +555,433 @@ async fn a_browser_oidc_session_is_labelled_by_its_activation() -> anyhow::Resul
     let _ = server.await;
     Ok(())
 }
+
+/// BE-Q23 dependency compatibility: an ES256 or ES384 provider (signed by ring, verified by the
+/// vendored openidconnect on the 0.14 curve stack) gets the same claim checks and linking flow as
+/// the RS256 scenario, and a token signed by an unpublished key of the same curve is refused.
+#[tokio::test]
+async fn oidc_verifies_ec_signed_id_tokens() -> anyhow::Result<()> {
+    use crate::support::oidc::{Signing, serve_signed};
+    use openidconnect::core::CoreJwsSigningAlgorithm;
+    for alg in [
+        CoreJwsSigningAlgorithm::EcdsaP256Sha256,
+        CoreJwsSigningAlgorithm::EcdsaP384Sha384,
+    ] {
+        let (provider, server) = serve_signed(Signing::ec(alg.clone())).await?;
+        let (_dir, database) = crate::support::database::database_url().await?;
+        let store = Store::connect(&database).await?;
+        store.migrate().await?;
+        let account = Uuid::new_v4().to_string();
+        store
+            .add_account(
+                &account,
+                "alice",
+                &hash_password("oidc-ec-password".into()).await?,
+            )
+            .await?;
+        let app = App::new(store.clone())
+            .await?
+            .public_origin("https://atlas.example")?
+            .oidc(&provider.issuer, "atlas-test", None, false)?
+            .router();
+        let (_, _, session) = call(
+            &app,
+            "POST",
+            "sessions",
+            &[],
+            json!({"username":"alice","password":"oidc-ec-password","device_id":"native"}),
+        )
+        .await;
+        let bearer = session["access_token"].as_str().unwrap();
+        for mode in [
+            "nonce",
+            "audience",
+            "issuer",
+            "expired",
+            "signature",
+            "access_hash",
+            "wrong_key",
+        ] {
+            let (path, cookie, _, _) = begin(&app, &provider, mode, Some(bearer), None).await;
+            assert_eq!(
+                call(&app, "GET", &path, &[("cookie", &cookie)], Value::Null)
+                    .await
+                    .0,
+                StatusCode::UNAUTHORIZED,
+                "{alg:?} {mode}"
+            );
+        }
+        let (path, cookie, attempt_id, verifier) =
+            begin(&app, &provider, "valid", Some(bearer), None).await;
+        let (status, headers, _) =
+            call(&app, "GET", &path, &[("cookie", &cookie)], Value::Null).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{alg:?}");
+        let sent = fragment(headers["location"].to_str()?);
+        assert_eq!(sent["atlas_account"], account, "{alg:?}");
+        assert_eq!(sent["atlas_attempt"], attempt_id, "{alg:?}");
+        let (status, _, activated) = call(
+            &app,
+            "POST",
+            "browser-sessions/activate",
+            &[("origin", "https://atlas.example")],
+            json!({"grant":sent["atlas_grant"],"verifier":verifier}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{alg:?}: {activated}");
+        assert_eq!(activated["account_id"], account, "{alg:?}");
+        assert_eq!(
+            call(&app, "GET", &path, &[("cookie", &cookie)], Value::Null)
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED,
+            "{alg:?}: the flow row is consumed exactly once"
+        );
+        server.abort();
+        let _ = server.await;
+    }
+    Ok(())
+}
+
+/// Signs a JWS signing input with an independent (ring) implementation.
+type Signer = Box<dyn Fn(&[u8]) -> Vec<u8>>;
+
+/// One retained JWS algorithm for the signature matrix: the verification key, a same-type key that
+/// must not verify, and a signer from ring (independent of the RustCrypto code openidconnect uses).
+struct Jws {
+    alg: openidconnect::core::CoreJwsSigningAlgorithm,
+    key: openidconnect::core::CoreJsonWebKey,
+    other: openidconnect::core::CoreJsonWebKey,
+    sign: Signer,
+}
+
+fn jwk(value: Value) -> openidconnect::core::CoreJsonWebKey {
+    serde_json::from_value(value).unwrap()
+}
+
+fn b64(bytes: &[u8]) -> String {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Every algorithm openidconnect 4.0.1 verifies, each with an independent ring signer.
+fn retained_algorithms() -> Vec<Jws> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use openidconnect::{
+        JsonWebKeyId, PrivateSigningKey,
+        core::{CoreJwsSigningAlgorithm as A, CoreRsaPrivateSigningKey},
+    };
+    use ring::{hmac, rand::SystemRandom, signature as sig, signature::KeyPair};
+    use std::sync::Arc;
+    let pem = include_str!("../fixtures/oidc-test-only.pem");
+    let rsa_jwk = serde_json::to_value(
+        CoreRsaPrivateSigningKey::from_pem(pem, Some(JsonWebKeyId::new("test".into())))
+            .unwrap()
+            .as_verification_key(),
+    )
+    .unwrap();
+    // A same-size modulus that is not the signing key's.
+    let mut other_rsa = rsa_jwk.clone();
+    let mut n = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(rsa_jwk["n"].as_str().unwrap())
+        .unwrap();
+    let middle = n.len() / 2;
+    n[middle] ^= 0x10;
+    other_rsa["n"] = json!(b64(&n));
+    let der: Vec<u8> = STANDARD
+        .decode(
+            pem.lines()
+                .filter(|l| !l.starts_with("-----"))
+                .collect::<String>(),
+        )
+        .unwrap();
+    let rsa = Arc::new(sig::RsaKeyPair::from_der(&der).unwrap());
+    let rsa_signer = |encoding: &'static dyn sig::RsaEncoding| -> Signer {
+        let rsa = rsa.clone();
+        Box::new(move |message: &[u8]| {
+            let mut out = vec![0; rsa.public().modulus_len()];
+            rsa.sign(encoding, &SystemRandom::new(), message, &mut out)
+                .unwrap();
+            out
+        })
+    };
+    let ec = |signing: &'static sig::EcdsaSigningAlgorithm, crv: &str| -> (Value, Signer) {
+        let rng = SystemRandom::new();
+        let pkcs8 = sig::EcdsaKeyPair::generate_pkcs8(signing, &rng).unwrap();
+        let pair = sig::EcdsaKeyPair::from_pkcs8(signing, pkcs8.as_ref(), &rng).unwrap();
+        let point = pair.public_key().as_ref().to_vec();
+        let half = (point.len() - 1) / 2;
+        (
+            json!({"kty":"EC","use":"sig","crv":crv,"x":b64(&point[1..1 + half]),"y":b64(&point[1 + half..])}),
+            Box::new(move |message: &[u8]| {
+                pair.sign(&SystemRandom::new(), message)
+                    .unwrap()
+                    .as_ref()
+                    .to_vec()
+            }),
+        )
+    };
+    let ed = || -> (Value, Signer) {
+        let pkcs8 = sig::Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).unwrap();
+        let pair = sig::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        (
+            json!({"kty":"OKP","use":"sig","crv":"Ed25519","x":b64(pair.public_key().as_ref())}),
+            Box::new(move |message: &[u8]| pair.sign(message).as_ref().to_vec()),
+        )
+    };
+    let mac = |algorithm: hmac::Algorithm, secret: &[u8]| -> (Value, Signer) {
+        let key = hmac::Key::new(algorithm, secret);
+        (
+            json!({"kty":"oct","use":"sig","k":b64(secret)}),
+            Box::new(move |message: &[u8]| hmac::sign(&key, message).as_ref().to_vec()),
+        )
+    };
+    let mut cases = vec![
+        (
+            A::RsaSsaPkcs1V15Sha256,
+            &sig::RSA_PKCS1_SHA256 as &'static dyn sig::RsaEncoding,
+        ),
+        (A::RsaSsaPkcs1V15Sha384, &sig::RSA_PKCS1_SHA384),
+        (A::RsaSsaPkcs1V15Sha512, &sig::RSA_PKCS1_SHA512),
+        (A::RsaSsaPssSha256, &sig::RSA_PSS_SHA256),
+        (A::RsaSsaPssSha384, &sig::RSA_PSS_SHA384),
+        (A::RsaSsaPssSha512, &sig::RSA_PSS_SHA512),
+    ]
+    .into_iter()
+    .map(|(alg, encoding)| Jws {
+        alg,
+        key: jwk(rsa_jwk.clone()),
+        other: jwk(other_rsa.clone()),
+        sign: rsa_signer(encoding),
+    })
+    .collect::<Vec<_>>();
+    for (alg, signing, crv) in [
+        (
+            A::EcdsaP256Sha256,
+            &sig::ECDSA_P256_SHA256_FIXED_SIGNING,
+            "P-256",
+        ),
+        (
+            A::EcdsaP384Sha384,
+            &sig::ECDSA_P384_SHA384_FIXED_SIGNING,
+            "P-384",
+        ),
+    ] {
+        let (key, sign) = ec(signing, crv);
+        let (other, _) = ec(signing, crv);
+        cases.push(Jws {
+            alg,
+            key: jwk(key),
+            other: jwk(other),
+            sign,
+        });
+    }
+    let (key, sign) = ed();
+    let (other, _) = ed();
+    cases.push(Jws {
+        alg: A::EdDsa,
+        key: jwk(key),
+        other: jwk(other),
+        sign,
+    });
+    for (alg, algorithm, size) in [
+        (A::HmacSha256, hmac::HMAC_SHA256, 32),
+        (A::HmacSha384, hmac::HMAC_SHA384, 48),
+        (A::HmacSha512, hmac::HMAC_SHA512, 64),
+    ] {
+        let (key, sign) = mac(algorithm, &vec![7; size]);
+        let (other, _) = mac(algorithm, &vec![8; size]);
+        cases.push(Jws {
+            alg,
+            key: jwk(key),
+            other: jwk(other),
+            sign,
+        });
+    }
+    cases
+}
+
+#[derive(Debug, PartialEq)]
+enum Verified {
+    Accepted,
+    Refused,
+    Panicked,
+}
+
+fn verify(
+    key: &openidconnect::core::CoreJsonWebKey,
+    alg: &openidconnect::core::CoreJwsSigningAlgorithm,
+    message: &[u8],
+    signature: &[u8],
+) -> Verified {
+    use openidconnect::JsonWebKey;
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        key.verify_signature(alg, message, signature)
+    })) {
+        Ok(Ok(())) => Verified::Accepted,
+        Ok(Err(_)) => Verified::Refused,
+        Err(_) => Verified::Panicked,
+    }
+}
+
+/// openidconnect 4.0.1 converts an HMAC signature with `GenericArray::from(&[u8])`, which panics
+/// on a wrong length instead of returning an error. That path (hmac 0.12/sha2 0.10) is not touched
+/// by the BE-Q23 patch, so the panic is characterised here, not fixed: if upstream behaviour
+/// changes, this expectation fails and must be revisited.
+fn expected_refusal(
+    key: &openidconnect::core::CoreJsonWebKey,
+    alg: &openidconnect::core::CoreJwsSigningAlgorithm,
+    signature: &[u8],
+) -> Verified {
+    use openidconnect::core::CoreJwsSigningAlgorithm as A;
+    let symmetric = serde_json::to_value(key).unwrap()["kty"] == "oct";
+    let length = match alg {
+        A::HmacSha256 => Some(32),
+        A::HmacSha384 => Some(48),
+        A::HmacSha512 => Some(64),
+        _ => None,
+    };
+    match length {
+        Some(length) if symmetric && signature.len() != length => Verified::Panicked,
+        _ => Verified::Refused,
+    }
+}
+
+/// BE-Q23 dependency compatibility: every retained algorithm accepts its own signature and refuses
+/// a changed message, a changed or truncated signature, a different key, and every other algorithm
+/// (including `none` and the unsupported ES512) for the same key and signature.
+#[test]
+fn oidc_signature_verification_matrix() {
+    use openidconnect::core::CoreJwsSigningAlgorithm as A;
+    let message = b"eyJhbGciOiJ0ZXN0In0.eyJzdWIiOiJhdGxhcyJ9";
+    let cases = retained_algorithms();
+    assert_eq!(cases.len(), 12);
+    let mut algs: Vec<A> = cases.iter().map(|c| c.alg.clone()).collect();
+    algs.extend([A::EcdsaP521Sha512, A::None]);
+    for case in &cases {
+        let alg = &case.alg;
+        let signature = (case.sign)(message);
+        assert_eq!(
+            verify(&case.key, alg, message, &signature),
+            Verified::Accepted,
+            "{alg:?} must accept its own signature"
+        );
+        let mut changed = message.to_vec();
+        changed[5] ^= 1;
+        let mut flipped = signature.clone();
+        let middle = flipped.len() / 2;
+        flipped[middle] ^= 1;
+        let truncated = &signature[..signature.len() - 1];
+        for (label, key, alg, message, signature) in [
+            ("message", &case.key, alg, &changed[..], &signature[..]),
+            ("signature", &case.key, alg, &message[..], &flipped[..]),
+            ("truncated", &case.key, alg, &message[..], truncated),
+            ("empty", &case.key, alg, &message[..], &[][..]),
+            ("other key", &case.other, alg, &message[..], &signature[..]),
+        ] {
+            assert_eq!(
+                verify(key, alg, message, signature),
+                expected_refusal(key, alg, signature),
+                "{alg:?} {label}"
+            );
+        }
+        for mismatch in algs.iter().filter(|a| *a != alg) {
+            assert_eq!(
+                verify(&case.key, mismatch, message, &signature),
+                expected_refusal(&case.key, mismatch, &signature),
+                "{alg:?} key and signature verified as {mismatch:?}"
+            );
+        }
+    }
+}
+
+/// BE-Q23 dependency compatibility: malformed EC verification keys are refused rather than
+/// accepted or panicking, while the unaltered key still verifies.
+#[test]
+fn oidc_rejects_malformed_ec_keys() {
+    use openidconnect::{JsonWebKey, core::CoreJwsSigningAlgorithm as A};
+    let message = b"header.payload";
+    for case in retained_algorithms()
+        .into_iter()
+        .filter(|c| matches!(c.alg, A::EcdsaP256Sha256 | A::EcdsaP384Sha384))
+    {
+        let alg = &case.alg;
+        let signature = (case.sign)(message);
+        let good = serde_json::to_value(&case.key).unwrap();
+        assert!(
+            case.key.verify_signature(alg, message, &signature).is_ok(),
+            "{alg:?}"
+        );
+        let coordinate = |name: &str| {
+            base64::Engine::decode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                good[name].as_str().unwrap(),
+            )
+            .unwrap()
+        };
+        let mut off_curve = good.clone();
+        let mut y = coordinate("y");
+        *y.last_mut().unwrap() ^= 1;
+        off_curve["y"] = json!(b64(&y));
+        let mut short = good.clone();
+        short["x"] = json!(b64(&coordinate("x")[1..]));
+        let mut zero = good.clone();
+        zero["x"] = json!(b64(&vec![0; coordinate("x").len()]));
+        zero["y"] = json!(b64(&vec![0; coordinate("y").len()]));
+        let mut wrong_curve = good.clone();
+        wrong_curve["crv"] = json!(if *alg == A::EcdsaP256Sha256 {
+            "P-384"
+        } else {
+            "P-256"
+        });
+        let mut p521 = good.clone();
+        p521["crv"] = json!("P-521");
+        for (label, key) in [
+            ("off-curve", off_curve),
+            ("short", short),
+            ("zero", zero),
+            ("wrong curve", wrong_curve),
+            ("P-521", p521),
+        ] {
+            let key = jwk(key);
+            assert!(
+                key.verify_signature(alg, message, &signature).is_err(),
+                "{alg:?} {label}"
+            );
+        }
+    }
+}
+
+/// BE-Q23 dependency compatibility: `at_hash` for every retained algorithm is the left half of the
+/// algorithm's digest of the access token (OIDC Core 3.1.3.6), computed independently with ring;
+/// PKCE S256 matches RFC 7636 Appendix B.
+#[test]
+fn oidc_access_token_hash_and_pkce_known_answers() {
+    use openidconnect::{
+        AccessToken, AccessTokenHash, PkceCodeChallenge, PkceCodeVerifier,
+        core::CoreJwsSigningAlgorithm as A,
+    };
+    use ring::digest;
+    let token = AccessToken::new("test-access".into());
+    for case in retained_algorithms() {
+        let algorithm = match case.alg {
+            A::RsaSsaPkcs1V15Sha256 | A::RsaSsaPssSha256 | A::EcdsaP256Sha256 | A::HmacSha256 => {
+                &digest::SHA256
+            }
+            A::RsaSsaPkcs1V15Sha384 | A::RsaSsaPssSha384 | A::EcdsaP384Sha384 | A::HmacSha384 => {
+                &digest::SHA384
+            }
+            _ => &digest::SHA512,
+        };
+        let full = digest::digest(algorithm, b"test-access");
+        let expected = b64(&full.as_ref()[..full.as_ref().len() / 2]);
+        let actual = AccessTokenHash::from_token(&token, &case.alg, &case.key).unwrap();
+        assert_eq!(actual.to_string(), expected, "{:?}", case.alg);
+    }
+    assert_eq!(
+        PkceCodeChallenge::from_code_verifier_sha256(&PkceCodeVerifier::new(
+            "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".into()
+        ))
+        .as_str(),
+        "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+    );
+}

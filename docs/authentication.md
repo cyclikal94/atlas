@@ -371,8 +371,18 @@ contains one explicitly justified exception. This is an assessment of Atlas's us
 not a claim that the dependency is fixed. Reassess the exception before introducing
 any private-key operations and when upgrading the dependency.
 
+[RUSTSEC-2026-0387](https://rustsec.org/advisories/RUSTSEC-2026-0387) (timing variability
+in `crypto-bigint` 0.5) reached Atlas through both `openidconnect` 4.0.1 and `web-push`
+0.11.0 via the 0.13 elliptic-curve stack. Neither crate had a release on the fixed stack, so
+Atlas builds both from local copies under `vendor/`. In those copies only the curve
+dependency changed, and no source file changed. `cargo deny` passes with no exception for
+this advisory. See `vendor/README.md` for provenance, retained behaviour and removal.
+
 The local provider test uses a deliberately public, test-only RSA fixture to sign
-synthetic tokens. It is not an application/deployment key and must never become one.
+synthetic tokens. It is not an application/deployment key and must never become one. The
+ES256/ES384 provider tests and the signature matrix generate disposable keys with `ring` on
+every run. Their signatures therefore come from an implementation independent of the
+RustCrypto verifier that `openidconnect` uses.
 
 ## Device retirement
 
