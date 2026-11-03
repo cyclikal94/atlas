@@ -2139,3 +2139,553 @@ fn collect_numbers(value: &serde_json::Value, into: &mut Vec<i64>) {
         _ => {}
     }
 }
+
+// R3 ----------------------------------------------------------------------------------------------
+// A page is selected by target (BE-PEOPLE-ACTIVITY R3): the reader's visible targets are found from
+// the current hierarchy and only their events are read. These cases compare every reader's whole
+// timeline with an independent reference, and witness that hidden history adds no work.
+
+/// Every resource `actor` receives in a fresh sync snapshot: an independent composition of the
+/// production visibility rule (owned, granted and household resources), not the activity reader's.
+async fn synced(s: &Store, actor: &str) -> Result<BTreeSet<String>> {
+    use atlas_core::Change;
+    let device = format!("oracle-{}", id());
+    let (mut ids, mut cursor) = (BTreeSet::new(), None::<String>);
+    loop {
+        let page = s.sync(actor, &device, cursor.as_deref(), 200, NOW).await?;
+        for batch in &page.batches {
+            for change in &batch.changes {
+                if let Change::Upsert { resource } = change {
+                    ids.insert(resource.id.clone());
+                }
+            }
+        }
+        if !page.has_more {
+            return Ok(ids);
+        }
+        cursor = Some(page.next_cursor);
+    }
+}
+
+/// The timeline's people, from the alias table.
+async fn family(s: &Store, canonical: &str) -> Result<BTreeSet<String>> {
+    let mut ids: BTreeSet<String> = sqlx::query_scalar::<_, String>(
+        "SELECT source_id FROM person_aliases WHERE canonical_id=$1",
+    )
+    .bind(canonical)
+    .fetch_all(&s.pool)
+    .await?
+    .into_iter()
+    .collect();
+    ids.insert(canonical.to_owned());
+    Ok(ids)
+}
+
+/// Reference model: the family's raw events, newest first, whose target `reader` can see.
+async fn reference_model(s: &Store, canonical: &str, reader: &str) -> Result<Vec<String>> {
+    let people = family(s, canonical).await?;
+    let seen = synced(s, reader).await?;
+    Ok(raw(s)
+        .await?
+        .into_iter()
+        .rev()
+        .filter(|r| people.contains(&r.person_id) && seen.contains(&r.target_id))
+        .map(|r| r.id)
+        .collect())
+}
+
+async fn create_fields(
+    s: &Store,
+    owner: &str,
+    person: &str,
+    policies: Vec<Policy>,
+) -> Result<Vec<String>> {
+    let ids: Vec<String> = policies.iter().map(|_| id()).collect();
+    let commands: Vec<Command> = ids
+        .iter()
+        .zip(policies)
+        .enumerate()
+        .map(|(n, (field, policy))| Command::CreateField {
+            id: field.clone(),
+            person_id: person.into(),
+            label: format!("Field {n}"),
+            value: "Initial".into(),
+            initial_policy: Some(policy),
+        })
+        .collect();
+    for chunk in commands.chunks(20) {
+        s.apply(owner, &id(), chunk).await?;
+    }
+    Ok(ids)
+}
+
+#[tokio::test]
+async fn a15_every_reader_sees_exactly_the_reference_timeline() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    s.hooks().record_activity_work(true);
+    let [alice, carol, dave, erin] = [
+        account(&s).await?,
+        account(&s).await?,
+        account(&s).await?,
+        account(&s).await?,
+    ];
+    let both = || grants(&[(&carol, false), (&dave, false)]);
+    let p = create_person(
+        &s,
+        &alice,
+        "Morgan",
+        grants(&[(&carol, false), (&dave, false), (&erin, false)]),
+    )
+    .await?;
+    // 150 fields: more than one statement's worth of visible targets for Dave, every third one
+    // for Carol, none for Erin; one field hidden from everyone but Alice.
+    let policies = (0..150)
+        .map(|n| match n {
+            75 => Policy::default(),
+            n if n % 3 == 0 => both(),
+            _ => grants(&[(&dave, false)]),
+        })
+        .collect();
+    let fields = create_fields(&s, &alice, &p, policies).await?;
+    let hidden = &fields[75];
+    for n in 0..40 {
+        edit(&s, &alice, hidden, "Field 75", &format!("secret {n}")).await?;
+        edit(
+            &s,
+            &alice,
+            &fields[n * 3],
+            &format!("Field {}", n * 3),
+            "shared",
+        )
+        .await?;
+        if n % 4 == 0 {
+            edit(&s, &alice, &fields[1 + n * 3], "Dave only", "dave").await?;
+        }
+    }
+    // A transitive merge: S1 into S2, then S2 into Morgan. Carol and Dave can see S1 and one of
+    // its fields (and so S2, whose audience the merge joins with S1's); S2's field moves to
+    // Morgan and is shared with them there. S3, which only Alice can see, is merged in too.
+    let s1 = create_person(&s, &alice, "First", both()).await?;
+    let s1_fields = create_fields(&s, &alice, &s1, vec![both(), Policy::default()]).await?;
+    let s2 = create_person(&s, &alice, "Second", Policy::default()).await?;
+    let s2_fields = create_fields(&s, &alice, &s2, vec![Policy::default()]).await?;
+    edit(&s, &alice, &s1_fields[0], "Before", "merge").await?;
+    edit(&s, &alice, &s1_fields[1], "Before", "hidden").await?;
+    merge(&s, &alice, &s1, &s2, "Second").await?;
+    merge(&s, &alice, &s2, &p, "Morgan").await?;
+    let s3 = create_person(&s, &alice, "Third", Policy::default()).await?;
+    let s3_fields = create_fields(&s, &alice, &s3, vec![Policy::default()]).await?;
+    edit(&s, &alice, &s3_fields[0], "Third note", "private").await?;
+    merge(&s, &alice, &s3, &p, "Morgan").await?;
+    replace_policy(&s, &alice, &s2_fields[0], both()).await?;
+    // Moved fields edited after the merges; one of them archived.
+    edit(&s, &alice, &s1_fields[0], "After", "merge").await?;
+    edit(&s, &alice, &s2_fields[0], "After", "moved").await?;
+    archive(&s, &alice, &s1_fields[0], true).await?;
+    for n in 0..10 {
+        edit(&s, &alice, hidden, "Field 75", &format!("later {n}")).await?;
+    }
+
+    // The targets the read found cover every target the timeline has ever recorded.
+    let people = family(&s, &p).await?;
+    s.person_activity(&alice, &p, None, 1).await?;
+    let found: BTreeSet<String> = s.hooks().activity_work().targets.into_iter().collect();
+    let recorded: BTreeSet<String> = raw(&s)
+        .await?
+        .into_iter()
+        .filter(|r| people.contains(&r.person_id))
+        .map(|r| r.target_id)
+        .collect();
+    assert!(
+        recorded.is_subset(&found),
+        "{:?}",
+        recorded.difference(&found)
+    );
+    assert_eq!(people.len(), 4);
+
+    for (reader, stream, statements) in [
+        (&alice, "member", 4),
+        (&carol, "targets", 1),
+        (&dave, "targets", 2),
+        (&erin, "targets", 1),
+    ] {
+        let model = reference_model(&s, &p, reader).await?;
+        assert!(!model.is_empty());
+        for limit in [1, 2, 7, 50, 100] {
+            let walked = walk(&s, reader, &p, limit).await?;
+            assert_eq!(ids_of(&walked), model, "limit {limit}");
+        }
+        let first = s.person_activity(reader, &p, None, 50).await?;
+        let work = s.hooks().activity_work();
+        assert!(work.statements.iter().all(|w| w.stream == stream));
+        assert_eq!(work.statements.len(), statements);
+        assert!(work.statements.iter().all(|w| w.rows <= 51));
+        // A merge's source is shown exactly when the reader can see it.
+        let seen = synced(&s, reader).await?;
+        for event in walk(&s, reader, &p, 100).await?.iter().chain(&first.items) {
+            if event.event_type == T::PersonMerged {
+                let raw_source = raw(&s)
+                    .await?
+                    .into_iter()
+                    .find(|r| r.id == event.id)
+                    .and_then(|r| r.merged_from)
+                    .expect("a merge records its source");
+                assert_eq!(
+                    event.merged_from.as_ref().map(|m| m.id.clone()),
+                    seen.contains(&raw_source).then_some(raw_source)
+                );
+            }
+        }
+    }
+    // The fixture covers what it claims: Carol sees S1, S2 and the shared or moved fields, but not
+    // S3, its field, S1's private field or the hidden field.
+    let carol_seen = synced(&s, &carol).await?;
+    for visible in [&s1, &s2, &s1_fields[0], &s2_fields[0]] {
+        assert!(carol_seen.contains(visible), "{visible}");
+    }
+    for hidden in [&s3, &s3_fields[0], &s1_fields[1], hidden] {
+        assert!(!carol_seen.contains(hidden), "{hidden}");
+    }
+    Ok(())
+}
+
+/// Rows PostgreSQL examined in `person_activity_events` for one recorded statement, from EXPLAIN
+/// ANALYZE: for every node that reads the table's rows (sequential, index or bitmap heap scan), its
+/// returned rows times loops plus the rows its filter or recheck removed. Index entries a bitmap
+/// heap scan then fetches are counted once, at the heap scan.
+async fn examined(
+    s: &Store,
+    statement: &atlas_core::hooks::ActivityStatement,
+) -> Result<(i64, String)> {
+    use atlas_core::hooks::Bind;
+    let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {}",
+        statement.sql
+    )));
+    for bind in &statement.binds {
+        query = match bind {
+            Bind::Text(t) => query.bind(t.clone()),
+            Bind::Int(i) => query.bind(*i),
+        };
+    }
+    let plan = query.fetch_all(&s.pool).await?;
+    let number = |text: &str, key: &str| -> Option<i64> {
+        let rest = &text[text.find(key)? + key.len()..];
+        rest.split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()
+    };
+    let (mut total, mut counting) = (0, false);
+    for line in &plan {
+        if line.contains("(actual") {
+            // A new node: count it only when it scans the event table itself.
+            counting = line.contains(" on person_activity_events (actual");
+            if counting {
+                total += number(line, "rows=").unwrap_or(0) * number(line, "loops=").unwrap_or(1);
+            }
+        } else if counting {
+            for key in [
+                "Rows Removed by Filter: ",
+                "Rows Removed by Index Recheck: ",
+            ] {
+                total += number(line, key).unwrap_or(0);
+            }
+        }
+    }
+    assert!(
+        plan.iter()
+            .any(|l| l.contains(" on person_activity_events (actual")),
+        "no scan of the event table found in {plan:#?}"
+    );
+    Ok((total, plan.join("; ")))
+}
+
+/// SQLite's plan for one recorded statement.
+async fn sqlite_plan(
+    s: &Store,
+    statement: &atlas_core::hooks::ActivityStatement,
+) -> Result<String> {
+    use atlas_core::hooks::Bind;
+    use sqlx::Row;
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN QUERY PLAN {}",
+        statement.sql
+    )));
+    for bind in &statement.binds {
+        query = match bind {
+            Bind::Text(t) => query.bind(t.clone()),
+            Bind::Int(i) => query.bind(*i),
+        };
+    }
+    Ok(query
+        .fetch_all(&s.pool)
+        .await?
+        .iter()
+        .map(|r| r.get::<String, _>(3))
+        .collect::<Vec<_>>()
+        .join("; "))
+}
+
+/// The work of one read: its statements (stream, SQL, rows) and its visibility checks, plus the
+/// rows PostgreSQL examined or SQLite's plans.
+async fn work_of(
+    s: &Store,
+    reader: &str,
+    person: &str,
+    after: Option<&str>,
+) -> Result<(
+    PersonActivityPage,
+    Vec<(String, String, usize, String)>,
+    usize,
+)> {
+    let page = s.person_activity(reader, person, after, 50).await?;
+    let work = s.hooks().activity_work();
+    let mut statements = Vec::new();
+    for statement in &work.statements {
+        let witness = if postgres() {
+            let (rows, plan) = examined(s, statement).await?;
+            format!("{rows} | {plan}")
+        } else {
+            sqlite_plan(s, statement).await?
+        };
+        if std::env::var_os("ATLAS_TEST_ACTIVITY_WORK").is_some() {
+            eprintln!(
+                "activity-work reader={reader} after={after:?} stream={} rows={} checks={} witness={witness} sql={}",
+                statement.stream, statement.rows, work.visibility_checks, statement.sql
+            );
+        }
+        statements.push((
+            statement.stream.to_owned(),
+            statement.sql.clone(),
+            statement.rows,
+            witness,
+        ));
+    }
+    Ok((page, statements, work.visibility_checks))
+}
+
+#[tokio::test]
+async fn a16_hidden_history_adds_no_work_to_a_restricted_or_a_deep_read() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    s.hooks().record_activity_work(true);
+    let (alice, carol) = (account(&s).await?, account(&s).await?);
+    let p = create_person(&s, &alice, "Morgan", grants(&[(&carol, false)])).await?;
+    let shared = create_field(&s, &alice, &p, "Hobby", grants(&[(&carol, false)])).await?;
+    let hidden = create_field(&s, &alice, &p, "Medical note", Policy::default()).await?;
+    for n in 0..120 {
+        edit(&s, &alice, &shared, "Hobby", &format!("v{n}")).await?;
+    }
+    // Another person's long history, which no statement may read either.
+    let other = create_person(&s, &alice, "Other", Policy::default()).await?;
+    let other_field = create_field(&s, &alice, &other, "Other", Policy::default()).await?;
+
+    let mut previous = None;
+    let mut hidden_total = 0;
+    for step in [0, 300, 600] {
+        while hidden_total < step {
+            edit(
+                &s,
+                &alice,
+                &hidden,
+                "Medical note",
+                &format!("h{hidden_total}"),
+            )
+            .await?;
+            edit(
+                &s,
+                &alice,
+                &other_field,
+                "Other",
+                &format!("o{hidden_total}"),
+            )
+            .await?;
+            hidden_total += 1;
+        }
+        // Statistics change what a planner may choose: Atlas never gathers them, but an operator
+        // or autovacuum can. The last step reads with them on both engines.
+        if step == 600 {
+            sqlx::query("ANALYZE person_activity_events")
+                .execute(&s.pool)
+                .await?;
+        }
+        let (first, first_work, first_checks) = work_of(&s, &carol, &p, None).await?;
+        let after = first
+            .next_after
+            .clone()
+            .expect("Carol has more than a page");
+        let (second, second_work, second_checks) = work_of(&s, &carol, &p, Some(&after)).await?;
+        let (third, third_work, _) = work_of(&s, &carol, &p, second.next_after.as_deref()).await?;
+        assert_eq!(third.next_after, None);
+        // Morgan's creation, the shared field's creation and its 120 edits.
+        assert_eq!(
+            first.items.len() + second.items.len() + third.items.len(),
+            122
+        );
+        // Carol reads only her two visible targets, never the hidden field or the other person.
+        for (stream, _, rows, witness) in first_work.iter().chain(&second_work).chain(&third_work) {
+            assert_eq!(stream, "targets");
+            assert!(*rows <= 51);
+            if postgres() {
+                // The rows of the two visible targets at most (122 events), whatever is hidden.
+                // PostgreSQL's plan follows its statistics (ANALYZE runs below), so the bound,
+                // not the exact count, is the hidden-history invariant there.
+                let rows: i64 = witness.split(" | ").next().unwrap_or_default().parse()?;
+                assert!(rows <= 122, "examined {witness}");
+            } else {
+                assert!(
+                    witness.contains("USING INDEX person_activity_events_target (target_id=?)"),
+                    "{witness}"
+                );
+                assert!(
+                    !witness.contains("SCAN person_activity_events"),
+                    "{witness}"
+                );
+            }
+        }
+        // The owner's deep page seeks straight to the cursor.
+        // A fixed old event with 69 older ones, however much newer history there is.
+        let everything = walk(&s, &alice, &p, 100).await?;
+        let deep_from = &everything[everything.len() - 70].id;
+        let (_, owner_work, owner_checks) = work_of(&s, &alice, &p, Some(deep_from)).await?;
+        assert_eq!(owner_work.len(), 1);
+        let (stream, _, rows, witness) = &owner_work[0];
+        assert_eq!((stream.as_str(), *rows), ("member", 51));
+        if postgres() {
+            // The cursor bound is an index condition, so nothing newer than the cursor (where
+            // all the added history is) is read: at most the 69 older rows and the boundary.
+            let examined: i64 = witness.split(" | ").next().unwrap_or_default().parse()?;
+            assert!(
+                examined <= 70,
+                "the owner's continuation examined {witness}"
+            );
+            let condition = witness
+                .split("; ")
+                .find(|line| line.contains("Cond: ((person_id = "))
+                .unwrap_or_default();
+            assert!(condition.contains(") AND (revision <= "), "{witness}");
+        } else {
+            assert!(
+                witness.contains(
+                    "USING INDEX person_activity_events_person (person_id=? AND revision<?)"
+                ),
+                "{witness}"
+            );
+            assert!(!witness.contains("TEMP B-TREE"), "{witness}");
+        }
+        // The same statements, rows and visibility checks at every amount of hidden history, and
+        // on SQLite the same plans (PostgreSQL's are bounded above instead).
+        let shape = |w: &Vec<(String, String, usize, String)>| {
+            w.iter()
+                .map(|(stream, sql, rows, witness)| {
+                    let plan = if postgres() {
+                        String::new()
+                    } else {
+                        witness.clone()
+                    };
+                    (stream.clone(), sql.clone(), *rows, plan)
+                })
+                .collect::<Vec<_>>()
+        };
+        let now = (
+            ids_of(&first.items),
+            ids_of(&second.items),
+            shape(&first_work),
+            shape(&second_work),
+            first_checks,
+            second_checks,
+            owner_checks,
+        );
+        if let Some(previous) = &previous {
+            assert_eq!(
+                &now, previous,
+                "hidden history changed the work at step {step}"
+            );
+        }
+        previous = Some(now);
+    }
+    Ok(())
+}
+
+const TARGETS: &str = "people_activity.between_targets_and_events";
+
+#[tokio::test]
+async fn a13_a_page_paused_after_its_target_selection_reads_one_snapshot() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (alice, carol) = (account(&s).await?, account(&s).await?);
+    let p = create_person(&s, &alice, "Morgan", grants(&[(&carol, false)])).await?;
+    let f = create_field(&s, &alice, &p, "Hobby", grants(&[(&carol, false)])).await?;
+    let g = create_field(&s, &alice, &p, "Gift ideas", Policy::default()).await?;
+    let before = walk(&s, &carol, &p, 50).await?;
+    assert_eq!(before.len(), 2);
+
+    let mut gate = s.hooks().arm(TARGETS);
+    let read = {
+        let (s, carol, p) = (s.clone(), carol.clone(), p.clone());
+        tokio::spawn(async move { s.person_activity(&carol, &p, None, 50).await })
+    };
+    gate.reached().await;
+    // Paused after its targets were judged: revoke one, share the other, and add an event.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        replace_policy(&s, &alice, &f, Policy::default()).await?;
+        replace_policy(&s, &alice, &g, grants(&[(&carol, false)])).await?;
+        edit(&s, &alice, &p, "Morgan Lee", "").await
+    })
+    .await
+    .expect("the writer was not blocked by the paused reader")?;
+    gate.release();
+    let page: PersonActivityPage = read.await??;
+    assert_eq!(
+        page.items, before,
+        "events come from the snapshot the targets were judged in"
+    );
+    let after = walk(&s, &carol, &p, 50).await?;
+    assert_eq!(
+        types(&after),
+        [T::PersonRenamed, T::FieldCreated, T::PersonCreated]
+    );
+    assert_eq!(after[1].target.id, g);
+    if postgres() {
+        let seen = s.hooks().isolation_seen();
+        assert!(!seen.is_empty());
+        assert!(
+            seen.iter().all(|level| level == "repeatable read"),
+            "{seen:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a17_an_event_outside_the_hierarchy_is_refused_never_shown() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (alice, carol) = (account(&s).await?, account(&s).await?);
+    let p = create_person(&s, &alice, "Morgan", grants(&[(&carol, false)])).await?;
+    let f = create_field(&s, &alice, &p, "Hobby", grants(&[(&carol, false)])).await?;
+    create_field(&s, &alice, &p, "Medical note", Policy::default()).await?;
+    let elsewhere = create_person(&s, &alice, "Elsewhere", grants(&[(&carol, false)])).await?;
+    let before_owner = walk(&s, &alice, &p, 50).await?;
+    let before_carol = walk(&s, &carol, &p, 50).await?;
+    // Forced corruption: an event of Morgan's timeline whose target is another person. No writer
+    // can produce it; the hierarchy triggers keep every target inside the timeline.
+    sqlx::query("INSERT INTO person_activity_events(id,revision,ordinal,person_id,target_id,event_type,actor_id,occurred_at) VALUES ($1,1000000,0,$2,$3,'field_edited',$4,0)")
+        .bind(id())
+        .bind(&p)
+        .bind(&elsewhere)
+        .bind(&alice)
+        .execute(&s.pool)
+        .await?;
+    // A reader who sees every target fails closed rather than presenting it.
+    let error = s.person_activity(&alice, &p, None, 50).await.unwrap_err();
+    assert_eq!(
+        code(&error),
+        None,
+        "an internal error, not a client error: {error}"
+    );
+    // A restricted reader reads only the targets found in the hierarchy.
+    assert_eq!(walk(&s, &carol, &p, 50).await?, before_carol);
+    assert_eq!(before_owner.len(), 3);
+    assert_eq!(before_carol.len(), 2);
+    assert_eq!(before_carol[0].target.id, f);
+    Ok(())
+}

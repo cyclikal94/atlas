@@ -8,7 +8,10 @@ use anyhow::Result;
 use sqlx::{Any, Transaction};
 use std::{
     collections::HashMap,
-    sync::{Mutex, MutexGuard},
+    sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::sync::oneshot;
 
@@ -24,6 +27,34 @@ struct State {
     split_reads: bool,
     read_committed: bool,
     unverified: bool,
+    activity: ActivityWork,
+}
+
+/// A value bound to a recorded People activity event statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Bind {
+    Text(String),
+    Int(i64),
+}
+
+/// One event statement of a People activity read, as executed.
+#[derive(Clone, Debug)]
+pub struct ActivityStatement {
+    /// `"member"` (one timeline alias, through `person_activity_events_person`) or `"targets"`
+    /// (a chunk of visible targets, through `person_activity_events_target`).
+    pub stream: &'static str,
+    pub sql: String,
+    pub binds: Vec<Bind>,
+    pub rows: usize,
+}
+
+/// The work of the most recent People activity read: the event statements it ran, the target
+/// resources it found for the timeline and how many IDs it submitted to the visibility rule.
+#[derive(Clone, Debug, Default)]
+pub struct ActivityWork {
+    pub statements: Vec<ActivityStatement>,
+    pub targets: Vec<String>,
+    pub visibility_checks: usize,
 }
 
 /// Held by a test for one armed point. Dropping it without `release` also releases the point,
@@ -52,7 +83,7 @@ impl Gate {
 }
 
 #[derive(Default)]
-pub struct Hooks(Mutex<State>);
+pub struct Hooks(Mutex<State>, AtomicBool);
 
 impl Hooks {
     fn state(&self) -> MutexGuard<'_, State> {
@@ -158,6 +189,43 @@ impl Hooks {
 
     pub(crate) fn verifies_snapshot(&self) -> bool {
         !self.state().unverified
+    }
+
+    /// Record the work of each People activity read (off by default, so a hook-enabled build such
+    /// as the load example pays one atomic load per read for it).
+    pub fn record_activity_work(&self, enabled: bool) {
+        self.1.store(enabled, Ordering::Relaxed);
+    }
+
+    /// The work witness of the most recent People activity read while recording was on.
+    pub fn activity_work(&self) -> ActivityWork {
+        self.state().activity.clone()
+    }
+
+    pub(crate) fn records_activity(&self) -> bool {
+        self.1.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn activity_begin(&self) {
+        if self.records_activity() {
+            self.state().activity = ActivityWork::default();
+        }
+    }
+
+    pub(crate) fn activity_targets(&self, targets: &std::collections::BTreeSet<String>) {
+        if self.records_activity() {
+            self.state().activity.targets = targets.iter().cloned().collect();
+        }
+    }
+
+    pub(crate) fn activity_visibility(&self, ids: usize) {
+        if self.records_activity() {
+            self.state().activity.visibility_checks += ids;
+        }
+    }
+
+    pub(crate) fn activity_statement(&self, statement: ActivityStatement) {
+        self.state().activity.statements.push(statement);
     }
 
     /// Reach a point outside any transaction (or one that must not run injected SQL).

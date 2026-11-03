@@ -18,9 +18,19 @@
 //! `NotFound` as `GET /people/{id}`), then the current visibility of each event's own target (and
 //! of a merge's source), using the production `VISIBLE` rule through `subset_batch`. Hidden events
 //! never count toward a page, its continuation or anything else in the response.
+//!
+//! The page is selected by target, not by scanning history (BE-PEOPLE-ACTIVITY R3). Every event of
+//! a timeline targets one of its people (the canonical person or a merged alias) or a field whose
+//! parent is one of them: an event's field belongs to the event's person when it is written, and the
+//! schema's hierarchy triggers allow a field's parent to change only from a merged alias to the
+//! person it was merged into. So the read collects those resources from the current hierarchy,
+//! judges each one's visibility once, and then reads events only for what the reader can see: when
+//! every target is visible, each alias's newest events through `person_activity_events_person`;
+//! otherwise the newest events of the visible targets through `person_activity_events_target`.
+//! Either way each statement returns at most one page plus one row, so hidden history is never read.
 use crate::error::ErrorCode;
 use crate::{Projection, Store, identifier};
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use serde::Serialize;
 use sqlx::{Any, Row, Transaction};
 use std::collections::{BTreeMap, BTreeSet};
@@ -282,8 +292,23 @@ pub(crate) fn value_differs(old: &serde_json::Value, new: &str) -> Result<bool> 
     Ok(*old != new)
 }
 
-/// Candidate rows read per statement while filling a page.
-const SCAN_CHUNK: i64 = 256;
+/// Visible targets bound per event statement when some of the timeline's targets are hidden.
+const TARGET_CHUNK: usize = 100;
+
+const EVENT_COLUMNS: &str = "id,revision,ordinal,target_id,event_type,actor_id,account_id,merged_from,label_changed,value_changed,occurred_at";
+
+/// The events one statement reads, newest first.
+enum Stream<'a> {
+    /// Every event of one timeline alias (the reader can see all the timeline's targets).
+    Member(&'a str),
+    /// The events of these visible targets.
+    Targets(&'a [String]),
+}
+
+enum Value {
+    Text(String),
+    Int(i64),
+}
 
 struct Candidate {
     id: String,
@@ -300,6 +325,116 @@ struct Candidate {
 }
 
 impl Store {
+    /// At most `take` events of `stream` strictly older than `position`, newest first.
+    async fn activity_stream(
+        &self,
+        tx: &mut Transaction<'_, Any>,
+        stream: &Stream<'_>,
+        members: &[String],
+        position: Option<(i64, i64)>,
+        take: i64,
+    ) -> Result<Vec<Candidate>> {
+        let mut binds = Vec::new();
+        let mut place = |value: Value| {
+            binds.push(value);
+            format!("${}", binds.len())
+        };
+        // Once statistics exist (Atlas never gathers them, but an operator can), SQLite prefers the
+        // unique (revision, ordinal) index, which satisfies the ORDER BY by walking every person's
+        // history, so each statement names the index it is designed for. PostgreSQL's planner is
+        // left to its statistics; the tests bound the rows it examines.
+        let index = |name: &str| {
+            if self.sqlite {
+                format!(" INDEXED BY {name}")
+            } else {
+                String::new()
+            }
+        };
+        let (kind, mut sql) = match stream {
+            Stream::Member(member) => (
+                "member",
+                format!(
+                    "SELECT {EVENT_COLUMNS} FROM person_activity_events{} WHERE person_id={}",
+                    index("person_activity_events_person"),
+                    place(Value::Text((*member).to_owned()))
+                ),
+            ),
+            Stream::Targets(targets) => {
+                let targets = targets
+                    .iter()
+                    .map(|t| place(Value::Text(t.clone())))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let members = members
+                    .iter()
+                    .map(|m| place(Value::Text(m.clone())))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                (
+                    "targets",
+                    format!(
+                        "SELECT {EVENT_COLUMNS} FROM person_activity_events{} WHERE target_id IN ({targets}) AND person_id IN ({members})",
+                        index("person_activity_events_target")
+                    ),
+                )
+            }
+        };
+        // A strict (revision, ordinal) bound whose first term is an index range on both engines.
+        if let Some((revision, ordinal)) = position {
+            let (revision, ordinal) = (place(Value::Int(revision)), place(Value::Int(ordinal)));
+            sql.push_str(&format!(
+                " AND revision<={revision} AND (revision<{revision} OR ordinal<{ordinal})"
+            ));
+        }
+        sql.push_str(&format!(
+            " ORDER BY revision DESC,ordinal DESC LIMIT {}",
+            place(Value::Int(take))
+        ));
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
+        for value in &binds {
+            query = match value {
+                Value::Text(text) => query.bind(text.as_str()),
+                Value::Int(int) => query.bind(*int),
+            };
+        }
+        let rows = query.fetch_all(&mut **tx).await?;
+        #[cfg(feature = "test-hooks")]
+        if self.hooks.records_activity() {
+            self.hooks
+                .activity_statement(crate::hooks::ActivityStatement {
+                    stream: kind,
+                    sql,
+                    binds: binds
+                        .iter()
+                        .map(|value| match value {
+                            Value::Text(text) => crate::hooks::Bind::Text(text.clone()),
+                            Value::Int(int) => crate::hooks::Bind::Int(*int),
+                        })
+                        .collect(),
+                    rows: rows.len(),
+                });
+        }
+        #[cfg(not(feature = "test-hooks"))]
+        let _ = (kind, sql);
+        rows.iter()
+            .map(|r| {
+                Ok(Candidate {
+                    id: r.get(0),
+                    revision: r.get(1),
+                    ordinal: r.get(2),
+                    target_id: r.get(3),
+                    event_type: ActivityType::parse(&r.get::<String, _>(4))?,
+                    actor_id: r.get(5),
+                    account_id: r.get(6),
+                    merged_from: r.get(7),
+                    label_changed: r.get::<i64, _>(8) == 1,
+                    value_changed: r.get::<i64, _>(9) == 1,
+                    occurred_at: r.get(10),
+                })
+            })
+            .collect()
+    }
+
     /// The parent person of a field, when it has one (a field can also belong to a task).
     pub(crate) async fn field_person(
         tx: &mut Transaction<'_, Any>,
@@ -361,6 +496,8 @@ impl Store {
         }
         let limit = usize::from(limit);
         let mut tx = self.task_read().await?;
+        #[cfg(feature = "test-hooks")]
+        self.hooks.activity_begin();
         let canonical = Self::canonical_person(&mut tx, id).await?;
         let person = Self::task_resource(&mut tx, actor, &canonical, "person", false).await?;
         hook!(self, "people_activity.between_person_and_events", &mut tx);
@@ -384,7 +521,7 @@ impl Store {
         // (revoked or narrowed field access, an exclusion, a merge source the reader cannot see)
         // is the same error as a missing event and another person's event, so the cursor never
         // reveals that a hidden event exists or belongs to this timeline.
-        let mut position = if let Some(after) = after {
+        let position = if let Some(after) = after {
             let mut query = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "SELECT revision,ordinal,target_id FROM person_activity_events WHERE person_id IN ({members_sql}) AND id=${}",
                 members.len() + 1
@@ -398,6 +535,8 @@ impl Store {
                 .await?
                 .ok_or_else(|| anyhow!(ErrorCode::InvalidValue))?;
             let target: String = row.get(2);
+            #[cfg(feature = "test-hooks")]
+            self.hooks.activity_visibility(1);
             let mut found =
                 Self::subset_batch(&mut tx, actor, &BTreeSet::from([target.clone()])).await?;
             let projection = found.remove(&target);
@@ -408,70 +547,84 @@ impl Store {
         } else {
             None
         };
-        let mut kept: Vec<(Candidate, Projection)> = Vec::new();
-        'scan: loop {
-            let n = members.len();
-            let sql = format!(
-                "SELECT id,revision,ordinal,target_id,event_type,actor_id,account_id,merged_from,label_changed,value_changed,occurred_at FROM person_activity_events WHERE person_id IN ({members_sql}) AND (${a} IS NULL OR revision<${a} OR (revision=${a} AND ordinal<${b})) ORDER BY revision DESC,ordinal DESC LIMIT ${c}",
-                a = n + 1,
-                b = n + 2,
-                c = n + 3
+        // The timeline's targets, from the current hierarchy rather than from its history: its
+        // people and their fields (archived ones included). See the module comment for why no
+        // event can target anything else.
+        let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+            "SELECT id FROM resources WHERE parent_id IN ({members_sql})"
+        )));
+        for member in &members {
+            query = query.bind(member.as_str());
+        }
+        let mut targets: BTreeSet<String> = query.fetch_all(&mut *tx).await?.into_iter().collect();
+        targets.extend(members.iter().cloned());
+        let unseen: BTreeSet<String> = targets
+            .iter()
+            .filter(|t| !visible.contains_key(*t))
+            .cloned()
+            .collect();
+        #[cfg(feature = "test-hooks")]
+        {
+            self.hooks.activity_targets(&targets);
+            self.hooks.activity_visibility(unseen.len());
+        }
+        let mut found = Self::subset_batch(&mut tx, actor, &unseen).await?;
+        for id in unseen {
+            let p = found.remove(&id);
+            visible.insert(id, p);
+        }
+        hook!(self, "people_activity.between_targets_and_events", &mut tx);
+        let shown: Vec<String> = targets
+            .iter()
+            .filter(|t| matches!(visible.get(*t), Some(Some(_))))
+            .cloned()
+            .collect();
+        let streams: Vec<Stream> = if shown.len() == targets.len() {
+            members.iter().map(|m| Stream::Member(m)).collect()
+        } else {
+            shown.chunks(TARGET_CHUNK).map(Stream::Targets).collect()
+        };
+        // Each stream's own newest `limit + 1` rows include every row of the global newest
+        // `limit + 1`, and the streams are disjoint, so one statement per stream fills the page
+        // and its lookahead.
+        let take = i64::try_from(limit + 1)?;
+        let mut candidates = Vec::new();
+        for stream in &streams {
+            candidates.extend(
+                self.activity_stream(&mut tx, stream, &members, position, take)
+                    .await?,
             );
-            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
-            for member in &members {
-                query = query.bind(member.as_str());
+        }
+        candidates.sort_by_key(|c| std::cmp::Reverse((c.revision, c.ordinal)));
+        candidates.truncate(limit + 1);
+        // A merge source is always one of the timeline's people; anything else is judged here.
+        let sources: BTreeSet<String> = candidates
+            .iter()
+            .filter_map(|c| c.merged_from.clone())
+            .filter(|id| !visible.contains_key(id))
+            .collect();
+        if !sources.is_empty() {
+            #[cfg(feature = "test-hooks")]
+            self.hooks.activity_visibility(sources.len());
+            let mut found = Self::subset_batch(&mut tx, actor, &sources).await?;
+            for id in sources {
+                let p = found.remove(&id);
+                visible.insert(id, p);
             }
-            let rows = query
-                .bind(position.map(|p| p.0))
-                .bind(position.map(|p| p.1))
-                .bind(SCAN_CHUNK)
-                .fetch_all(&mut *tx)
-                .await?;
-            let exhausted = rows.len() < usize::try_from(SCAN_CHUNK)?;
-            let candidates = rows
-                .iter()
-                .map(|r| {
-                    Ok(Candidate {
-                        id: r.get(0),
-                        revision: r.get(1),
-                        ordinal: r.get(2),
-                        target_id: r.get(3),
-                        event_type: ActivityType::parse(&r.get::<String, _>(4))?,
-                        actor_id: r.get(5),
-                        account_id: r.get(6),
-                        merged_from: r.get(7),
-                        label_changed: r.get::<i64, _>(8) == 1,
-                        value_changed: r.get::<i64, _>(9) == 1,
-                        occurred_at: r.get(10),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let unseen: BTreeSet<String> = candidates
-                .iter()
-                .flat_map(|c| std::iter::once(&c.target_id).chain(c.merged_from.as_ref()))
-                .filter(|id| !visible.contains_key(*id))
-                .cloned()
-                .collect();
-            if !unseen.is_empty() {
-                let mut found = Self::subset_batch(&mut tx, actor, &unseen).await?;
-                for id in unseen {
-                    let p = found.remove(&id);
-                    visible.insert(id, p);
-                }
-            }
-            for candidate in candidates {
-                position = Some((candidate.revision, candidate.ordinal));
-                if let Some(Some(target)) = visible.get(&candidate.target_id) {
-                    let target = target.clone();
-                    kept.push((candidate, target));
-                    if kept.len() > limit {
-                        break 'scan;
-                    }
-                }
-            }
-            if exhausted {
-                break;
-            }
+        }
+        let mut kept: Vec<(Candidate, Projection)> = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            // Every selected row targets a resource judged visible above. A row outside the
+            // timeline's targets would break the hierarchy invariant: refuse rather than guess.
+            let Some(Some(target)) = visible.get(&candidate.target_id) else {
+                bail!(
+                    "person activity event {} targets {}, outside the timeline of {canonical}",
+                    candidate.id,
+                    candidate.target_id
+                );
+            };
+            let target = target.clone();
+            kept.push((candidate, target));
         }
         let next_after = (kept.len() > limit).then(|| kept[limit - 1].0.id.clone());
         kept.truncate(limit);

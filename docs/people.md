@@ -299,6 +299,17 @@ the caller now, including one it was given before a revoke, an exclusion or a me
 cannot see) is the same `422 invalid_value`, so a saved cursor never reveals that a hidden event
 exists.
 
+**Read cost.** A page is selected by target, not by scanning history. The server finds the
+timeline's people (the canonical person and its merged aliases) and their fields, archived ones
+included, from the current hierarchy, judges each one's visibility once, and then reads only the
+events of what the caller can see, at most one page plus one row per statement. Hidden history,
+however long, is never read. This relies on an invariant the schema enforces: an event's field
+belongs to the event's person when it is written, and a field's parent can change only from a
+merged alias to the person it was merged into. An event outside that hierarchy (possible only
+through corruption) fails a read that would otherwise return it with an internal error rather
+than being shown. No index or schema change is involved. Response time depends on the number of
+the person's fields and on the caller's visible events; it is not made constant.
+
 **For WEB-19.** Show no sharing rows and no old values; say "Recorded since …" from
 `coverage_started_at`; deduplicate by event `id`, which is stable across reads, retries and
 devices; refresh from the first page when `/sync` delivers a change to the person or any
