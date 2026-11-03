@@ -37,7 +37,17 @@ impl App {
             browser: None,
             oidc: None,
             native_redirects: Arc::new(Vec::new()),
+            #[cfg(feature = "test-hooks")]
+            sync_time: None,
         })
+    }
+    /// Test-only (feature `test-hooks`, never a normal build): `/sync` on this App's router reads
+    /// `time` instead of the system clock. Authentication, sessions and publication keep the
+    /// system clock, and other App values (including clones made before this call) are unaffected.
+    #[cfg(feature = "test-hooks")]
+    pub fn sync_time_for_tests(mut self, time: i64) -> Self {
+        self.sync_time = Some(time);
+        self
     }
     pub fn trust_proxies(mut self, addresses: Vec<IpAddr>) -> Self {
         self.trusted_proxies = Arc::new(addresses);

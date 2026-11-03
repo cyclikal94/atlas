@@ -1160,12 +1160,13 @@ fn sealed(token: &str) -> u32 {
 /// pages; the device key (test only) confirms the plain positions the comparison would expose.
 #[tokio::test]
 async fn continuations_do_not_compare() -> Result<()> {
-    let fixed = |n: u128| Uuid::from_u128(n).to_string();
     let never_sent = fixed(350);
     let mut visible = Vec::new();
     for hidden in [false, true] {
         let (_d, store) = fixture().await?;
-        let (a, b) = (account(&store).await?, account(&store).await?);
+        // DA-H1 (Review 12): fixed accounts and device key, installed before any cursor, so the
+        // XOR comparison below is a fixed vector rather than a 2^-32 chance per run.
+        let (a, b) = fixed_accounts(&store, "reader").await?;
         let person = fixed(1);
         let fields: Vec<String> = (1..=12).map(|i| fixed(i * 100)).collect();
         let mut commands = vec![Command::CreatePerson {
@@ -1191,6 +1192,7 @@ async fn continuations_do_not_compare() -> Result<()> {
             revoke(&store, &a, &never_sent, &b).await?;
         }
         let key = cursor_key(&store, &b, "reader").await?;
+        assert_eq!(key, VECTOR_KEY);
         let piece = |m: usize| {
             let (store, b, start) = (store.clone(), b.clone(), start.clone());
             async move {
@@ -1242,6 +1244,551 @@ async fn continuations_do_not_compare() -> Result<()> {
         );
     }
     assert_eq!(visible[0], visible[1], "the visible pages are identical");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// DA-H1/Q6 (Review 12, 3 November 2026; authority BE-Q23-HMAC-TOKEN-SCOPE-20261103): fixed
+// continuation vectors. Every signing input is declared: accounts, device and its key (installed
+// through test-only database access before any cursor is issued), the clock, operation and
+// resource IDs, notice order, policies and the delivery ledger. The expected tokens come from
+// `tests/fixtures/q23_continuation_vectors.py` (Python's standard library), not from the Rust
+// signer. A finite vector is a regression case, not a general non-collision or security proof.
+// ---------------------------------------------------------------------------------------------
+
+/// Test-only device key: 64 hex characters, like a generated one. Never a production value.
+const VECTOR_KEY: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
+/// `T + 90 days` (the default retention), as every vector's expiry.
+const VECTOR_EXPIRY: i64 = T + 90 * 86400;
+const NEVER_SENT: u128 = 350;
+mod golden {
+    //! `python3 -I crates/core/tests/fixtures/q23_continuation_vectors.py`, device `reader`.
+    pub const START: &str = "d1.0000000000000002.000000006b169fc0.1f1994f82dc7c0a2e796cb18ac811a20046e86a8e78d72074b3b9fa608949f1b";
+    pub const DONE: &str = "d1.0000000000000003.000000006b169fc0.33caaa7472536ab2f99f5a4c7739a356b4aa0b83c118eeab1df026f348b59bde";
+    pub const I1_U4: &str = "d2.0000000000000002.000000006b169fc0.0000000000000003.00000001.0c166316.38915ffeedc4377e88b70ae62960246a720499804a8cc7d49529ecab4de63a18";
+    pub const I1_U5: &str = "d2.0000000000000002.000000006b169fc0.0000000000000003.00000001.9261a0b8.b54819fb981978ca7e79968698b04d4832d3f4d1172a5fba7ff6faa31dc2fd76";
+    pub const I1_U6: &str = "d2.0000000000000002.000000006b169fc0.0000000000000003.00000001.2be62377.08b1e6c60ebe44142bd91f31b446b8873004eeaefca573e1c3388937f4989f07";
+    pub const I1_U7: &str = "d2.0000000000000002.000000006b169fc0.0000000000000003.00000001.0ad2c4bb.9504c8bbdf7dd35763d2d5c73f7f34f3cf59ca8fde21489997ca5c2ce1ac1b04";
+    pub const I2_U7: &str = "d2.0000000000000002.000000006b169fc0.0000000000000003.00000002.643bcdfa.e4bea02e6ef95b02b79dfcd4819204e994f0a35e5c6b6757678dce2440cbc6fe";
+    pub const I2_U8: &str = "d2.0000000000000002.000000006b169fc0.0000000000000003.00000002.13d3e3be.b75604f9378e4646447e43fea365450dc7d3c23f8ca2c860e4ca92b42fcb32ae";
+    pub const I2_U9: &str = "d2.0000000000000002.000000006b169fc0.0000000000000003.00000002.e87db10d.c5813fd33f5ffc279c7e982339dc29e9ca5dcf4fe2844499870a722f47f6614f";
+    pub const I2_U10: &str = "d2.0000000000000002.000000006b169fc0.0000000000000003.00000002.d0e8238d.de74b65d32d94265cbf8447d544f36fd7110abef14a540c712d276973e64b83d";
+    pub const I3_R4: &str = "d2.0000000000000002.000000006b169fc0.0000000000000003.00000003.61f7002c.34b9aa2b5604ac84490dc679ab9edc786823f89f6cb3a6560bfd5853f4131a0f";
+    pub const I3_R5: &str = "d2.0000000000000002.000000006b169fc0.0000000000000003.00000003.8b0784f2.26664b9b73e4dd8f40c27fdca77cdb9ec3ad3def7a2c0d058a3b94a15f3d1a4a";
+    pub const I3_U10: &str = "d2.0000000000000002.000000006b169fc0.0000000000000003.00000003.556de9d8.78902db048218e234787ee5852456128f33be4b3546c333bd1e018db9ad6eff1";
+}
+
+fn fixed(n: u128) -> String {
+    Uuid::from_u128(n).to_string()
+}
+
+/// The fixed owner (`…a0`) and reader (`…b0`), with the reader's `device` registered and its key
+/// replaced by [`VECTOR_KEY`] before any delta cursor or continuation is issued.
+async fn fixed_accounts(store: &Store, device: &str) -> Result<(String, String)> {
+    let (a, b) = (fixed(0xA0), fixed(0xB0));
+    store.add_account(&a, "q23-owner", "test-only").await?;
+    store.add_account(&b, "q23-reader", "test-only").await?;
+    // Registration generates a random key; the only token it signs here is this snapshot's
+    // stored UUID, which no vector uses.
+    store.sync(&b, device, None, 200, T).await?;
+    sqlx::query("UPDATE sync_devices SET cursor_key=$1 WHERE account_id=$2 AND device_id=$3")
+        .bind(VECTOR_KEY)
+        .bind(&b)
+        .bind(device)
+        .execute(&store.pool)
+        .await?;
+    assert_eq!(cursor_key(store, &b, device).await?, VECTOR_KEY);
+    Ok((a, b))
+}
+
+async fn fixed_apply(store: &Store, actor: &str, op: u128, commands: &[Command]) -> Result<i64> {
+    store.apply(actor, &fixed(0xF000 + op), commands).await
+}
+
+/// One fixed history: revision 1 creates person `…01` and fields `…64` (100) to `…4b0` (1200),
+/// shared with the reader, plus `NEVER_SENT` (between the third and fourth field) when `hidden`;
+/// revision 2 revokes the person; the reader then anchors at boundary 2; revision 3 grants the
+/// person again; with `hidden`, revision 4 revokes `NEVER_SENT` before any delta request. The
+/// reader's notices for revision 3 are the person, then the fields (and `NEVER_SENT`) in id order.
+struct History {
+    _dir: tempfile::TempDir,
+    store: Store,
+    owner: String,
+    reader: String,
+    person: String,
+    fields: Vec<String>,
+    start: String,
+}
+
+async fn history(hidden: bool) -> Result<History> {
+    let (dir, store) = fixture().await?;
+    let (a, b) = fixed_accounts(&store, "reader").await?;
+    let person = fixed(1);
+    let fields: Vec<String> = (1..=12).map(|i| fixed(i * 100)).collect();
+    let never_sent = fixed(NEVER_SENT);
+    let mut commands = vec![Command::CreatePerson {
+        id: person.clone(),
+        name: "Vector".into(),
+        initial_policy: Some(share(&b)),
+    }];
+    for f in fields.iter().chain(hidden.then_some(&never_sent)) {
+        commands.push(Command::CreateField {
+            id: f.clone(),
+            person_id: person.clone(),
+            label: "Shared".into(),
+            value: "Shared value".into(),
+            initial_policy: Some(share(&b)),
+        });
+    }
+    assert_eq!(fixed_apply(&store, &a, 1, &commands).await?, 1);
+    let policy = versions(&store, &person).await?.1;
+    let revoked = fixed_apply(&store, &a, 2, &[revoke_command(&person, policy, &b)]).await?;
+    assert_eq!(revoked, 2);
+    let start = head(&store, &b, "reader", T).await?;
+    let grant = Command::Grant {
+        id: person.clone(),
+        expected_version: versions(&store, &person).await?.1,
+        account_id: b.clone(),
+        edit: false,
+    };
+    assert_eq!(fixed_apply(&store, &a, 3, &[grant]).await?, 3);
+    if hidden {
+        let policy = versions(&store, &never_sent).await?.1;
+        let hide = revoke_command(&never_sent, policy, &b);
+        assert_eq!(fixed_apply(&store, &a, 4, &[hide]).await?, 4);
+    }
+    Ok(History {
+        _dir: dir,
+        store,
+        owner: a,
+        reader: b,
+        person,
+        fields,
+        start,
+    })
+}
+
+impl History {
+    async fn piece(&self, cursor: &str, m: usize) -> Result<Page> {
+        self.store
+            .sync_bounded(&self.reader, "reader", Some(cursor), 1, Some(m), T)
+            .await
+    }
+    /// Asserts the response's next cursor, opened with the device key, before its golden value:
+    /// its header and plain position, then the exact token.
+    fn expect(&self, page: &Page, index: u32, plain: u32, golden: &str, label: &str) {
+        assert!(
+            page.next_cursor.starts_with("d2."),
+            "{label}: a continuation after {:?}",
+            Self::ids(page)
+        );
+        let (header, position) = open(VECTOR_KEY, &self.reader, "reader", &page.next_cursor);
+        assert_eq!(
+            header,
+            format!("d2.{:016x}.{VECTOR_EXPIRY:016x}.{:016x}.{index:08x}", 2, 3),
+            "{label}: header"
+        );
+        assert_eq!(position, plain, "{label}: plain position");
+        assert_eq!(page.next_cursor, golden, "{label}: golden token");
+    }
+    fn ids(page: &Page) -> Vec<String> {
+        page.batches
+            .iter()
+            .flat_map(|b| &b.changes)
+            .map(|c| match c {
+                Change::Upsert { resource } => format!("+{}", resource.id),
+                Change::Remove { id } => format!("-{id}"),
+            })
+            .collect()
+    }
+}
+
+/// Plain positions at one public header never cancel: the sealed fields' XOR differs from the
+/// positions' XOR. Checked before any golden comparison, so a common-pad construction fails here.
+fn no_cancellation(tokens: &[(&str, u32, &str)]) {
+    for (i, (x, a, lx)) in tokens.iter().enumerate() {
+        for (y, b, ly) in &tokens[i + 1..] {
+            assert_eq!(
+                x.rsplitn(3, '.').nth(2),
+                y.rsplitn(3, '.').nth(2),
+                "{lx} / {ly}: same public header"
+            );
+            if a != b {
+                assert_ne!(
+                    sealed(x) ^ sealed(y),
+                    a ^ b,
+                    "privacy: {lx} / {ly} cancel to the positions' XOR"
+                );
+            } else {
+                assert_eq!(x, y, "{lx} / {ly}: identical inputs, identical token");
+            }
+        }
+    }
+}
+
+/// Two bounds, then for each history: index-1 position and token, index-2 position and token.
+type Chain = ((usize, usize), [(u32, &'static str, u32, &'static str); 2]);
+
+/// DA-H1/Q6 upsert pass: two fixed histories (without and with a never-sent hidden notice) and
+/// four multi-piece prefixes reach the same public revision and index with the declared plain
+/// positions and golden tokens. Different positions never cancel; the same position, reached by
+/// different prefixes or histories, gives the same token. Each traversal completes to the whole
+/// batch, and a retried request at the same time returns the same response and ledger.
+#[tokio::test]
+async fn continuation_vectors_upsert_pass() -> Result<()> {
+    use golden::*;
+    let never_sent = fixed(NEVER_SENT);
+    // (first bound, second bound) -> index 1 and index 2 plain positions, without/with hidden.
+    let chains: [Chain; 4] = [
+        ((4, 4), [(4, I1_U4, 7, I2_U7), (5, I1_U5, 8, I2_U8)]),
+        ((4, 5), [(4, I1_U4, 8, I2_U8), (5, I1_U5, 9, I2_U9)]),
+        ((5, 4), [(5, I1_U5, 8, I2_U8), (6, I1_U6, 9, I2_U9)]),
+        ((6, 4), [(6, I1_U6, 9, I2_U9), (7, I1_U7, 10, I2_U10)]),
+    ];
+    let mut index2 = Vec::new();
+    let mut bodies = Vec::new();
+    for (h, hidden) in [false, true].into_iter().enumerate() {
+        let history = history(hidden).await?;
+        assert_eq!(history.start, START, "the anchor is a fixed vector");
+        let mut whole_text = String::new();
+        for ((m1, m2), expected) in &chains {
+            let (p1, g1, p2, g2) = expected[h];
+            let label = format!("history {h}, bounds {m1}/{m2}");
+            let first = history.piece(&history.start, *m1).await?;
+            history.expect(&first, 1, p1, g1, &format!("{label} index 1"));
+            let second = history.piece(&first.next_cursor, *m2).await?;
+            index2.push((second.next_cursor.clone(), p2, label.clone()));
+            history.expect(&second, 2, p2, g2, &format!("{label} index 2"));
+            for page in [&first, &second] {
+                whole_text.push_str(&serde_json::to_string(page)?);
+                assert_eq!(History::ids(page)[0], format!("+{}", history.person));
+            }
+            if (*m1, *m2) == (4, 4) {
+                bodies.push((History::ids(&first), History::ids(&second)));
+            }
+        }
+        assert!(!whole_text.contains(&never_sent), "never disclosed");
+        // Complete traversal with bound 4 from the anchor reassembles the whole batch, and the
+        // last piece of revision 3 returns the fixed `d1` cursor.
+        let (pieces, _) = drain(
+            &history.store,
+            &history.reader,
+            "reader",
+            Some(history.start.clone()),
+            1,
+            Some(4),
+            T,
+        )
+        .await?;
+        let last = pieces
+            .iter()
+            .find(|p| p.batches[0].segment.is_some_and(|s| s.last))
+            .expect("a last piece");
+        assert_eq!(last.next_cursor, DONE);
+        // The reference: the same anchor, without the bound, at the same time.
+        let (whole, _) = drain(
+            &history.store,
+            &history.reader,
+            "reader",
+            Some(history.start.clone()),
+            1,
+            None,
+            T,
+        )
+        .await?;
+        let whole: Vec<Page> = whole
+            .into_iter()
+            .filter(|p| p.batches.iter().any(|b| b.revision == 3))
+            .collect();
+        let pieces: Vec<Page> = pieces
+            .into_iter()
+            .filter(|p| p.batches.iter().any(|b| b.revision == 3))
+            .collect();
+        reassembles(&whole, &pieces, 4);
+        // Retry of a committed piece at the same time: same response, same token, same ledger.
+        let ledger_before = ledger(&history.store, &history.reader, "reader").await?;
+        let again = history.piece(&history.start, 4).await?;
+        let retry = history.piece(&history.start, 4).await?;
+        assert_eq!(
+            serde_json::to_string(&again)?,
+            serde_json::to_string(&retry)?
+        );
+        assert_eq!(retry.next_cursor, [I1_U4, I1_U5][h]);
+        assert_eq!(
+            ledger(&history.store, &history.reader, "reader").await?,
+            ledger_before
+        );
+    }
+    let refs: Vec<(&str, u32, &str)> = index2
+        .iter()
+        .map(|(t, p, l)| (t.as_str(), *p, l.as_str()))
+        .collect();
+    no_cancellation(&refs);
+    // The hidden notice changes positions, never the visible bodies.
+    assert_eq!(bodies[0], bodies[1], "identical visible pieces");
+    Ok(())
+}
+
+/// DA-H1/Q6 removal pass, and the revocation and merge controls. After the reader receives two
+/// pieces (the person and six fields), the owner hides the person: the rest of revision 3 is a
+/// removal pass whose index-3 continuation has removal position 4 without the hidden notice and 5
+/// with it (never delivered, so never removed), at the same public header and with the same
+/// bodies. A revocation of a delivered field before a repeated first piece moves its window to
+/// position 5, the same token the hidden-notice history gives, without sending that field.
+#[tokio::test]
+async fn continuation_vectors_removal_pass_and_controls() -> Result<()> {
+    use golden::*;
+    let never_sent = fixed(NEVER_SENT);
+    let mut index3 = Vec::new();
+    let mut bodies = Vec::new();
+    for (h, hidden) in [false, true].into_iter().enumerate() {
+        let history = history(hidden).await?;
+        assert_eq!(history.start, START, "the anchor is a fixed vector");
+        let f = &history.fields;
+        let first = history.piece(&history.start, 4).await?;
+        let second = history.piece(&first.next_cursor, 4).await?;
+        history.expect(&second, 2, [7, 8][h], [I2_U7, I2_U8][h], "prefix");
+        let delivered = ledger(&history.store, &history.reader, "reader").await?;
+        let policy = versions(&history.store, &history.person).await?.1;
+        let hide = revoke_command(&history.person, policy, &history.reader);
+        fixed_apply(&history.store, &history.owner, 5, &[hide]).await?;
+        let third = history.piece(&second.next_cursor, 4).await?;
+        let label = format!("history {h} index 3");
+        let (position, golden) = [(4, I3_R4), (5, I3_R5)][h];
+        index3.push((
+            third.next_cursor.clone(),
+            (1 << 16) | position,
+            label.clone(),
+        ));
+        history.expect(&third, 3, (1 << 16) | position, golden, &label);
+        assert_eq!(
+            History::ids(&third),
+            f[..4].iter().map(|id| format!("-{id}")).collect::<Vec<_>>(),
+            "{label}: removals of delivered fields only"
+        );
+        let last = history.piece(&third.next_cursor, 4).await?;
+        assert_eq!(
+            History::ids(&last),
+            [&f[4], &f[5], &history.person]
+                .map(|id| format!("-{id}"))
+                .to_vec(),
+            "history {h}: the remaining delivered resources"
+        );
+        assert_eq!(
+            last.batches[0].segment.map(|s| (s.index, s.last)),
+            Some((3, true)),
+            "the index-3 continuation returns the last piece"
+        );
+        assert_eq!(last.next_cursor, DONE);
+        // Removals keep the ledger: a lost removal response can be retried.
+        assert_eq!(
+            ledger(&history.store, &history.reader, "reader").await?,
+            delivered
+        );
+        let text = [&first, &second, &third, &last]
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<String, _>>()?;
+        assert!(!text.contains(&never_sent), "history {h}: never disclosed");
+        bodies.push(
+            [&first, &second, &third, &last]
+                .iter()
+                .map(|p| serde_json::to_string(&p.batches))
+                .collect::<Result<String, _>>()?,
+        );
+    }
+    let refs: Vec<(&str, u32, &str)> = index3
+        .iter()
+        .map(|(t, p, l)| (t.as_str(), *p, l.as_str()))
+        .collect();
+    no_cancellation(&refs);
+    assert_eq!(bodies[0], bodies[1], "the hidden notice changes no body");
+
+    // Revocation between requests: a delivered field hidden, then the first piece repeated.
+    let history = history(false).await?;
+    assert_eq!(history.start, START, "the anchor is a fixed vector");
+    let first = history.piece(&history.start, 4).await?;
+    history.expect(&first, 1, 4, I1_U4, "before revocation");
+    let policy = versions(&history.store, &history.fields[0]).await?.1;
+    let hide = revoke_command(&history.fields[0], policy, &history.reader);
+    fixed_apply(&history.store, &history.owner, 5, &[hide]).await?;
+    let repeat = history.piece(&history.start, 4).await?;
+    history.expect(&repeat, 1, 5, I1_U5, "after revocation");
+    assert_eq!(
+        History::ids(&repeat),
+        [
+            &history.person,
+            &history.fields[1],
+            &history.fields[2],
+            &history.fields[3]
+        ]
+        .map(|id| format!("+{id}"))
+        .to_vec()
+    );
+    no_cancellation(&[
+        (first.next_cursor.as_str(), 4, "before revocation"),
+        (repeat.next_cursor.as_str(), 5, "after revocation"),
+    ]);
+    Ok(())
+}
+
+/// DA-H1/Q6 binding: the same fixed key installed (test-only) on another device of the reader and
+/// on a device of the same name for another account does not make the reader's anchor or
+/// continuation valid there; the MAC binds account and device, not only the key. The rightful
+/// device then continues with the declared vector.
+#[tokio::test]
+async fn continuation_binding_with_shared_key() -> Result<()> {
+    use golden::*;
+    let history = history(false).await?;
+    let first = history.piece(&history.start, 4).await?;
+    // Goldens are checked after the refusals, so a binding fault fails at its own assertion.
+    let other = fixed(0xC0);
+    history
+        .store
+        .add_account(&other, "q23-other", "test-only")
+        .await?;
+    for (actor, device) in [(history.reader.clone(), "other"), (other, "reader")] {
+        history.store.sync(&actor, device, None, 200, T).await?;
+        sqlx::query("UPDATE sync_devices SET cursor_key=$1 WHERE account_id=$2 AND device_id=$3")
+            .bind(VECTOR_KEY)
+            .bind(&actor)
+            .bind(device)
+            .execute(&history.store.pool)
+            .await?;
+        for token in [&history.start, &first.next_cursor] {
+            let result = history
+                .store
+                .sync_bounded(&actor, device, Some(token), 1, Some(4), T)
+                .await;
+            assert_eq!(
+                result
+                    .map(|page| page.next_cursor)
+                    .map_err(|e| e.to_string()),
+                Err("resync_required".into()),
+                "binding: {actor}/{device} with the same key"
+            );
+        }
+    }
+    let second = history.piece(&first.next_cursor, 4).await?;
+    assert_eq!(history.start, START, "the anchor is a fixed vector");
+    history.expect(&first, 1, 4, I1_U4, "first");
+    history.expect(&second, 2, 7, I2_U7, "the rightful device");
+    Ok(())
+}
+
+/// DA-H1/Q6 merge between pieces: after two pieces, the owner merges the shared person into a new
+/// person (`…02`), which takes over its fields and sharing. Access is re-resolved: the next piece
+/// carries the target as the fields' parent, never the merged person's stale projection, at the
+/// declared upsert position 10; the next piece completes the revision with the fixed `d1` cursor
+/// (the merged person is settled by the merge's own revision), and the reader converges.
+#[tokio::test]
+async fn continuation_vectors_merge_between_pieces() -> Result<()> {
+    use golden::*;
+    let history = history(false).await?;
+    assert_eq!(history.start, START, "the anchor is a fixed vector");
+    let f = &history.fields;
+    let first = history.piece(&history.start, 4).await?;
+    let second = history.piece(&first.next_cursor, 4).await?;
+    history.expect(&second, 2, 7, I2_U7, "before merge");
+    let target = fixed(2);
+    fixed_apply(
+        &history.store,
+        &history.owner,
+        5,
+        &[Command::CreatePerson {
+            id: target.clone(),
+            name: "Private".into(),
+            initial_policy: None,
+        }],
+    )
+    .await?;
+    let preview = history
+        .store
+        .merge_preview(&history.owner, &history.person, &target)
+        .await?;
+    history
+        .store
+        .people_command(
+            &history.owner,
+            &fixed(0xF006),
+            &PeopleCommand::Merge {
+                source_id: history.person.clone(),
+                target_id: target.clone(),
+                preview_token: preview.token,
+                name: "Merged".into(),
+            },
+            T,
+        )
+        .await?;
+    let third = history.piece(&second.next_cursor, 4).await?;
+    history.expect(&third, 3, 10, I3_U10, "after merge");
+    assert_eq!(
+        History::ids(&third),
+        [&target, &f[6], &f[7], &f[8]]
+            .map(|id| format!("+{id}"))
+            .to_vec()
+    );
+    for change in &third.batches[0].changes[1..] {
+        let Change::Upsert { resource } = change else {
+            panic!("an upsert")
+        };
+        assert_eq!(resource.parent_id.as_ref(), Some(&target), "re-parented");
+    }
+    let fourth = history.piece(&third.next_cursor, 4).await?;
+    assert_eq!(
+        History::ids(&fourth),
+        [&target, &f[9], &f[10], &f[11]]
+            .map(|id| format!("+{id}"))
+            .to_vec()
+    );
+    // The merged person is still visible to revision 3's removal pass, so it is not removed
+    // there; the merge's own later revision settles it.
+    assert_eq!(
+        fourth.batches[0].segment.map(|s| (s.index, s.last)),
+        Some((3, true))
+    );
+    assert_eq!(fourth.next_cursor, DONE);
+    // Eventual whole-reference convergence: staged delivery plus the later revisions equals a
+    // fresh snapshot of the reader at the same time.
+    let mut staging = Client {
+        staging: true,
+        ..Client::default()
+    };
+    for page in [&first, &second, &third, &fourth] {
+        staging.receive(page);
+    }
+    for page in drain(
+        &history.store,
+        &history.reader,
+        "reader",
+        Some(DONE.into()),
+        200,
+        Some(4),
+        T,
+    )
+    .await?
+    .0
+    {
+        staging.receive(&page);
+    }
+    let (fresh, _) = drain(&history.store, &history.reader, "fresh", None, 200, None, T).await?;
+    let mut reference = Client::default();
+    fresh.iter().for_each(|p| reference.receive(p));
+    assert_eq!(staging.live, reference.live, "staged delivery converges");
+    assert!(staging.staged.is_empty());
+    assert!(
+        reference
+            .live
+            .values()
+            .filter(|p| p.kind == "field")
+            .all(|p| p.parent_id.as_deref() == Some(target.as_str())),
+        "the merge re-parented the fields"
+    );
+    no_cancellation(&[
+        (third.next_cursor.as_str(), 10, "upsert 10"),
+        (I3_R4, (1 << 16) | 4, "removal 4"),
+        (I3_R5, (1 << 16) | 5, "removal 5"),
+    ]);
     Ok(())
 }
 

@@ -89,6 +89,10 @@ pub struct App {
     browser: Option<browser::Config>,
     oidc: Option<Arc<oidc::Config>>,
     native_redirects: Arc<Vec<String>>,
+    /// BE-Q23 DA-H1 (feature `test-hooks` only): a fixed `/sync` time for this App's in-process
+    /// router tests. Only the sync route reads it; a normal build has no such field.
+    #[cfg(feature = "test-hooks")]
+    sync_time: Option<i64>,
 }
 
 /// Contract version reported by `/health`, read from `api/openapi.json` `info.version` at build time.

@@ -86,7 +86,7 @@ pub(crate) async fn sync(
                 input.cursor.as_deref(),
                 input.limit.unwrap_or(50),
                 input.max_changes,
-                now,
+                sync_clock(&app),
             )
             .await?,
     ))
@@ -98,4 +98,16 @@ pub(crate) async fn sync(
 #[cfg(feature = "sync-diagnostic")]
 fn now() -> i64 {
     diagnostic::sync_now()
+}
+
+/// The clock of one `/sync` request: the system clock (a diagnostic build's fixture time, above)
+/// unless a `test-hooks` build's App fixes it (BE-Q23 DA-H1).
+#[cfg(not(feature = "test-hooks"))]
+fn sync_clock(_: &App) -> fn() -> i64 {
+    now
+}
+#[cfg(feature = "test-hooks")]
+fn sync_clock(app: &App) -> impl Fn() -> i64 + Send + Sync + use<> {
+    let fixed = app.sync_time;
+    move || fixed.unwrap_or_else(now)
 }

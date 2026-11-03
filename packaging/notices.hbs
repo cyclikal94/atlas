@@ -6,8 +6,9 @@ Upstream crate source archives (including the unmodified MPL-2.0 ece source)
 are available using each exact name and version below at:
 https://crates.io/api/v1/crates/NAME/VERSION/download
 openidconnect 4.0.1 and web-push 0.11.0 are built from copies of those archives
-whose dependency manifests Atlas modified; the modified copies and their exact
-changes are in the Atlas source under vendor/ (see vendor/README.md).
+whose dependency manifests Atlas modified; in openidconnect Atlas also modified
+HMAC signature verification in src/core/jwk/mod.rs. The modified copies and their
+exact changes are in the Atlas source under vendor/ (see vendor/README.md).
 Atlas source: https://github.com/cyclikal94/atlas
 
 {{#each licenses}}
