@@ -12,7 +12,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
 use openidconnect::{
-    AccessToken, Audience, EmptyAdditionalClaims, IssuerUrl, JsonWebKeyId, Nonce,
+    AccessToken, AccessTokenHash, Audience, EmptyAdditionalClaims, IssuerUrl, JsonWebKeyId, Nonce,
     PkceCodeChallenge, PkceCodeVerifier, PrivateSigningKey, SigningError, StandardClaims,
     SubjectIdentifier,
     core::{
@@ -21,7 +21,7 @@ use openidconnect::{
     },
 };
 use ring::{
-    hmac,
+    digest, hmac,
     rand::SystemRandom,
     signature::{
         ECDSA_P256_SHA256_FIXED_SIGNING, ECDSA_P384_SHA384_FIXED_SIGNING, EcdsaKeyPair, KeyPair,
@@ -218,6 +218,9 @@ pub(crate) struct Provider {
     /// ID tokens the token endpoint has answered with, so a test can tell a refused token from a
     /// failed exchange.
     issued: Arc<AtomicUsize>,
+    /// The confidential client secret an RS/EC provider expects in HTTP Basic authentication (an
+    /// HMAC provider expects its signing secret); `None` for a public client.
+    client_secret: Option<String>,
 }
 
 impl Provider {
@@ -270,22 +273,32 @@ async fn token(
         }
         None => mode,
     };
-    // `…+new_subject`: the same mode for a subject no account is linked to.
-    let (mode, fresh) = match mode.strip_suffix("+new_subject") {
-        Some(rest) => (rest.to_owned(), true),
-        None => (mode.clone(), mode == "new_subject"),
+    // `…+new_subject` / `…+hash_subject`: the same mode for one of two subjects no account is
+    // linked to.
+    let (mode, subject) = if let Some(rest) = mode.strip_suffix("+new_subject") {
+        (rest.to_owned(), "new-subject")
+    } else if let Some(rest) = mode.strip_suffix("+hash_subject") {
+        (rest.to_owned(), "hash-subject")
+    } else if mode == "new_subject" {
+        (mode, "new-subject")
+    } else {
+        (mode, "provider-subject")
     };
     assert_eq!(form["grant_type"], "authorization_code");
     // A public client names itself in the form; a confidential one authenticates with HTTP Basic
     // (`client_secret_basic`, the library default), which must carry the shared secret.
-    match (&*provider.signing, headers.get("authorization")) {
-        (Signing::Hmac { secret, .. }, Some(basic)) => {
+    let confidential = match &*provider.signing {
+        Signing::Hmac { secret, .. } => Some(secret.as_str()),
+        _ => provider.client_secret.as_deref(),
+    };
+    match (confidential, headers.get("authorization")) {
+        (Some(secret), Some(basic)) => {
             let encoded = basic.to_str().unwrap().strip_prefix("Basic ").unwrap();
             let decoded = String::from_utf8(STANDARD.decode(encoded).unwrap()).unwrap();
             assert_eq!(decoded, format!("atlas-test:{secret}"));
         }
         (_, None) => assert_eq!(form["client_id"], "atlas-test"),
-        (_, Some(_)) => panic!("unexpected client authentication"),
+        (None, Some(_)) => panic!("unexpected client authentication"),
     }
     assert_eq!(
         form["redirect_uri"],
@@ -317,14 +330,7 @@ async fn token(
         )],
         instant + chrono::Duration::seconds(if mode == "expired" { -60 } else { 300 }),
         instant,
-        StandardClaims::new(SubjectIdentifier::new(
-            if fresh {
-                "new-subject"
-            } else {
-                "provider-subject"
-            }
-            .into(),
-        )),
+        StandardClaims::new(SubjectIdentifier::new(subject.into())),
         EmptyAdditionalClaims {},
     )
     .set_nonce(Some(Nonce::new(if mode == "nonce" {
@@ -333,8 +339,19 @@ async fn token(
         nonce
     })));
     let alg = provider.signing.alg();
+    // `at_hash:KIND`: a validly signed token whose `at_hash` claim is not the hash of the returned
+    // access token under the signing algorithm. Otherwise the library computes the claim from
+    // the access token (always for RS/EC; for HS only in `valid_at_hash` and `access_hash`).
+    let forged = mode
+        .strip_prefix("at_hash:")
+        .map(|kind| AccessTokenHash::new(forged_access_hash(kind, &alg, access.secret())));
+    let hashed = forged.is_none().then_some(&access);
+    let claims = match forged {
+        Some(hash) => claims.set_access_token_hash(Some(hash)),
+        None => claims,
+    };
     let signed = match &*provider.signing {
-        Signing::Rs256 => CoreIdToken::new(claims, &key(), alg, Some(&access), None),
+        Signing::Rs256 => CoreIdToken::new(claims, &key(), alg, hashed, None),
         Signing::Ec {
             published,
             unpublished,
@@ -346,11 +363,12 @@ async fn token(
                 &**published
             },
             alg,
-            Some(&access),
+            hashed,
             None,
         ),
-        // `at_hash` is optional in the code flow; only `valid_at_hash` asks for one. `alg:HS…`
-        // signs under an algorithm the provider metadata does not advertise.
+        // `at_hash` is optional in the code flow; `valid_at_hash` and `access_hash` ask for one,
+        // `at_hash:KIND` sets a wrong one. `alg:HS…` signs under an algorithm the provider
+        // metadata does not advertise.
         Signing::Hmac { alg, secret } => {
             let alg = match mode.strip_prefix("alg:") {
                 Some(name) => serde_json::from_value(json!(name)).unwrap(),
@@ -365,7 +383,7 @@ async fn token(
                 claims,
                 &HmacKey::new(alg.clone(), secret.as_bytes()),
                 alg,
-                (mode == "valid_at_hash").then_some(&access),
+                matches!(mode.as_str(), "valid_at_hash" | "access_hash").then_some(&access),
                 None,
             )
         }
@@ -401,6 +419,38 @@ async fn token(
     )
 }
 
+/// The `at_hash` claim of an `at_hash:KIND` mode, computed with ring (independently of
+/// openidconnect) for `access` under `alg`: `other_digest` is the left half of a digest the
+/// algorithm does not use (SHA-384 for a 256-bit algorithm, otherwise SHA-256), `truncated` the
+/// correct value without its last character, `empty` and `garbage` not a hash at all.
+fn forged_access_hash(kind: &str, alg: &CoreJwsSigningAlgorithm, access: &str) -> String {
+    use CoreJwsSigningAlgorithm as A;
+    let (own, other) = match alg {
+        A::HmacSha256 | A::RsaSsaPkcs1V15Sha256 | A::RsaSsaPssSha256 | A::EcdsaP256Sha256 => {
+            (&digest::SHA256, &digest::SHA384)
+        }
+        A::HmacSha384 | A::RsaSsaPkcs1V15Sha384 | A::RsaSsaPssSha384 | A::EcdsaP384Sha384 => {
+            (&digest::SHA384, &digest::SHA256)
+        }
+        _ => (&digest::SHA512, &digest::SHA256),
+    };
+    let left_half = |algorithm| {
+        let full = digest::digest(algorithm, access.as_bytes());
+        URL_SAFE_NO_PAD.encode(&full.as_ref()[..full.as_ref().len() / 2])
+    };
+    match kind {
+        "other_digest" => left_half(other),
+        "truncated" => {
+            let mut correct = left_half(own);
+            correct.pop();
+            correct
+        }
+        "empty" => String::new(),
+        "garbage" => "not-an-access-token-hash".into(),
+        _ => panic!("unknown at_hash mode {kind}"),
+    }
+}
+
 /// Start the RS256 provider on an ephemeral loopback port. Abort the handle to stop it.
 pub(crate) async fn serve() -> anyhow::Result<(Provider, JoinHandle<()>)> {
     serve_signed(Signing::Rs256).await
@@ -408,6 +458,22 @@ pub(crate) async fn serve() -> anyhow::Result<(Provider, JoinHandle<()>)> {
 
 /// Start a provider that signs, and advertises only, `signing`'s algorithm.
 pub(crate) async fn serve_signed(signing: Signing) -> anyhow::Result<(Provider, JoinHandle<()>)> {
+    serve_provider(signing, None).await
+}
+
+/// Start an RS/EC provider for a confidential client that authenticates with `client_secret`.
+pub(crate) async fn serve_confidential(
+    signing: Signing,
+    client_secret: &str,
+) -> anyhow::Result<(Provider, JoinHandle<()>)> {
+    assert!(!matches!(signing, Signing::Hmac { .. }), "use serve_signed");
+    serve_provider(signing, Some(client_secret.into())).await
+}
+
+async fn serve_provider(
+    signing: Signing,
+    client_secret: Option<String>,
+) -> anyhow::Result<(Provider, JoinHandle<()>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let provider = Provider {
         issuer: format!("http://{}", listener.local_addr()?),
@@ -416,6 +482,7 @@ pub(crate) async fn serve_signed(signing: Signing) -> anyhow::Result<(Provider, 
         arrived: Arc::new(Notify::new()),
         release: Arc::new(Notify::new()),
         issued: Arc::new(AtomicUsize::new(0)),
+        client_secret,
     };
     let alg = serde_json::to_value(provider.signing.alg())?;
     let metadata = json!({"issuer":provider.issuer,"authorization_endpoint":format!("{}/authorize",provider.issuer),"token_endpoint":format!("{}/token",provider.issuer),"jwks_uri":format!("{}/jwks",provider.issuer),"response_types_supported":["code"],"subject_types_supported":["public"],"id_token_signing_alg_values_supported":[alg]});

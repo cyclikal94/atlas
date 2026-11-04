@@ -42,7 +42,7 @@ a subprocess helper invoked by the sync lifecycle test; do not run it directly.
 | Clean startup/reopen, concurrent initialisation, incompatible-schema rejection | `storage/initialisation` | Both database engines |
 | Foreign keys and failed-initialisation rollback | `resources/hierarchy`, `storage/initialisation` | SQLite connection pool; transactional DDL on both engines |
 | ICS exceptions/cancellation, event reconciliation, private anchors, leap birthdays, connection preserve/replace/disconnect on partial `configure_source` updates, safe, distinguishable refresh-error codes and read-time refresh-in-progress | `calendars` | Calendar HTTP routes and integration worker |
-| Authentication, CSRF, session revocation, OIDC signatures and replay | — | Server `browser`, `sessions`, `onboarding`, `oidc` |
+| Authentication, CSRF, session revocation, OIDC signatures, `at_hash` (HS and public-key algorithms, confidential and public clients) and replay | — | Server `browser`, `sessions`, `onboarding`, `oidc` |
 | API version signal, contract hash and probed behaviour baseline | — | Server `compatibility`, `scripts/validate_contract.py` |
 | Fetch address rules, secret scope, real encrypted push payloads, the Declarative Web Push envelope, its origin-gated fallback and retry-identical plaintext | — | Server `integrations`; the payload probe in `compatibility`. Not browsers: display, clicks and service-worker fallback belong to the web client's tests |
 

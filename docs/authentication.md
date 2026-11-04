@@ -387,10 +387,13 @@ and removal.
 
 A provider can only reach HMAC verification when Atlas has a client secret (a confidential
 client) and the provider advertises an HS algorithm; a public client refuses shared-secret
-signatures. One limitation remains, recorded as open finding H1-AT and not changed here: when
-an HS-signed ID token carries `at_hash`, the callback looks for the hash's key among the
-provider's published keys, which never include a shared secret, so such a token is refused
-(`401`, no authority created). HS-signed ID tokens without `at_hash` sign in normally.
+signatures. When an HS-signed ID token carries `at_hash`, the callback checks it with the
+library's symmetric key built from that client secret, as the library's own signature check
+does, because a provider's published keys never include a shared secret; every other algorithm
+still takes the key from the provider's published keys. A correct `at_hash` signs in; a wrong
+one (another access token's hash, another digest, truncated, empty or not a hash) is `401`
+with no authority created (BE-Q23 H1-AT, authority BE-Q23-H1-AT-SCOPE-20261104). Earlier
+BE-Q23 candidates refused every HS-signed token that carried `at_hash`.
 
 The local provider test uses a deliberately public, test-only RSA fixture to sign
 synthetic tokens. It is not an application/deployment key and must never become one. The

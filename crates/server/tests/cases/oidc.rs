@@ -148,6 +148,10 @@ async fn scenario() -> anyhow::Result<()> {
         "expired",
         "signature",
         "access_hash",
+        "at_hash:other_digest",
+        "at_hash:truncated",
+        "at_hash:empty",
+        "at_hash:garbage",
     ] {
         let (path, cookie, _, _) = begin(&app, &provider, mode, Some(bearer), None).await;
         assert_eq!(
@@ -600,6 +604,10 @@ async fn oidc_verifies_ec_signed_id_tokens() -> anyhow::Result<()> {
             "expired",
             "signature",
             "access_hash",
+            "at_hash:other_digest",
+            "at_hash:truncated",
+            "at_hash:empty",
+            "at_hash:garbage",
             "wrong_key",
         ] {
             let (path, cookie, _, _) = begin(&app, &provider, mode, Some(bearer), None).await;
@@ -642,6 +650,108 @@ async fn oidc_verifies_ec_signed_id_tokens() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// BE-Q23 H1-AT (authority BE-Q23-H1-AT-SCOPE-20261104): a confidential client (with a client
+/// secret) whose provider signs with RS256, ES256 or ES384 still verifies `at_hash` with the
+/// published key, not the secret. A correct `at_hash` signs in (one grant, which activates); a
+/// wrong one is `401` and consumes only its flow.
+#[tokio::test]
+async fn oidc_confidential_public_key_clients_verify_access_token_hash() -> anyhow::Result<()> {
+    use crate::support::oidc::{Signing, serve_confidential};
+    use openidconnect::core::CoreJwsSigningAlgorithm as A;
+    const SECRET: &str = "atlas-test-only-confidential-public-key-client-secret";
+    for (label, signing) in [
+        ("RS256", Signing::Rs256),
+        ("ES256", Signing::ec(A::EcdsaP256Sha256)),
+        ("ES384", Signing::ec(A::EcdsaP384Sha384)),
+    ] {
+        let (provider, server) = serve_confidential(signing, SECRET).await?;
+        let (_dir, database) = crate::support::database::database_url().await?;
+        let store = Store::connect(&database).await?;
+        store.migrate().await?;
+        let account = Uuid::new_v4().to_string();
+        store
+            .add_account(
+                &account,
+                "alice",
+                &hash_password("oidc-confidential-password".into()).await?,
+            )
+            .await?;
+        let app = App::new(store.clone())
+            .await?
+            .public_origin("https://atlas.example")?
+            .oidc(&provider.issuer, "atlas-test", Some(SECRET.into()), false)?
+            .router();
+        let (_, _, session) = call(
+            &app,
+            "POST",
+            "sessions",
+            &[],
+            json!({"username":"alice","password":"oidc-confidential-password","device_id":"native"}),
+        )
+        .await;
+        let bearer = session["access_token"].as_str().unwrap().to_owned();
+        for mode in [
+            "access_hash",
+            "at_hash:other_digest",
+            "at_hash:truncated",
+            "at_hash:empty",
+            "at_hash:garbage",
+        ] {
+            let (path, cookie, _, _) = begin(&app, &provider, mode, Some(&bearer), None).await;
+            let before = authority(&store).await?;
+            let issued = provider.issued();
+            let (status, headers, _) =
+                call(&app, "GET", &path, &[("cookie", &cookie)], Value::Null).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{label} {mode}");
+            assert_eq!(provider.issued(), issued + 1, "{label} {mode}");
+            assert!(!headers.contains_key("location"), "{label} {mode}");
+            assert_eq!(
+                authority(&store).await?,
+                consumed_one(&before),
+                "{label} {mode}: only the flow is consumed"
+            );
+        }
+        // Healthy control: RS/EC tokens always carry a correct `at_hash`.
+        let (path, cookie, attempt, verifier) =
+            begin(&app, &provider, "valid", Some(&bearer), None).await;
+        let before = authority(&store).await?;
+        let (status, headers, _) =
+            call(&app, "GET", &path, &[("cookie", &cookie)], Value::Null).await;
+        assert_eq!(
+            status,
+            StatusCode::SEE_OTHER,
+            "{label}: confidential control"
+        );
+        assert_eq!(
+            authority(&store).await?,
+            consumed_one(&before)
+                .iter()
+                .map(|(t, n)| {
+                    let added = matches!(*t, "activation_grants" | "external_identities");
+                    (*t, *n + i64::from(added))
+                })
+                .collect::<Vec<_>>(),
+            "{label}: the link issues one grant"
+        );
+        let sent = fragment(headers["location"].to_str()?);
+        assert_eq!(sent["atlas_account"], account, "{label}");
+        assert_eq!(sent["atlas_attempt"], attempt, "{label}");
+        let (status, _, activated) = call(
+            &app,
+            "POST",
+            "browser-sessions/activate",
+            &[("origin", "https://atlas.example")],
+            json!({"grant":sent["atlas_grant"],"verifier":verifier}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{label}: {activated}");
+        assert_eq!(activated["account_id"], account, "{label}");
+        server.abort();
+        let _ = server.await;
+    }
+    Ok(())
+}
+
 /// Rows that carry or create sign-in authority, by table, for before/after comparisons.
 async fn authority(store: &Store) -> anyhow::Result<Vec<(&'static str, i64)>> {
     let mut rows = Vec::new();
@@ -677,8 +787,9 @@ fn consumed_one(before: &[(&'static str, i64)]) -> Vec<(&'static str, i64)> {
 /// N - 1, N + 1, the other HS lengths), an altered or wrong-secret MAC, an unadvertised HS
 /// algorithm and each claim failure is `401` without a panic. Its only durable effect is consuming
 /// its own flow: no account, identity, grant, handoff, session or session cookie, the existing
-/// session survives, and a replay is refused. The valid controls link, provision, activate and
-/// exchange. A second callback for a flow whose exchange is held at the token endpoint is refused,
+/// session survives, and a replay is refused. A wrong `at_hash` (another access token, another
+/// digest, truncated, empty, not a hash) is refused the same way. The valid controls, with and
+/// without a correct `at_hash` (H1-AT), link, provision, activate and exchange. A second callback for a flow whose exchange is held at the token endpoint is refused,
 /// for a malformed and a valid MAC alike; a flow bound to another tab's cookie is not consumed.
 #[tokio::test]
 async fn oidc_hmac_callbacks_refuse_malformed_signatures() -> anyhow::Result<()> {
@@ -741,10 +852,14 @@ async fn oidc_hmac_callbacks_refuse_malformed_signatures() -> anyhow::Result<()>
                 "audience",
                 "issuer",
                 "expired",
-                // Open finding H1-AT (characterised, not accepted): the callback resolves the
-                // `at_hash` key from the published JWKS, which never holds a shared secret, so a
-                // valid HS token that carries `at_hash` is refused. Recorded for decision.
-                "valid_at_hash",
+                // H1-AT (authority BE-Q23-H1-AT-SCOPE-20261104): a validly signed HS token whose
+                // `at_hash` is not the access token's hash under that algorithm is refused. The
+                // valid `at_hash` controls below sign in.
+                "access_hash",
+                "at_hash:other_digest",
+                "at_hash:truncated",
+                "at_hash:empty",
+                "at_hash:garbage",
             ]
             .map(String::from),
         );
@@ -889,8 +1004,48 @@ async fn oidc_hmac_callbacks_refuse_malformed_signatures() -> anyhow::Result<()>
             .await?;
         assert_eq!(mapped, account, "{alg:?}");
 
-        // Native: a malformed MAC creates no handoff; the valid control exchanges once.
-        for mode in [format!("mac_len:{}", size - 1), "valid".to_owned()] {
+        // H1-AT: a valid HS token carrying a correct `at_hash` signs in to the linked account,
+        // issuing one grant (the identity is already linked) that activates once.
+        let (path, cookie, attempt, verifier) =
+            begin(&app, &provider, "valid_at_hash", Some(&bearer), None).await;
+        let before = authority(&store).await?;
+        let issued = provider.issued();
+        let (status, headers, _) =
+            call(&app, "GET", &path, &[("cookie", &cookie)], Value::Null).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{alg:?}: valid at_hash");
+        assert_eq!(provider.issued(), issued + 1, "{alg:?}: valid at_hash");
+        assert_eq!(
+            authority(&store).await?,
+            consumed_one(&before)
+                .iter()
+                .map(|(t, n)| (*t, *n + i64::from(*t == "activation_grants")))
+                .collect::<Vec<_>>(),
+            "{alg:?}: valid at_hash issues one grant"
+        );
+        let sent = fragment(headers["location"].to_str()?);
+        assert_eq!(sent["atlas_account"], account, "{alg:?}: valid at_hash");
+        assert_eq!(sent["atlas_attempt"], attempt, "{alg:?}: valid at_hash");
+        let (status, headers, activated) = call(
+            &app,
+            "POST",
+            "browser-sessions/activate",
+            &[("origin", "https://atlas.example")],
+            json!({"grant":sent["atlas_grant"],"verifier":verifier}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{alg:?} valid at_hash: {activated}");
+        assert_eq!(activated["account_id"], account);
+        assert!(headers["set-cookie"].to_str()?.contains("atlas_session"));
+
+        // Native: a malformed MAC or a wrong `at_hash` creates no handoff; each valid control
+        // (with and without `at_hash`) exchanges once.
+        for mode in [
+            format!("mac_len:{}", size - 1),
+            "access_hash".to_owned(),
+            "at_hash:other_digest".to_owned(),
+            "valid".to_owned(),
+            "valid_at_hash".to_owned(),
+        ] {
             let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
             let mut start = url::Url::parse("https://atlas.example/oidc/native/start")?;
             start
@@ -927,12 +1082,12 @@ async fn oidc_hmac_callbacks_refuse_malformed_signatures() -> anyhow::Result<()>
             )
             .await;
             assert_eq!(provider.issued(), issued + 1, "{alg:?} native {mode}");
-            if mode != "valid" {
+            if !mode.starts_with("valid") {
                 assert_eq!(status, StatusCode::UNAUTHORIZED, "{alg:?} native {mode}");
                 assert_eq!(authority(&store).await?, consumed_one(&before));
                 continue;
             }
-            assert_eq!(status, StatusCode::SEE_OTHER, "{alg:?} native");
+            assert_eq!(status, StatusCode::SEE_OTHER, "{alg:?} native {mode}");
             let destination = url::Url::parse(headers["location"].to_str()?)?;
             let result: HashMap<_, _> = destination
                 .query_pairs()
@@ -958,18 +1113,32 @@ async fn oidc_hmac_callbacks_refuse_malformed_signatures() -> anyhow::Result<()>
             .public_origin("https://atlas.example")?
             .oidc(&provider.issuer, "atlas-test", Some(SECRET.into()), true)?
             .router();
-        let (path, cookie, _, _) =
-            begin(&auto, &provider, "mac_len:0+new_subject", None, None).await;
-        let before = authority(&store).await?;
-        let issued = provider.issued();
-        assert_eq!(
-            call(&auto, "GET", &path, &[("cookie", &cookie)], Value::Null)
-                .await
-                .0,
-            StatusCode::UNAUTHORIZED
-        );
-        assert_eq!(provider.issued(), issued + 1, "{alg:?}: provisioning");
-        assert_eq!(authority(&store).await?, consumed_one(&before));
+        for mode in [
+            "mac_len:0+new_subject",
+            "access_hash+new_subject",
+            "at_hash:truncated+hash_subject",
+        ] {
+            let (path, cookie, _, _) = begin(&auto, &provider, mode, None, None).await;
+            let before = authority(&store).await?;
+            let issued = provider.issued();
+            assert_eq!(
+                call(&auto, "GET", &path, &[("cookie", &cookie)], Value::Null)
+                    .await
+                    .0,
+                StatusCode::UNAUTHORIZED,
+                "{alg:?}: provisioning {mode}"
+            );
+            assert_eq!(
+                provider.issued(),
+                issued + 1,
+                "{alg:?}: provisioning {mode}"
+            );
+            assert_eq!(
+                authority(&store).await?,
+                consumed_one(&before),
+                "{alg:?}: provisioning {mode} creates no account"
+            );
+        }
         let (path, cookie, _, verifier) = begin(&auto, &provider, "new_subject", None, None).await;
         let (status, headers, _) =
             call(&auto, "GET", &path, &[("cookie", &cookie)], Value::Null).await;
@@ -989,25 +1158,70 @@ async fn oidc_hmac_callbacks_refuse_malformed_signatures() -> anyhow::Result<()>
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{alg:?}: {activated}");
+        let provisioned = sent["atlas_account"].clone();
 
-        // A public client (no secret) refuses even a valid shared-secret signature.
+        // H1-AT: a valid HS token with a correct `at_hash` for another unknown subject provisions
+        // a second account (one account, identity and grant), which activates.
+        let (path, cookie, _, verifier) =
+            begin(&auto, &provider, "valid_at_hash+hash_subject", None, None).await;
+        let before = authority(&store).await?;
+        let (status, headers, _) =
+            call(&auto, "GET", &path, &[("cookie", &cookie)], Value::Null).await;
+        assert_eq!(
+            status,
+            StatusCode::SEE_OTHER,
+            "{alg:?}: provisioning with at_hash"
+        );
+        assert_eq!(
+            authority(&store).await?,
+            consumed_one(&before)
+                .iter()
+                .map(|(t, n)| {
+                    let added =
+                        matches!(*t, "accounts" | "external_identities" | "activation_grants");
+                    (*t, *n + i64::from(added))
+                })
+                .collect::<Vec<_>>(),
+            "{alg:?}: provisioning with at_hash"
+        );
+        let sent = fragment(headers["location"].to_str()?);
+        assert_ne!(sent["atlas_account"], account);
+        assert_ne!(sent["atlas_account"], provisioned);
+        let (status, _, activated) = call(
+            &auto,
+            "POST",
+            "browser-sessions/activate",
+            &[("origin", "https://atlas.example")],
+            json!({"grant":sent["atlas_grant"],"verifier":verifier}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{alg:?}: {activated}");
+
+        // A public client (no secret) refuses even a valid shared-secret signature, with or
+        // without a correct `at_hash`.
         let public = App::new(store.clone())
             .await?
             .public_origin("https://atlas.example")?
             .oidc(&provider.issuer, "atlas-test", None, true)?
             .router();
-        let (path, cookie, _, _) = begin(&public, &provider, "new_subject", None, None).await;
-        let before = authority(&store).await?;
-        let issued = provider.issued();
-        assert_eq!(
-            call(&public, "GET", &path, &[("cookie", &cookie)], Value::Null)
-                .await
-                .0,
-            StatusCode::UNAUTHORIZED,
-            "{alg:?}: public client"
-        );
-        assert_eq!(provider.issued(), issued + 1, "{alg:?}: public client");
-        assert_eq!(authority(&store).await?, consumed_one(&before));
+        for mode in ["new_subject", "valid_at_hash+new_subject"] {
+            let (path, cookie, _, _) = begin(&public, &provider, mode, None, None).await;
+            let before = authority(&store).await?;
+            let issued = provider.issued();
+            assert_eq!(
+                call(&public, "GET", &path, &[("cookie", &cookie)], Value::Null)
+                    .await
+                    .0,
+                StatusCode::UNAUTHORIZED,
+                "{alg:?}: public client {mode}"
+            );
+            assert_eq!(
+                provider.issued(),
+                issued + 1,
+                "{alg:?}: public client {mode}"
+            );
+            assert_eq!(authority(&store).await?, consumed_one(&before));
+        }
         server.abort();
         let _ = server.await;
     }
