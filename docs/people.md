@@ -224,7 +224,7 @@ owner has left (only the person depends on that household):
 
 ## Activity timeline
 
-Since API `0.29.2` (schema `1007`) `GET /people/{id}/activity?after=&limit=` returns one
+Since API `0.30.2` (schema `1007`; the branch recorded this read as `0.29.2` and integration re-sequenced it) `GET /people/{id}/activity?after=&limit=` returns one
 page (1–100 items, default 50) of a person's recorded activity, newest first, as a
 `PersonActivityPage`. It is an authenticated online read like the summaries: not part of
 `/sync`, not cacheable and never an access grant, read from one database snapshot. A merged

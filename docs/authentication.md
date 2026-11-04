@@ -374,15 +374,33 @@ any private-key operations and when upgrading the dependency.
 [RUSTSEC-2026-0387](https://rustsec.org/advisories/RUSTSEC-2026-0387) (timing variability
 in `crypto-bigint` 0.5) reached Atlas through both `openidconnect` 4.0.1 and `web-push`
 0.11.0 via the 0.13 elliptic-curve stack. Neither crate had a release on the fixed stack, so
-Atlas builds both from local copies under `vendor/`. In those copies only the curve
-dependency changed, and no source file changed. `cargo deny` passes with no exception for
-this advisory. See `vendor/README.md` for provenance, retained behaviour and removal.
+Atlas builds both from local copies under `vendor/`. In those copies the curve dependency
+changed, and `cargo deny` passes with no exception for this advisory. One source file of the
+`openidconnect` copy also changed, separately: upstream 4.0.1 panicked on an HS256/384/512
+ID-token signature of the wrong length (empty, short or long) instead of refusing it, so its
+three HMAC verification calls now use the existing `hmac` length-checked `verify_slice`. Any
+such signature is an ordinary invalid signature, and the callback answers `401` without
+creating an account, identity, grant, handoff or session. Valid signatures, the algorithms,
+keys, claim checks and interfaces are unchanged (BE-Q23 H1, authority
+BE-Q23-HMAC-TOKEN-SCOPE-20261103). See `vendor/README.md` for provenance, retained behaviour
+and removal.
+
+A provider can only reach HMAC verification when Atlas has a client secret (a confidential
+client) and the provider advertises an HS algorithm; a public client refuses shared-secret
+signatures. When an HS-signed ID token carries `at_hash`, the callback checks it with the
+library's symmetric key built from that client secret, as the library's own signature check
+does, because a provider's published keys never include a shared secret; every other algorithm
+still takes the key from the provider's published keys. A correct `at_hash` signs in; a wrong
+one (another access token's hash, another digest, truncated, empty or not a hash) is `401`
+with no authority created (BE-Q23 H1-AT, authority BE-Q23-H1-AT-SCOPE-20261104). Earlier
+BE-Q23 candidates refused every HS-signed token that carried `at_hash`.
 
 The local provider test uses a deliberately public, test-only RSA fixture to sign
 synthetic tokens. It is not an application/deployment key and must never become one. The
 ES256/ES384 provider tests and the signature matrix generate disposable keys with `ring` on
-every run. Their signatures therefore come from an implementation independent of the
-RustCrypto verifier that `openidconnect` uses.
+every run, and the HS256/384/512 provider tests sign with a test-only client secret through
+`ring`; the HMAC known-answer test uses the RFC 4231 test vectors. These signatures therefore
+come from implementations independent of the RustCrypto verifier that `openidconnect` uses.
 
 ## Device retirement
 

@@ -1,4 +1,5 @@
-//! People activity timeline (BE-PEOPLE-ACTIVITY, schema `1007`, API `0.29.2`).
+//! People activity timeline (BE-PEOPLE-ACTIVITY, schema `1007`, API `0.30.2`; recorded on its
+//! branch as `0.29.2` and re-sequenced at the 4 November 2026 base merge).
 //!
 //! Supported People changes append metadata-only rows to `person_activity_events` in the same
 //! transaction as the change, after `publish` has assigned the commit's `sync_clock` revision and

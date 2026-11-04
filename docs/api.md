@@ -159,6 +159,11 @@ and must not probe `GET /policies/{id}` for people it does not own. See
 [people](people.md#viewer-safe-summaries). The compatibility baseline gains a
 `people_summaries` probe group.
 
+`0.30.2` is the first contract that carries the People activity timeline (recorded on its
+branch as `0.29.2`) together with `0.30.1`; the base merge of 4 November 2026 changed no
+endpoint, schema or behaviour beyond their union, and the compatibility baseline was
+re-recorded for the combined contract because a changed contract needs a greater version.
+
 `0.29.2` adds the People activity timeline (BE-PEOPLE-ACTIVITY) and changes no existing
 response or request: one authenticated read, `GET /people/{id}/activity`
 (`getPersonActivity`), and its strict schemas `PersonActivityPage`, `PersonActivityEvent`,
@@ -169,10 +174,33 @@ supported change) are not observable by any existing route. It needs database sc
 exists. Events store no names, labels or values; every read applies current access to each
 event (including to the `after` cursor, which is valid only while its own event is visible to
 the reader), names only the reader, the person's current owner or its currently linked account,
-and omits sharing changes. A client must call the read only once the server reports `0.29.2`
-or later. See [people](people.md#activity-timeline). The compatibility baseline gains a
-`people_activity` probe group. `0.29.1` and `0.30.0` are claimed by other unintegrated
-branches; integration re-sequences versions as described above.
+and omits sharing changes. A client must call the read only once the server reports `0.30.2`
+or later (the branch recorded it as `0.29.2`; integration re-sequenced it). See [people](people.md#activity-timeline). The compatibility baseline gains a
+`people_activity` probe group.
+
+`0.30.1` is the first contract that carries both `0.29.1` (dependency graph) and `0.30.0`
+(bounded `/sync` delivery) on one server; the base merge of 4 November 2026 changed no
+endpoint, schema or behaviour beyond their union, and the compatibility baseline was
+re-recorded for the combined contract because a changed contract needs a greater version.
+
+`0.30.0` adds opt-in bounded `/sync` delivery (BE-Q23) and changes no existing response: a
+request without the new `max_changes` query parameter (4–800) is answered byte for byte as
+before. With it, a snapshot page holds at most `min(limit, max_changes)` resources and a
+delta revision larger than the bound arrives as pieces, one per response, each marked by
+the new optional `Batch.segment` member (schema `BatchSegment`: `index`, `last`) and followed
+by a continuation cursor. The schema is unchanged at `1006`. A client must send
+`max_changes` only once the server reports `0.30.0` or later and must stage pieces until the
+last one; see [sync](sync.md#bounded-delivery). The compatibility baseline gains a
+`bounded_sync` probe group.
+
+`0.29.1` adds `GET /occurrences/{id}/dependency-graph` (`getDependencyGraph`), the
+caller-authorised prerequisite graph of one occurrence (BE-DEPENDENCY-GRAPH), and its strict
+schemas `DependencyGraph`, `DependencyGraphNode`, `DependencyEdge` and `DependencyGraphTask`.
+No existing response, command or behaviour changes: the completion preview
+`previewDependencyCompletion`, its token, `set_dependencies` and `complete_dependencies` are
+as before, and edges remain outside `/sync`. A client must call the read only once the
+server reports `0.29.1` or later. See [tasks](tasks.md#dependency-graph). The compatibility
+baseline gains a `dependency_graph` probe group.
 
 Mutations require an account-scoped UUID `Idempotency-Key` and explicit version
 preconditions where defined. Commands that replace existing authored text also carry the
@@ -204,7 +232,7 @@ statuses and [sync](sync.md) for client recovery.
 `GET /health` returns the version of the API contract the running server was built with:
 
 ```json
-{"status": "ok", "api_version": "0.28.0"}
+{"status": "ok", "api_version": "0.30.2"}
 ```
 
 `api_version` is exactly `info.version` in [the contract](../api/openapi.json), read from

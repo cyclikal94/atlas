@@ -272,7 +272,9 @@ impl JsonWebKey for CoreJsonWebKey {
                     SignatureVerificationError::Other(format!("Could not create key: {}", e))
                 })?;
                 mac.update(message);
-                mac.verify(signature.into())
+                // Atlas modification (BE-Q23 H1): `verify_slice` refuses a wrong-length signature
+                // as an ordinary error; `signature.into()` panicked on one.
+                mac.verify_slice(signature)
                     .map_err(|_| SignatureVerificationError::CryptoError("bad HMAC".to_string()))
             }
             CoreJwsSigningAlgorithm::HmacSha384 => {
@@ -287,7 +289,9 @@ impl JsonWebKey for CoreJsonWebKey {
                     SignatureVerificationError::Other(format!("Could not create key: {}", e))
                 })?;
                 mac.update(message);
-                mac.verify(signature.into())
+                // Atlas modification (BE-Q23 H1): `verify_slice` refuses a wrong-length signature
+                // as an ordinary error; `signature.into()` panicked on one.
+                mac.verify_slice(signature)
                     .map_err(|_| SignatureVerificationError::CryptoError("bad HMAC".to_string()))
             }
             CoreJwsSigningAlgorithm::HmacSha512 => {
@@ -302,7 +306,9 @@ impl JsonWebKey for CoreJsonWebKey {
                     SignatureVerificationError::Other(format!("Could not create key: {}", e))
                 })?;
                 mac.update(message);
-                mac.verify(signature.into())
+                // Atlas modification (BE-Q23 H1): `verify_slice` refuses a wrong-length signature
+                // as an ordinary error; `signature.into()` panicked on one.
+                mac.verify_slice(signature)
                     .map_err(|_| SignatureVerificationError::CryptoError("bad HMAC".to_string()))
             }
             CoreJwsSigningAlgorithm::EcdsaP256Sha256 => {

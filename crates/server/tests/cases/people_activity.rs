@@ -13,7 +13,7 @@ use atlas_server::{hash_password, now};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 
-use crate::cases::people_summary::{check, contract};
+use crate::support::contract::{check, contract};
 
 /// `people_summary::conforms`, refusing a schema name the contract does not define (which that
 /// checker would otherwise accept vacuously).
@@ -22,7 +22,7 @@ fn conforms(schema: &str, body: &Value) {
         contract()["components"]["schemas"].get(schema).is_some(),
         "{schema} is not in api/openapi.json"
     );
-    crate::cases::people_summary::conforms(schema, body);
+    crate::support::contract::conforms(schema, body);
 }
 use crate::support::http::{command_request, request};
 use crate::support::retirement::{PASSWORD, Reply, World, bearer, id, login, world};

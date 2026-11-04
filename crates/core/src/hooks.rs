@@ -130,7 +130,8 @@ impl Hooks {
     }
 
     /// Negative control for the sharing snapshot: read the households on a second, later
-    /// snapshot instead of the one the defaults were read in, on either engine.
+    /// snapshot instead of the one the defaults were read in, on either engine. The dependency
+    /// graph uses the same switch to expand on a later snapshot than its root read.
     pub fn split_snapshot_reads(&self, enabled: bool) {
         self.state().split_reads = enabled;
     }
@@ -149,8 +150,9 @@ impl Hooks {
 
     /// `SHOW transaction_isolation` as observed after the locking reads of each attempt,
     /// between the two halves of a sharing snapshot, between a People summary's id query and
-    /// its enrichment, and between a field-audience page's effective-access qualification and
-    /// its counts, and between a People activity read's person gate and its events.
+    /// its enrichment, between a field-audience page's effective-access qualification and
+    /// its counts, between a People activity read's person gate and its events, and after a
+    /// dependency graph's root read.
     pub fn isolation_seen(&self) -> Vec<String> {
         self.state().isolation_seen.clone()
     }
@@ -257,6 +259,7 @@ impl Hooks {
                 | "people_summary.between_reads"
                 | "people_summary.between_qualify_and_count"
                 | "people_activity.between_person_and_events"
+                | "dependency_graph.after_root_read"
         ) && !sqlite
         {
             let level: String = sqlx::query_scalar("SHOW transaction_isolation")

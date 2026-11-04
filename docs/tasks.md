@@ -256,6 +256,144 @@ invents numeric prerequisite evidence or records another person's completion. St
 roots reject advisory overrides. Failure rolls back the entire operation. Ordinary
 partial progress and corrections remain possible without completing prerequisites.
 
+### Dependency graph
+
+Since API `0.29.1`, `GET /occurrences/{id}/dependency-graph` (`getDependencyGraph`) returns
+the caller-authorised *upstream* prerequisite graph of one occurrence, for drawing the
+relationships and for editing direct prerequisites. It is an authenticated online read,
+not part of `/sync`, served `private, no-store`, and read from one database snapshot. A
+root the caller cannot see, or that is not an occurrence, is `not_found`, exactly like a
+nonexistent ID. Call it only once `/health` reports `0.29.1` or later.
+
+Dependencies exist only between occurrences. `nodes` are occurrences; `tasks` lists each
+task definition once with its current title, so several occurrences of one recurring
+task (distinguished by `slot`) share one entry. `edges` are exactly the stored direct
+relationships between returned occurrences: `dependant_id` requires `prerequisite_id`.
+Nothing is derived from list order or transitivity, and node and edge order carry no
+relationship meaning. `relation` is `root`, `direct` (a stored direct prerequisite of the
+root, even if it is also reachable through another prerequisite) or `transitive`; `depth`
+is the shortest distance from the root over `edges`. `direct_prerequisites` is the
+root's current visible direct list, which is the editor's starting point.
+
+The graph is bounded. `max_depth` (1 to 200, default 200) limits how far below the root
+the read goes, and at most 200 visible nodes are returned, the root included; the node
+budget is fixed. Nodes are discovered breadth-first in ascending ID order. A node is
+`expanded` only when all of its visible direct prerequisites fit, and then every edge to
+them is returned; otherwise it is `unexpanded` and none of its edges are returned. A node
+that does not fit does not stop smaller expansions later. `coverage` is `partial` exactly
+when some node is unexpanded, so a client can never mistake a cut-off graph for a whole
+one. Stored cycles cannot arise through the API, and even a damaged stored cycle returns
+each node once.
+
+Each response is a whole *view*: one account's graph of one root at one `max_depth`, from
+one snapshot. A client replaces a view only with a whole newer response to the same
+request, and never unions nodes or edges from separate responses, because nothing in a
+response can order or reconcile it with another:
+
+- A node's `version` is its edit precondition (`expected_version`), not a graph revision.
+  Completion, progress, a title change or an access change elsewhere alters `outcome`,
+  `dependency_state`, `tasks` and which nodes are returned without changing any returned
+  `version`. Equal versions therefore do not mean equal nodes, and a higher version does
+  not make the rest of its response newer.
+- A response lists only what is visible now and never what has gone. After a revocation or
+  a removed relationship the occurrences simply are not there; only whole replacement
+  drops them.
+- `relation`, `depth`, `prerequisites`, `restricted_prerequisites`, `dependency_state` and
+  `coverage` are relative to the request. The same occurrence is `direct` at depth 1 and
+  `unexpanded` in one view and the `expanded` root at depth 0 in another.
+
+To see further below an unexpanded node, open a separate view rooted at it (for example as
+a navigation step) and keep each view as its own response. A client:
+
+1. Keeps views in memory for the signed-in account only, keyed by root and `max_depth`,
+   like other `no-store` reads, and discards all of them when the account signs out or
+   changes.
+2. Gives each request a generation number per view, and applies a response only if it
+   answers that view's latest request and the same account is still signed in. Any other
+   response, including one that arrives out of order, is discarded.
+3. Reads a displayed view again after its own task or sharing commands, after a
+   `conflict`, whenever sync reports a change, and when the view is shown again. Sync does
+   not report every revocation (for example of an occurrence the device never received),
+   so a displayed view is a point-in-time snapshot until it is read again.
+4. Removes a view whose read answers `not_found`. A view opened from it is separate and is
+   read again on its own.
+
+Visibility follows the ordinary rules. An occurrence the caller cannot see is never
+returned, expanded or counted towards the budget, and neither is anything reachable only
+through it, so neither the budget nor the order depends on hidden data. A hidden direct
+prerequisite only sets `restricted_prerequisites: true` on its visible dependant (no ID,
+title, count or progress) and `restricted: true` on the graph. Revoking access makes a
+node disappear and its dependant restricted; a revoked root is `not_found`.
+
+`dependency_state` uses the caller's own view of each node's *direct* prerequisites,
+exactly as completion enforces them:
+
+| `dependency_state` | Meaning | Suggested label |
+| --- | --- | --- |
+| `satisfied` | The node's own outcome is `complete` (even after an advisory override) | Done |
+| `waiting` | A visible direct prerequisite is not satisfied | Waiting |
+| `restricted` | Every visible direct prerequisite is satisfied, but one or more is hidden; `require_satisfied` would conflict | Waiting on something you cannot see |
+| `ready` | No unsatisfied or hidden direct prerequisite | To do |
+| `unknown` | Unexpanded and not satisfied | Open this task to see more |
+
+It concerns prerequisites only: whether the caller can act now is the occurrence view's
+`actionable`, and another participant's progress that the caller cannot see is not
+complete for them. The graph carries no completion authority. Completing still uses
+`GET /occurrences/{id}/dependencies` and its token, and after a `conflict` a client reads
+both again.
+
+To edit, read with `max_depth=1` and send `set_dependencies` with the root's `version` and
+the full intended visible list. A stale version is `conflict`: read again and reapply.
+Self-references (`invalid_value`) and cycles (`conflict`) are still refused. The
+command replaces the whole stored set, including prerequisites the editor cannot see, so
+when the root's `restricted_prerequisites` is true, saving removes them. A client must warn
+before saving, or not offer saving, in that state.
+
+A chain: Pack requires Book tickets, which requires Choose dates (done).
+
+<!-- experimental-schema: DependencyGraph -->
+```json
+{"root_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e01","nodes":[{"occurrence_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e01","task_id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e01","slot":{"key":"once","date":"2026-09-08","intended_time":null,"timezone":"Europe/London","instant":null},"version":3,"can_edit":true,"strict":false,"depth":0,"relation":"root","outcome":"incomplete","prerequisites":"expanded","restricted_prerequisites":false,"dependency_state":"waiting"},{"occurrence_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e02","task_id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e02","slot":{"key":"once","date":"2026-09-08","intended_time":null,"timezone":"Europe/London","instant":null},"version":3,"can_edit":true,"strict":false,"depth":1,"relation":"direct","outcome":"incomplete","prerequisites":"expanded","restricted_prerequisites":false,"dependency_state":"ready"},{"occurrence_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e03","task_id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e03","slot":{"key":"once","date":"2026-09-08","intended_time":null,"timezone":"Europe/London","instant":null},"version":1,"can_edit":true,"strict":false,"depth":2,"relation":"transitive","outcome":"complete","prerequisites":"expanded","restricted_prerequisites":false,"dependency_state":"satisfied"}],"edges":[{"prerequisite_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e02","dependant_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e01"},{"prerequisite_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e03","dependant_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e02"}],"tasks":[{"id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e01","title":"Pack"},{"id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e02","title":"Book tickets"},{"id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e03","title":"Choose dates"}],"direct_prerequisites":["6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e02"],"coverage":"complete","restricted":false,"max_depth":200}
+```
+
+A branch and join with a shared prerequisite: Serve dinner (strict) requires Cook and Pour
+drinks, which both require Set the table. Set the table appears once, with two edges.
+
+<!-- experimental-schema: DependencyGraph -->
+```json
+{"root_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e10","nodes":[{"occurrence_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e10","task_id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e10","slot":{"key":"once","date":"2026-09-08","intended_time":null,"timezone":"Europe/London","instant":null},"version":3,"can_edit":true,"strict":true,"depth":0,"relation":"root","outcome":"incomplete","prerequisites":"expanded","restricted_prerequisites":false,"dependency_state":"waiting"},{"occurrence_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e11","task_id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e11","slot":{"key":"once","date":"2026-09-08","intended_time":null,"timezone":"Europe/London","instant":null},"version":2,"can_edit":true,"strict":false,"depth":1,"relation":"direct","outcome":"incomplete","prerequisites":"expanded","restricted_prerequisites":false,"dependency_state":"ready"},{"occurrence_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e12","task_id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e12","slot":{"key":"once","date":"2026-09-08","intended_time":null,"timezone":"Europe/London","instant":null},"version":2,"can_edit":true,"strict":false,"depth":1,"relation":"direct","outcome":"complete","prerequisites":"expanded","restricted_prerequisites":false,"dependency_state":"satisfied"},{"occurrence_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e13","task_id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e13","slot":{"key":"once","date":"2026-09-08","intended_time":null,"timezone":"Europe/London","instant":null},"version":1,"can_edit":true,"strict":false,"depth":2,"relation":"transitive","outcome":"complete","prerequisites":"expanded","restricted_prerequisites":false,"dependency_state":"satisfied"}],"edges":[{"prerequisite_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e11","dependant_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e10"},{"prerequisite_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e12","dependant_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e10"},{"prerequisite_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e13","dependant_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e11"},{"prerequisite_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e13","dependant_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e12"}],"tasks":[{"id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e10","title":"Serve dinner"},{"id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e11","title":"Cook"},{"id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e12","title":"Pour drinks"},{"id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e13","title":"Set the table"}],"direct_prerequisites":["6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e11","6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e12"],"coverage":"complete","restricted":false,"max_depth":200}
+```
+
+An occurrence with no prerequisites:
+
+<!-- experimental-schema: DependencyGraph -->
+```json
+{"root_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e20","nodes":[{"occurrence_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e20","task_id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e20","slot":{"key":"once","date":"2026-09-08","intended_time":null,"timezone":"Europe/London","instant":null},"version":1,"can_edit":true,"strict":false,"depth":0,"relation":"root","outcome":"incomplete","prerequisites":"expanded","restricted_prerequisites":false,"dependency_state":"ready"}],"edges":[],"tasks":[{"id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e20","title":"Water plants"}],"direct_prerequisites":[],"coverage":"complete","restricted":false,"max_depth":200}
+```
+
+A restricted root: one visible prerequisite is done and one is hidden from this caller.
+
+<!-- experimental-schema: DependencyGraph -->
+```json
+{"root_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e30","nodes":[{"occurrence_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e30","task_id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e30","slot":{"key":"once","date":"2026-09-08","intended_time":null,"timezone":"Europe/London","instant":null},"version":4,"can_edit":true,"strict":false,"depth":0,"relation":"root","outcome":"incomplete","prerequisites":"expanded","restricted_prerequisites":true,"dependency_state":"restricted"},{"occurrence_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e31","task_id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e31","slot":{"key":"once","date":"2026-09-08","intended_time":null,"timezone":"Europe/London","instant":null},"version":1,"can_edit":true,"strict":false,"depth":1,"relation":"direct","outcome":"complete","prerequisites":"expanded","restricted_prerequisites":false,"dependency_state":"satisfied"}],"edges":[{"prerequisite_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e31","dependant_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e30"}],"tasks":[{"id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e30","title":"Birthday party"},{"id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e31","title":"Send invitations"}],"direct_prerequisites":["6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e31"],"coverage":"complete","restricted":true,"max_depth":200}
+```
+
+The chain read with `max_depth=1`: Book tickets is unexpanded, so the graph is partial.
+
+<!-- experimental-schema: DependencyGraph -->
+```json
+{"root_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e01","nodes":[{"occurrence_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e01","task_id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e01","slot":{"key":"once","date":"2026-09-08","intended_time":null,"timezone":"Europe/London","instant":null},"version":3,"can_edit":true,"strict":false,"depth":0,"relation":"root","outcome":"incomplete","prerequisites":"expanded","restricted_prerequisites":false,"dependency_state":"waiting"},{"occurrence_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e02","task_id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e02","slot":{"key":"once","date":"2026-09-08","intended_time":null,"timezone":"Europe/London","instant":null},"version":3,"can_edit":true,"strict":false,"depth":1,"relation":"direct","outcome":"incomplete","prerequisites":"unexpanded","restricted_prerequisites":null,"dependency_state":"unknown"}],"edges":[{"prerequisite_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e02","dependant_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e01"}],"tasks":[{"id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e01","title":"Pack"},{"id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e02","title":"Book tickets"}],"direct_prerequisites":["6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e02"],"coverage":"partial","restricted":false,"max_depth":1}
+```
+
+Two occurrences of one recurring task, with one task entry:
+
+<!-- experimental-schema: DependencyGraph -->
+```json
+{"root_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e40","nodes":[{"occurrence_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e40","task_id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e40","slot":{"key":"once","date":"2026-09-08","intended_time":null,"timezone":"Europe/London","instant":null},"version":2,"can_edit":true,"strict":false,"depth":0,"relation":"root","outcome":"incomplete","prerequisites":"expanded","restricted_prerequisites":false,"dependency_state":"waiting"},{"occurrence_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e41","task_id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e41","slot":{"key":"2026-09-07","date":"2026-09-07","intended_time":null,"timezone":"Europe/London","instant":null},"version":1,"can_edit":true,"strict":false,"depth":1,"relation":"direct","outcome":"complete","prerequisites":"expanded","restricted_prerequisites":false,"dependency_state":"satisfied"},{"occurrence_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e42","task_id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e41","slot":{"key":"2026-09-08","date":"2026-09-08","intended_time":null,"timezone":"Europe/London","instant":null},"version":1,"can_edit":true,"strict":false,"depth":1,"relation":"direct","outcome":"incomplete","prerequisites":"expanded","restricted_prerequisites":false,"dependency_state":"ready"}],"edges":[{"prerequisite_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e41","dependant_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e40"},{"prerequisite_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e42","dependant_id":"6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e40"}],"tasks":[{"id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e40","title":"Holiday"},{"id":"1b7e2a90-4c1d-4e8a-9f30-5a6b7c8d9e41","title":"Water plants"}],"direct_prerequisites":["6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e41","6e0a1d7c-2f3b-5c4d-8e9f-0a1b2c3d4e42"],"coverage":"complete","restricted":false,"max_depth":200}
+```
+
+### Timers and recurrence
+
 `start_timer`, `stop_timer` and `cancel_timer` use numeric goals whose unit is
 `seconds`. Stop records one exact integer duration in the ordinary progress journal.
 Timers are independent per person per task occurrence. A person can time several

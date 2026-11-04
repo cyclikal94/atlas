@@ -64,6 +64,7 @@ pub(crate) async fn access_commands(
 pub(crate) struct SyncQuery {
     cursor: Option<String>,
     limit: Option<usize>,
+    max_changes: Option<usize>,
 }
 pub(crate) async fn sync(
     State(app): State<App>,
@@ -79,13 +80,34 @@ pub(crate) async fn sync(
     hook!(app.store, "sync_route.after_identity");
     Ok(Json(
         app.store
-            .sync(
+            .sync_bounded(
                 &account,
                 &device,
                 input.cursor.as_deref(),
                 input.limit.unwrap_or(50),
-                now,
+                input.max_changes,
+                sync_clock(&app),
             )
             .await?,
     ))
+}
+
+/// BE-Q23 R3: a diagnostic build's `/sync` time. This item shadows the glob-imported system clock
+/// in this module, whose only reader is `sync` above. It comes last so that a normal build's
+/// source positions are unchanged.
+#[cfg(feature = "sync-diagnostic")]
+fn now() -> i64 {
+    diagnostic::sync_now()
+}
+
+/// The clock of one `/sync` request: the system clock (a diagnostic build's fixture time, above)
+/// unless a `test-hooks` build's App fixes it (BE-Q23 DA-H1).
+#[cfg(not(feature = "test-hooks"))]
+fn sync_clock(_: &App) -> fn() -> i64 {
+    now
+}
+#[cfg(feature = "test-hooks")]
+fn sync_clock(app: &App) -> impl Fn() -> i64 + Send + Sync + use<> {
+    let fixed = app.sync_time;
+    move || fixed.unwrap_or_else(now)
 }

@@ -2,6 +2,12 @@ use crate::error::ErrorCode;
 mod commands;
 mod dependencies;
 pub use dependencies::{CompletionMode, DependencyItem, DependencyPreview};
+mod dependency_graph;
+pub use dependency_graph::{
+    DEPENDENCY_GRAPH_MAX_DEPTH, DEPENDENCY_GRAPH_NODE_LIMIT, DependencyEdge, DependencyGraph,
+    DependencyGraphNode, DependencyGraphTask, DependencyState, GraphCoverage, GraphRelation,
+    NodeExpansion,
+};
 mod lifecycle;
 mod reads;
 mod rotas;
