@@ -255,6 +255,16 @@ context as well. Other commands that do not replace authored text (for example
 occurrence corrections, archiving, list membership and merges bound to a preview token)
 keep their own version checks and are not gated by this revision.
 
+## History follows current access
+
+The People activity timeline (`GET /people/{id}/activity`, see
+[people](people.md#activity-timeline)) applies the same visibility rule as sync on every
+read: an event is returned only while the reader can see the person or field it is about
+now. Narrowing a field's sharing, revoking a grant, an exclusion or leaving a household
+hides the matching history at once; widening it shows earlier events too. Sharing and
+audience changes are not themselves recorded, and no actor outside the reader, the
+person's current owner and its currently linked account is named.
+
 ## Resource policies and recovery
 
 Owners can read `GET /policies/{id}` and use `replace_policy` to atomically replace

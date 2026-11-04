@@ -1,6 +1,7 @@
 mod checklists;
 mod completion_worker;
 mod dependencies;
+mod dependency_graph;
 mod domain;
 mod joint;
 mod lifecycle;

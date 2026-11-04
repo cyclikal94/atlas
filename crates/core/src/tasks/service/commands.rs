@@ -88,6 +88,9 @@ impl Store {
                 Self::subset(&mut tx, account, &touched).await?,
             );
         }
+        // People activity: only person and person-field changes are recorded; task, list and
+        // task-field changes record nothing.
+        let mut activity = crate::people::ActivityLog::default();
         match command {
             TaskCommand::SetRota { .. } | TaskCommand::RotaConsent { .. } => {
                 Self::rota_command(&mut tx, actor, command).await?;
@@ -581,6 +584,12 @@ impl Store {
                     ErrorCode::InvalidValue
                 );
                 ensure!(p.version == *expected_version, ErrorCode::Conflict);
+                let person = if p.kind == "field" {
+                    Self::field_person(&mut tx, &p).await?
+                } else {
+                    None
+                };
+                activity.archive(&p, person.as_deref(), *archived);
                 sqlx::query("UPDATE resources SET archived=$1,version=version+1 WHERE id=$2")
                     .bind(i64::from(*archived))
                     .bind(id)
@@ -611,7 +620,16 @@ impl Store {
                         p.parent_id.as_ref() == Some(parent_id),
                         ErrorCode::InvalidValue
                     );
-                    Self::value(&mut tx, id, label, &serde_json::to_string(value)?).await?;
+                    let serialised = serde_json::to_string(value)?;
+                    if parent.kind == "person" {
+                        activity.field_edit(
+                            parent_id,
+                            id,
+                            p.label != *label,
+                            crate::people::value_differs(&p.value, &serialised)?,
+                        );
+                    }
+                    Self::value(&mut tx, id, label, &serialised).await?;
                 } else {
                     // Creation has no earlier policy to race; it is guarded by the
                     // defaults revision instead.
@@ -635,6 +653,9 @@ impl Store {
                         &policy,
                     )
                     .await?;
+                    if parent.kind == "person" {
+                        activity.field(parent_id, id, crate::people::ActivityType::FieldCreated);
+                    }
                 }
             }
         }
@@ -655,6 +676,7 @@ impl Store {
             before.entry(account.clone()).or_default();
         }
         let revision = Self::publish(&mut tx, &accounts, &touched, &before, false).await?;
+        Self::record_activity(&mut tx, actor, revision, now, &activity).await?;
         sqlx::query(
             "INSERT INTO receipts(account_id,operation_id,payload,revision) VALUES ($1,$2,$3,$4)",
         )

@@ -37,6 +37,7 @@ pub mod resources;
 mod storage;
 mod sync;
 mod sync_cursor;
+mod sync_segment;
 pub mod tasks;
 pub use sync::{SYNC_LIMIT_DEFAULT, SYNC_LIMIT_MAX};
 use uuid::Uuid;
@@ -90,7 +91,24 @@ pub enum Change {
 pub struct Batch {
     pub revision: i64,
     pub changes: Vec<Change>,
+    /// Present only on a piece of a delta revision split under `max_changes` (BE-Q23).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub segment: Option<Segment>,
 }
+
+/// The position of one piece of a split revision: pieces share its revision, arrive in index
+/// order from 0, one per response, and exactly one is `last`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Segment {
+    pub index: u32,
+    pub last: bool,
+}
+
+/// The accepted range of `max_changes`: one changed resource plus its at most three ancestors,
+/// up to `Batch.changes.maxItems`. Structural bounds, not a memory figure.
+pub const MIN_MAX_CHANGES: usize = 4;
+pub const MAX_MAX_CHANGES: usize = 800;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Page {

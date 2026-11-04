@@ -309,6 +309,31 @@ CREATE TABLE person_accounts (
     account_id text NOT NULL
 );
 
+CREATE TABLE person_activity_coverage (
+    id bigint NOT NULL,
+    started_at bigint NOT NULL,
+    CONSTRAINT person_activity_coverage_id_check CHECK ((id = 1))
+);
+
+CREATE TABLE person_activity_events (
+    id text NOT NULL,
+    revision bigint NOT NULL,
+    ordinal bigint NOT NULL,
+    person_id text NOT NULL,
+    target_id text NOT NULL,
+    event_type text NOT NULL,
+    actor_id text NOT NULL,
+    account_id text,
+    merged_from text,
+    label_changed bigint DEFAULT 0 NOT NULL,
+    value_changed bigint DEFAULT 0 NOT NULL,
+    occurred_at bigint NOT NULL,
+    CONSTRAINT person_activity_events_event_type_check CHECK ((event_type = ANY (ARRAY['person_created'::text, 'person_renamed'::text, 'person_archived'::text, 'person_restored'::text, 'person_linked'::text, 'person_unlinked'::text, 'person_merged'::text, 'field_created'::text, 'field_edited'::text, 'field_archived'::text, 'field_restored'::text]))),
+    CONSTRAINT person_activity_events_label_changed_check CHECK ((label_changed = ANY (ARRAY[(0)::bigint, (1)::bigint]))),
+    CONSTRAINT person_activity_events_ordinal_check CHECK (((ordinal >= 0) AND (ordinal < 100))),
+    CONSTRAINT person_activity_events_value_changed_check CHECK ((value_changed = ANY (ARRAY[(0)::bigint, (1)::bigint])))
+);
+
 CREATE TABLE person_aliases (
     source_id text NOT NULL,
     canonical_id text NOT NULL
@@ -674,6 +699,15 @@ ALTER TABLE ONLY person_accounts
 ALTER TABLE ONLY person_accounts
     ADD CONSTRAINT person_accounts_pkey PRIMARY KEY (person_id);
 
+ALTER TABLE ONLY person_activity_coverage
+    ADD CONSTRAINT person_activity_coverage_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY person_activity_events
+    ADD CONSTRAINT person_activity_events_pkey PRIMARY KEY (id);
+
+ALTER TABLE ONLY person_activity_events
+    ADD CONSTRAINT person_activity_events_revision_ordinal_key UNIQUE (revision, ordinal);
+
 ALTER TABLE ONLY person_aliases
     ADD CONSTRAINT person_aliases_pkey PRIMARY KEY (source_id);
 
@@ -839,6 +873,10 @@ CREATE INDEX people_request_history_sender ON people_request_history USING btree
 CREATE INDEX people_requests_expiry ON people_requests USING btree (expires_at, id);
 
 CREATE INDEX people_requests_recipient ON people_requests USING btree (recipient_id, state, id);
+
+CREATE INDEX person_activity_events_person ON person_activity_events USING btree (person_id, revision DESC, ordinal DESC);
+
+CREATE INDEX person_activity_events_target ON person_activity_events USING btree (target_id);
 
 CREATE INDEX person_alias_target ON person_aliases USING btree (canonical_id);
 
@@ -1016,6 +1054,21 @@ ALTER TABLE ONLY person_accounts
 ALTER TABLE ONLY person_accounts
     ADD CONSTRAINT person_accounts_person_id_fkey FOREIGN KEY (person_id) REFERENCES resources(id);
 
+ALTER TABLE ONLY person_activity_events
+    ADD CONSTRAINT person_activity_events_account_id_fkey FOREIGN KEY (account_id) REFERENCES accounts(id);
+
+ALTER TABLE ONLY person_activity_events
+    ADD CONSTRAINT person_activity_events_actor_id_fkey FOREIGN KEY (actor_id) REFERENCES accounts(id);
+
+ALTER TABLE ONLY person_activity_events
+    ADD CONSTRAINT person_activity_events_merged_from_fkey FOREIGN KEY (merged_from) REFERENCES resources(id);
+
+ALTER TABLE ONLY person_activity_events
+    ADD CONSTRAINT person_activity_events_person_id_fkey FOREIGN KEY (person_id) REFERENCES resources(id);
+
+ALTER TABLE ONLY person_activity_events
+    ADD CONSTRAINT person_activity_events_target_id_fkey FOREIGN KEY (target_id) REFERENCES resources(id);
+
 ALTER TABLE ONLY person_aliases
     ADD CONSTRAINT person_aliases_canonical_id_fkey FOREIGN KEY (canonical_id) REFERENCES resources(id);
 
@@ -1156,5 +1209,6 @@ ALTER TABLE ONLY timer_sessions
 
 
 
+INSERT INTO person_activity_coverage(id, started_at) VALUES (1, CAST(floor(EXTRACT(EPOCH FROM now())) AS bigint));
 INSERT INTO sync_clock(id,revision,resource_count) VALUES(1,0,0);
-INSERT INTO atlas_schema(version) VALUES(1006);
+INSERT INTO atlas_schema(version) VALUES(1007);

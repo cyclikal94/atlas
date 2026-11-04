@@ -1,7 +1,9 @@
 mod collection;
 mod cursors;
 mod delivery;
+mod golden;
 mod lifecycle;
 mod page_bounds;
 mod publication;
 mod retention;
+mod segments;

@@ -3,6 +3,7 @@ WORKDIR /atlas
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 RUN rustup show active-toolchain
 COPY crates crates
+COPY vendor vendor
 # The server reports this contract's version, read at build time.
 COPY api/openapi.json api/openapi.json
 RUN cargo build --release --locked -p atlas-server
@@ -14,6 +15,7 @@ COPY rust-toolchain.toml ./
 RUN cargo install cargo-about --version 0.9.2 --locked --features cli
 COPY Cargo.toml Cargo.lock about.toml ./
 COPY crates crates
+COPY vendor vendor
 COPY packaging packaging
 COPY scripts/notices.sh scripts/notices.sh
 ARG TARGETARCH

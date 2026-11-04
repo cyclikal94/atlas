@@ -92,6 +92,30 @@ CREATE TABLE person_attributions (
  added_by TEXT NOT NULL REFERENCES accounts(id)
 );
 
+-- BE-PEOPLE-ACTIVITY (schema 1007): append-only People activity metadata. No name, label, value
+-- or summary column exists; labels are read from current state. Kept for the life of the person
+-- or field (Kieran, 1 November 2026); a future hard delete must handle these rows first.
+CREATE TABLE person_activity_events (
+ id TEXT PRIMARY KEY,
+ revision BIGINT NOT NULL,
+ ordinal BIGINT NOT NULL CHECK (ordinal >= 0 AND ordinal < 100),
+ person_id TEXT NOT NULL REFERENCES resources(id),
+ target_id TEXT NOT NULL REFERENCES resources(id),
+ event_type TEXT NOT NULL CHECK (event_type IN ('person_created','person_renamed','person_archived','person_restored','person_linked','person_unlinked','person_merged','field_created','field_edited','field_archived','field_restored')),
+ actor_id TEXT NOT NULL REFERENCES accounts(id),
+ account_id TEXT REFERENCES accounts(id),
+ merged_from TEXT REFERENCES resources(id),
+ label_changed BIGINT NOT NULL DEFAULT 0 CHECK (label_changed IN (0,1)),
+ value_changed BIGINT NOT NULL DEFAULT 0 CHECK (value_changed IN (0,1)),
+ occurred_at BIGINT NOT NULL,
+ UNIQUE (revision, ordinal)
+);
+
+CREATE TABLE person_activity_coverage (
+ id BIGINT PRIMARY KEY CHECK (id = 1),
+ started_at BIGINT NOT NULL
+);
+
 CREATE TABLE frozen_owner_visibility (
  resource_id TEXT PRIMARY KEY REFERENCES resources(id)
 );
@@ -496,5 +520,8 @@ BEGIN
  INSERT INTO resource_ancestors SELECT NEW.id,NEW.parent_id,1 UNION ALL
  SELECT NEW.id,ancestor_id,depth+1 FROM resource_ancestors WHERE resource_id=NEW.parent_id;
 END;
+CREATE INDEX person_activity_events_person ON person_activity_events (person_id, revision DESC, ordinal DESC);
+CREATE INDEX person_activity_events_target ON person_activity_events (target_id);
+INSERT INTO person_activity_coverage(id,started_at) VALUES (1, CAST(strftime('%s','now') AS INTEGER));
 INSERT INTO sync_clock(id,revision,resource_count) VALUES(1,0,0);
-INSERT INTO atlas_schema(version) VALUES(1006);
+INSERT INTO atlas_schema(version) VALUES(1007);

@@ -93,6 +93,10 @@ jobs:
       - run: python -m pip install -r scripts/requirements-contract.txt
       - run: cargo build --locked -p atlas-server
       - run: python scripts/smoke_server.py
+      # BE-Q23 R3: the non-default sync diagnostic fixture, which the steps above never build.
+      # After the smoke, because these rebuild target/debug/atlas-server with the feature.
+      - run: cargo clippy -p atlas-server --features sync-diagnostic --all-targets --locked -- -D warnings
+      - run: cargo test -p atlas-server --features sync-diagnostic --locked --test sync_diagnostic
 
   postgres:
     strategy:

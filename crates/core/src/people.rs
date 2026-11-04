@@ -1,11 +1,17 @@
 //! People workflows use the same authorised resource projections as sync.
 use crate::error::ErrorCode;
+mod activity;
 mod identity;
 mod merging;
 mod requests;
 mod summary;
 mod workflows;
 use crate::{Projection, Store};
+pub use activity::{
+    ActivityAccount, ActivityPersonRef, ActivityTarget, ActivityType, ChangedPart,
+    PersonActivityEvent, PersonActivityPage, TargetKind, TargetState,
+};
+pub(crate) use activity::{ActivityLog, value_differs};
 use anyhow::{Result, ensure};
 pub use merging::RecipientMergePreview;
 pub use requests::{SentPeopleRequest, SentPeopleRequestPage};

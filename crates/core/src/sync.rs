@@ -2,6 +2,8 @@
 use super::*;
 use crate::devices::{Clock, Continuity, forget_unlisted, order_membership};
 use crate::error::ErrorCode;
+use crate::sync_cursor::Continuation;
+use crate::sync_segment::{self, Position};
 
 /// Largest `limit` a `/sync` request may give: resources per snapshot page, publication batches
 /// per delta page. Equal to `SyncPage.batches.maxItems` and the `limit` maximum in
@@ -24,15 +26,33 @@ impl Store {
         limit: usize,
         time: impl Clock,
     ) -> Result<Page> {
+        self.sync_bounded(actor, device, cursor, limit, None, time)
+            .await
+    }
+
+    /// `sync` with an optional per-response change bound (BE-Q23). Without it every response is
+    /// what `sync` has always returned. With `max_changes = m`, a snapshot page holds at most
+    /// `min(limit, m)` resources and a delta page at most `m` changes: whole batches while they
+    /// fit, or else one piece of a larger revision followed by a continuation cursor.
+    pub async fn sync_bounded(
+        &self,
+        actor: &str,
+        device: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        max_changes: Option<usize>,
+        time: impl Clock,
+    ) -> Result<Page> {
         ensure!(
             (1..=SYNC_LIMIT_MAX).contains(&limit)
+                && max_changes.is_none_or(|m| (MIN_MAX_CHANGES..=MAX_MAX_CHANGES).contains(&m))
                 && !device.is_empty()
                 && device.len() <= 100
                 && cursor.is_none_or(|c| c.len() <= 512),
             ErrorCode::InvalidValue
         );
         retry_unit(device, || {
-            self.sync_once(actor, device, cursor, limit, &time)
+            self.sync_once(actor, device, cursor, limit, max_changes, &time)
         })
         .await
     }
@@ -43,6 +63,7 @@ impl Store {
         device: &str,
         cursor: Option<&str>,
         limit: usize,
+        max_changes: Option<usize>,
         time: &impl Clock,
     ) -> Result<Page> {
         let now = time.now();
@@ -62,6 +83,7 @@ impl Store {
         let clock: i64 = sqlx::query_scalar("SELECT revision FROM sync_clock WHERE id=1")
             .fetch_one(&mut *tx)
             .await?;
+        let mut continuation = None;
         let (boundary, snapshot, position, expires) = if let Some(token) =
             cursor.filter(|token| token.starts_with("d1."))
         {
@@ -76,6 +98,20 @@ impl Store {
             let (boundary, expiry) = sync_cursor::verify(&key, actor, device, token)?;
             ensure!(expiry > now, ErrorCode::ResyncRequired);
             (boundary, None, 0, expiry)
+        } else if let Some(token) = cursor.filter(|token| token.starts_with("d2.")) {
+            // A continuation is never a stored snapshot token; it fails like a delta cursor.
+            let key: String = sqlx::query_scalar(
+                "SELECT cursor_key FROM sync_devices WHERE account_id=$1 AND device_id=$2",
+            )
+            .bind(actor)
+            .bind(device)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| anyhow!(ErrorCode::ResyncRequired))?;
+            let c = sync_cursor::verify_continuation(&key, actor, device, token)?;
+            ensure!(c.expiry > now, ErrorCode::ResyncRequired);
+            continuation = Some(c);
+            (c.boundary, None, 0, c.expiry)
         } else if let Some(token) = cursor {
             let r = sqlx::query("SELECT account_id,device_id,epoch,boundary,snapshot_id,position,expires_at FROM sync_cursors WHERE token=$1")
                 .bind(token).fetch_optional(&mut *tx).await?.ok_or_else(|| anyhow!(ErrorCode::ResyncRequired))?;
@@ -132,9 +168,12 @@ impl Store {
             boundary >= floor && boundary <= clock,
             ErrorCode::ResyncRequired
         );
+        let mut next_continuation = None;
         let (phase, batches, more, next_boundary, next_snapshot, next_position) = if let Some(id) =
             snapshot
         {
+            // A snapshot page is already resource-granular: `max_changes` only narrows it.
+            let limit = max_changes.map_or(limit, |m| limit.min(m));
             let rows = sqlx::query("SELECT id,kind,parent_id,label,value,version,policy_version,can_edit,archived FROM snapshot_items WHERE snapshot_id=$1 AND position>$2 ORDER BY position LIMIT $3")
                 .bind(&id).bind(position).bind((limit + 1) as i64).fetch_all(&mut *tx).await?;
             let more = rows.len() > limit;
@@ -153,68 +192,111 @@ impl Store {
                 vec![Batch {
                     revision: boundary,
                     changes,
+                    segment: None,
                 }],
                 more,
                 boundary,
                 if more { Some(id) } else { None },
                 if more { next_position } else { 0 },
             )
+        } else if let Some(c) = continuation {
+            // The revision must still be the first stored batch after the boundary and not
+            // pruned; access-epoch changes do not invalidate it (contract §3.9).
+            ensure!(c.revision <= clock, ErrorCode::ResyncRequired);
+            let rows = sqlx::query("SELECT revision,payload FROM sync_batches WHERE account_id=$1 AND revision>$2 AND revision<=$3 ORDER BY revision LIMIT 1")
+                .bind(actor).bind(boundary).bind(c.revision).fetch_all(&mut *tx).await?;
+            let row = rows
+                .first()
+                .filter(|row| row.get::<i64, _>(0) == c.revision)
+                .ok_or_else(|| anyhow!(ErrorCode::ResyncRequired))?;
+            let notices: Vec<Notice> = serde_json::from_str(&row.get::<String, _>(1))?;
+            let start = Position {
+                pass: c.pass,
+                ordinal: c.ordinal,
+            };
+            // Without a bound the rest of the revision fits: at most 200 notices and their
+            // ancestors are published per revision.
+            let m = max_changes.unwrap_or(MAX_MAX_CHANGES);
+            let piece = sync_segment::build(&mut tx, actor, device, &notices, start, m).await?;
+            let more = if let Some(next) = piece.next {
+                next_continuation = Some(Continuation {
+                    index: c.index + 1,
+                    pass: next.pass,
+                    ordinal: next.ordinal,
+                    ..c
+                });
+                true
+            } else {
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sync_batches WHERE account_id=$1 AND revision>$2 AND revision<=$3")
+                    .bind(actor).bind(c.revision).bind(clock).fetch_one(&mut *tx).await? > 0
+            };
+            let batch = Batch {
+                revision: c.revision,
+                changes: piece.changes,
+                segment: Some(Segment {
+                    index: c.index,
+                    last: piece.next.is_none(),
+                }),
+            };
+            ("delta", vec![batch], more, c.revision, None, 0)
         } else {
             let rows = sqlx::query("SELECT revision,payload FROM sync_batches WHERE account_id=$1 AND revision>$2 AND revision<=$3 ORDER BY revision LIMIT $4")
                 .bind(actor).bind(boundary).bind(clock).bind((limit + 1) as i64).fetch_all(&mut *tx).await?;
-            let more = rows.len() > limit;
+            let mut more = rows.len() > limit;
             let mut batches = Vec::new();
+            let mut total = 0;
             for row in rows.iter().take(limit) {
                 let notices: Vec<Notice> = serde_json::from_str(&row.get::<String, _>(1))?;
-                let ids = notices.iter().map(|n| n.id.clone()).collect();
-                let mut current = Self::subset(&mut tx, actor, &ids).await?;
-                let mut parents = BTreeSet::new();
-                for id in current.keys() {
-                    parents.extend(
-                        sqlx::query_scalar::<_, String>(
-                            "SELECT ancestor_id FROM resource_ancestors WHERE resource_id=$1",
-                        )
-                        .bind(id)
-                        .fetch_all(&mut *tx)
-                        .await?,
-                    );
+                let revision = row.get(0);
+                let changes = Self::resolve_batch(&mut tx, actor, device, &notices).await?;
+                let Some(m) = max_changes else {
+                    batches.push(Batch {
+                        revision,
+                        changes,
+                        segment: None,
+                    });
+                    continue;
+                };
+                if total + changes.len() <= m {
+                    total += changes.len();
+                    batches.push(Batch {
+                        revision,
+                        changes,
+                        segment: None,
+                    });
+                    continue;
                 }
-                current.extend(Self::subset(&mut tx, actor, &parents).await?);
-                let mut changes = Vec::new();
-                for kind in RESOURCE_ORDER {
-                    changes.extend(
-                        current
-                            .values()
-                            .filter(|p| p.kind == kind)
-                            .cloned()
-                            .map(|resource| Change::Upsert { resource }),
-                    );
-                }
-                let mut removed = Vec::new();
-                for notice in notices {
-                    if current.contains_key(&notice.id) {
-                        continue;
-                    }
-                    let delivered: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_deliveries WHERE account_id=$1 AND device_id=$2 AND resource_id=$3")
-                        .bind(actor).bind(device).bind(&notice.id).fetch_one(&mut *tx).await?;
-                    if delivered == 0 {
-                        continue;
-                    }
-                    let kind: Option<String> =
-                        sqlx::query_scalar("SELECT kind FROM resources WHERE id=$1")
-                            .bind(&notice.id)
-                            .fetch_optional(&mut *tx)
+                // A revision larger than the bound on its own is split, alone in its response;
+                // one reached after whole batches starts the next response.
+                more = true;
+                if batches.is_empty() {
+                    let piece =
+                        sync_segment::build(&mut tx, actor, device, &notices, Position::START, m)
                             .await?;
-                    let kind = kind.unwrap_or(notice.resource_kind);
-                    let rank = RESOURCE_ORDER.iter().position(|k| *k == kind).unwrap_or(0);
-                    removed.push((std::cmp::Reverse(rank), notice.id));
+                    // The pieces of a revision together hold at least its whole resolution, so
+                    // the first piece cannot be the last; if it ever were, it is a whole batch.
+                    let segment = piece.next.map(|next| {
+                        next_continuation = Some(Continuation {
+                            boundary,
+                            expiry: 0,
+                            revision,
+                            index: 1,
+                            pass: next.pass,
+                            ordinal: next.ordinal,
+                        });
+                        Segment {
+                            index: 0,
+                            last: false,
+                        }
+                    });
+                    more = segment.is_some() || rows.len() > 1;
+                    batches.push(Batch {
+                        revision,
+                        changes: piece.changes,
+                        segment,
+                    });
                 }
-                removed.sort();
-                changes.extend(removed.into_iter().map(|(_, id)| Change::Remove { id }));
-                batches.push(Batch {
-                    revision: row.get(0),
-                    changes,
-                });
+                break;
             }
             let next = batches.last().map_or(boundary, |b| b.revision);
             ("delta", batches, more, next, None, 0)
@@ -309,7 +391,11 @@ impl Store {
             .bind(device)
             .fetch_one(&mut *tx)
             .await?;
-            sync_cursor::sign(&key, actor, device, next_boundary, expiry)?
+            if let Some(c) = next_continuation {
+                sync_cursor::sign_continuation(&key, actor, device, &Continuation { expiry, ..c })?
+            } else {
+                sync_cursor::sign(&key, actor, device, next_boundary, expiry)?
+            }
         };
         tx.commit().await?;
         Ok(Page {
@@ -318,6 +404,62 @@ impl Store {
             next_cursor,
             has_more: more,
         })
+    }
+
+    /// A whole stored batch re-resolved against the reader's current access: visible notices and
+    /// their visible ancestors in `RESOURCE_ORDER`, then removals of notices no longer visible
+    /// that this device was sent, children first.
+    async fn resolve_batch(
+        tx: &mut Transaction<'_, Any>,
+        actor: &str,
+        device: &str,
+        notices: &[Notice],
+    ) -> Result<Vec<Change>> {
+        let ids = notices.iter().map(|n| n.id.clone()).collect();
+        let mut current = Self::subset(tx, actor, &ids).await?;
+        let mut parents = BTreeSet::new();
+        for id in current.keys() {
+            parents.extend(
+                sqlx::query_scalar::<_, String>(
+                    "SELECT ancestor_id FROM resource_ancestors WHERE resource_id=$1",
+                )
+                .bind(id)
+                .fetch_all(&mut **tx)
+                .await?,
+            );
+        }
+        current.extend(Self::subset(tx, actor, &parents).await?);
+        let mut changes = Vec::new();
+        for kind in RESOURCE_ORDER {
+            changes.extend(
+                current
+                    .values()
+                    .filter(|p| p.kind == kind)
+                    .cloned()
+                    .map(|resource| Change::Upsert { resource }),
+            );
+        }
+        let mut removed = Vec::new();
+        for notice in notices {
+            if current.contains_key(&notice.id) {
+                continue;
+            }
+            let delivered: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sync_deliveries WHERE account_id=$1 AND device_id=$2 AND resource_id=$3")
+                .bind(actor).bind(device).bind(&notice.id).fetch_one(&mut **tx).await?;
+            if delivered == 0 {
+                continue;
+            }
+            let kind: Option<String> = sqlx::query_scalar("SELECT kind FROM resources WHERE id=$1")
+                .bind(&notice.id)
+                .fetch_optional(&mut **tx)
+                .await?;
+            let kind = kind.unwrap_or_else(|| notice.resource_kind.clone());
+            let rank = RESOURCE_ORDER.iter().position(|k| *k == kind).unwrap_or(0);
+            removed.push((std::cmp::Reverse(rank), notice.id.clone()));
+        }
+        removed.sort();
+        changes.extend(removed.into_iter().map(|(_, id)| Change::Remove { id }));
+        Ok(changes)
     }
 
     /// Reclaim transport state in bounded transactions, without the publication gate.

@@ -1,0 +1,2691 @@
+//! BE-PEOPLE-ACTIVITY: the People activity timeline (`person_activity`) and its write side
+//! (schema `1007`). Cases follow plan §9.2 (A1–A14; A12 lives in `storage::migration`).
+//!
+//! Kieran's 1 November 2026 decisions are the oracle: metadata only and no old values (D-VAL);
+//! actors named only when they are the reader, the person's current owner or its currently linked
+//! account (D-ACT); sharing changes are not recorded (D-SHR). Every read applies current access.
+//! Fixtures are built through the public commands; raw SQL only reads the event table (the
+//! independent reference model) or forces a failure.
+use crate::support::{
+    database::{fixture, postgres},
+    sharing::{NOW, account, id, replace_policy},
+    task_fixtures::{definition, task},
+};
+use anyhow::Result;
+use atlas_core::{
+    Command, Store,
+    error::ErrorCode,
+    households::ManagementCommand as M,
+    people::{
+        ActivityAccount, ActivityType as T, ChangedPart, PeopleCommand, PersonActivityEvent,
+        PersonActivityPage, TargetState,
+    },
+    policy::{Policy, PrincipalGrant},
+    resources::FieldValue,
+    tasks::{Goal, TaskCommand},
+};
+use std::collections::BTreeSet;
+use std::time::Duration;
+
+// ------------------------------------------------------------------------------------- helpers
+
+fn grants(accounts: &[(&str, bool)]) -> Policy {
+    Policy {
+        grants: accounts
+            .iter()
+            .map(|(id, edit)| PrincipalGrant::Account {
+                id: (*id).into(),
+                edit: *edit,
+            })
+            .collect(),
+        exclude_accounts: vec![],
+    }
+}
+
+fn code(error: &anyhow::Error) -> Option<ErrorCode> {
+    error.downcast_ref::<ErrorCode>().copied()
+}
+
+async fn versions(s: &Store, resource: &str) -> Result<(i64, i64)> {
+    Ok(
+        sqlx::query_as("SELECT version,policy_version FROM resources WHERE id=$1")
+            .bind(resource)
+            .fetch_one(&s.pool)
+            .await?,
+    )
+}
+
+async fn create_person(s: &Store, owner: &str, name: &str, policy: Policy) -> Result<String> {
+    let person = id();
+    s.apply(
+        owner,
+        &id(),
+        &[Command::CreatePerson {
+            id: person.clone(),
+            name: name.into(),
+            initial_policy: Some(policy),
+        }],
+    )
+    .await?;
+    Ok(person)
+}
+
+async fn create_field(
+    s: &Store,
+    owner: &str,
+    person: &str,
+    label: &str,
+    policy: Policy,
+) -> Result<String> {
+    let field = id();
+    s.apply(
+        owner,
+        &id(),
+        &[Command::CreateField {
+            id: field.clone(),
+            person_id: person.into(),
+            label: label.into(),
+            value: "Initial".into(),
+            initial_policy: Some(policy),
+        }],
+    )
+    .await?;
+    Ok(field)
+}
+
+async fn edit(s: &Store, actor: &str, resource: &str, label: &str, value: &str) -> Result<i64> {
+    let (version, policy_version) = versions(s, resource).await?;
+    s.apply(
+        actor,
+        &id(),
+        &[Command::Edit {
+            id: resource.into(),
+            expected_version: version,
+            expected_policy_version: Some(policy_version),
+            label: label.into(),
+            value: value.into(),
+        }],
+    )
+    .await
+}
+
+async fn put_field(
+    s: &Store,
+    actor: &str,
+    parent: &str,
+    label: &str,
+    value: FieldValue,
+    policy: Policy,
+) -> Result<String> {
+    let field = id();
+    s.task_command(
+        actor,
+        &id(),
+        &TaskCommand::PutField {
+            id: field.clone(),
+            parent_id: parent.into(),
+            expected_version: None,
+            expected_policy_version: None,
+            label: label.into(),
+            value,
+            initial_policy: Some(policy),
+        },
+        None,
+        NOW,
+    )
+    .await?;
+    Ok(field)
+}
+
+async fn revise_field(
+    s: &Store,
+    actor: &str,
+    field: &str,
+    parent: &str,
+    label: &str,
+    value: FieldValue,
+) -> Result<i64> {
+    let (version, policy_version) = versions(s, field).await?;
+    Ok(s.task_command(
+        actor,
+        &id(),
+        &TaskCommand::PutField {
+            id: field.into(),
+            parent_id: parent.into(),
+            expected_version: Some(version),
+            expected_policy_version: Some(policy_version),
+            label: label.into(),
+            value,
+            initial_policy: None,
+        },
+        None,
+        NOW,
+    )
+    .await?
+    .revision)
+}
+
+async fn archive(s: &Store, actor: &str, resource: &str, archived: bool) -> Result<()> {
+    let (version, _) = versions(s, resource).await?;
+    s.task_command(
+        actor,
+        &id(),
+        &TaskCommand::Archive {
+            id: resource.into(),
+            expected_version: version,
+            archived,
+        },
+        None,
+        NOW,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn request_link(s: &Store, sender: &str, subject: &str, person: &str) -> Result<String> {
+    let request = id();
+    let version = s.person_detail(sender, person).await?.person.version;
+    s.people_command(
+        sender,
+        &id(),
+        &PeopleCommand::RequestLink {
+            id: request.clone(),
+            person_id: person.into(),
+            account_id: subject.into(),
+            expected_version: version,
+        },
+        NOW,
+    )
+    .await?;
+    Ok(request)
+}
+
+async fn respond(s: &Store, recipient: &str, request: &str, accept: bool) -> Result<()> {
+    s.people_command(
+        recipient,
+        &id(),
+        &PeopleCommand::RespondRequest {
+            id: request.into(),
+            accept,
+            recipient_preview_token: None,
+        },
+        NOW,
+    )
+    .await?;
+    Ok(())
+}
+
+/// `sender` asks `subject` to link `person`, and `subject` accepts: ownership moves to `subject`.
+async fn link(s: &Store, sender: &str, subject: &str, person: &str) -> Result<()> {
+    let request = request_link(s, sender, subject, person).await?;
+    respond(s, subject, &request, true).await
+}
+
+async fn unlink(s: &Store, actor: &str, person: &str) -> Result<()> {
+    let version = s.person_detail(actor, person).await?.person.version;
+    s.people_command(
+        actor,
+        &id(),
+        &PeopleCommand::Unlink {
+            person_id: person.into(),
+            expected_version: version,
+        },
+        NOW,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn rename_profile(s: &Store, actor: &str, person: &str, name: &str) -> Result<()> {
+    let version = s.person_detail(actor, person).await?.person.version;
+    s.people_command(
+        actor,
+        &id(),
+        &PeopleCommand::RenameProfile {
+            person_id: person.into(),
+            expected_version: version,
+            name: name.into(),
+        },
+        NOW,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn reference(s: &Store, actor: &str, account: &str) -> Result<String> {
+    Ok(s.people_command(
+        actor,
+        &id(),
+        &PeopleCommand::ReferenceAccount {
+            account_id: account.into(),
+            person_id: id(),
+        },
+        NOW,
+    )
+    .await?
+    .person_id)
+}
+
+async fn merge(s: &Store, actor: &str, source: &str, target: &str, name: &str) -> Result<()> {
+    let preview = s.merge_preview(actor, source, target).await?;
+    s.people_command(
+        actor,
+        &id(),
+        &PeopleCommand::Merge {
+            source_id: source.into(),
+            target_id: target.into(),
+            preview_token: preview.token,
+            name: name.into(),
+        },
+        NOW,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn manage(s: &Store, actor: &str, command: M) -> Result<i64> {
+    s.management(actor, &id(), &[command], NOW).await
+}
+
+async fn household_version(s: &Store, member: &str, household: &str) -> Result<i64> {
+    Ok(s.households(member)
+        .await?
+        .into_iter()
+        .find(|h| h.id == household)
+        .expect("a member")
+        .version)
+}
+
+/// A household managed by `owner` that `member` has joined.
+async fn household(s: &Store, owner: &str, member: &str) -> Result<String> {
+    let household = id();
+    manage(
+        s,
+        owner,
+        M::CreateHousehold {
+            id: household.clone(),
+            name: "Home".into(),
+        },
+    )
+    .await?;
+    let invitation = id();
+    let expected_version = household_version(s, owner, &household).await?;
+    manage(
+        s,
+        owner,
+        M::InviteToHousehold {
+            id: invitation.clone(),
+            household_id: household.clone(),
+            recipient_id: member.into(),
+            expected_version,
+        },
+    )
+    .await?;
+    manage(
+        s,
+        member,
+        M::RespondToHouseholdInvitation {
+            id: invitation,
+            expected_version: 1,
+            accept: true,
+        },
+    )
+    .await?;
+    Ok(household)
+}
+
+/// One raw event row: the independent reference model reads the table directly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Raw {
+    id: String,
+    event_type: String,
+    person_id: String,
+    target_id: String,
+    actor_id: String,
+    account_id: Option<String>,
+    merged_from: Option<String>,
+    label_changed: i64,
+    value_changed: i64,
+    revision: i64,
+    ordinal: i64,
+}
+
+/// Every event in commit order (oldest first).
+async fn raw(s: &Store) -> Result<Vec<Raw>> {
+    use sqlx::Row;
+    Ok(sqlx::query("SELECT id,event_type,person_id,target_id,actor_id,account_id,merged_from,label_changed,value_changed,revision,ordinal FROM person_activity_events ORDER BY revision,ordinal")
+        .fetch_all(&s.pool)
+        .await?
+        .iter()
+        .map(|r| Raw {
+            id: r.get(0),
+            event_type: r.get(1),
+            person_id: r.get(2),
+            target_id: r.get(3),
+            actor_id: r.get(4),
+            account_id: r.get(5),
+            merged_from: r.get(6),
+            label_changed: r.get(7),
+            value_changed: r.get(8),
+            revision: r.get(9),
+            ordinal: r.get(10),
+        })
+        .collect())
+}
+
+async fn count(s: &Store) -> Result<usize> {
+    Ok(raw(s).await?.len())
+}
+
+/// Events added after `before` rows, as `(type, target)`.
+async fn added(s: &Store, before: usize) -> Result<Vec<(String, String)>> {
+    Ok(raw(s)
+        .await?
+        .into_iter()
+        .skip(before)
+        .map(|r| (r.event_type, r.target_id))
+        .collect())
+}
+
+/// The whole timeline `viewer` sees, following `next_after` at page size `limit`.
+async fn walk(
+    s: &Store,
+    viewer: &str,
+    person: &str,
+    limit: u16,
+) -> Result<Vec<PersonActivityEvent>> {
+    let mut items = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let page = s
+            .person_activity(viewer, person, after.as_deref(), limit)
+            .await?;
+        assert!(page.items.len() <= usize::from(limit));
+        if let Some(next) = &page.next_after {
+            assert_eq!(
+                page.items.len(),
+                usize::from(limit),
+                "only a full page continues"
+            );
+            assert_eq!(Some(next), page.items.last().map(|e| &e.id));
+        }
+        items.extend(page.items);
+        match page.next_after {
+            Some(next) => after = Some(next),
+            None => return Ok(items),
+        }
+    }
+}
+
+fn types(items: &[PersonActivityEvent]) -> Vec<T> {
+    items.iter().map(|e| e.event_type).collect()
+}
+
+fn ids_of(items: &[PersonActivityEvent]) -> Vec<String> {
+    items.iter().map(|e| e.id.clone()).collect()
+}
+
+// A1 ------------------------------------------------------------------------------------------
+// Every supported write records exactly its catalogue events; everything else records nothing.
+
+#[tokio::test]
+async fn a1_each_supported_change_records_exactly_its_event() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (a, b) = (account(&s).await?, account(&s).await?);
+
+    // Command::CreatePerson and CreateField.
+    let n = count(&s).await?;
+    let p = create_person(&s, &a, "Morgan", Policy::default()).await?;
+    assert_eq!(added(&s, n).await?, [("person_created".into(), p.clone())]);
+    let n = count(&s).await?;
+    let f = create_field(&s, &a, &p, "Hobby", Policy::default()).await?;
+    assert_eq!(added(&s, n).await?, [("field_created".into(), f.clone())]);
+    let row = raw(&s).await?.pop().unwrap();
+    assert_eq!(
+        (row.person_id.as_str(), row.actor_id.as_str()),
+        (p.as_str(), a.as_str())
+    );
+
+    // Command::Edit: a rename of the person, then label-only, value-only and both on the field.
+    let n = count(&s).await?;
+    edit(&s, &a, &p, "Morgan Lee", "").await?;
+    assert_eq!(added(&s, n).await?, [("person_renamed".into(), p.clone())]);
+    for (label, value, flags) in [
+        ("Pastime", "Initial", (1, 0)),
+        ("Pastime", "Surfing", (0, 1)),
+        ("Sport", "Rowing", (1, 1)),
+    ] {
+        let n = count(&s).await?;
+        edit(&s, &a, &f, label, value).await?;
+        assert_eq!(added(&s, n).await?, [("field_edited".into(), f.clone())]);
+        let row = raw(&s).await?.pop().unwrap();
+        assert_eq!((row.label_changed, row.value_changed), flags);
+        assert_eq!(row.person_id, p);
+    }
+
+    // TaskCommand::PutField (typed) create and revise, on a person.
+    let n = count(&s).await?;
+    let typed = put_field(
+        &s,
+        &a,
+        &p,
+        "Anniversary",
+        FieldValue::Date {
+            year: None,
+            month: 5,
+            day: 1,
+        },
+        Policy::default(),
+    )
+    .await?;
+    assert_eq!(
+        added(&s, n).await?,
+        [("field_created".into(), typed.clone())]
+    );
+    let n = count(&s).await?;
+    revise_field(
+        &s,
+        &a,
+        &typed,
+        &p,
+        "Anniversary",
+        FieldValue::Date {
+            year: None,
+            month: 6,
+            day: 1,
+        },
+    )
+    .await?;
+    assert_eq!(
+        added(&s, n).await?,
+        [("field_edited".into(), typed.clone())]
+    );
+    assert_eq!(raw(&s).await?.pop().unwrap().value_changed, 1);
+
+    // TaskCommand::Archive on the field and the person, both ways.
+    for (resource, archived, event) in [
+        (&f, true, "field_archived"),
+        (&f, false, "field_restored"),
+        (&p, true, "person_archived"),
+        (&p, false, "person_restored"),
+    ] {
+        let n = count(&s).await?;
+        archive(&s, &a, resource, archived).await?;
+        assert_eq!(added(&s, n).await?, [(event.to_string(), resource.clone())]);
+    }
+
+    // Link (request + accept): only the acceptance records, attributed to the accepter.
+    let n = count(&s).await?;
+    let request = request_link(&s, &a, &b, &p).await?;
+    assert_eq!(count(&s).await?, n, "a request records nothing");
+    respond(&s, &b, &request, true).await?;
+    assert_eq!(added(&s, n).await?, [("person_linked".into(), p.clone())]);
+    let row = raw(&s).await?.pop().unwrap();
+    assert_eq!(
+        (row.actor_id.as_str(), row.account_id.as_deref()),
+        (b.as_str(), Some(b.as_str()))
+    );
+
+    // RenameProfile by the linked account, then Unlink.
+    let n = count(&s).await?;
+    rename_profile(&s, &b, &p, "Morgan B").await?;
+    assert_eq!(added(&s, n).await?, [("person_renamed".into(), p.clone())]);
+    let n = count(&s).await?;
+    unlink(&s, &b, &p).await?;
+    assert_eq!(added(&s, n).await?, [("person_unlinked".into(), p.clone())]);
+    assert_eq!(
+        raw(&s).await?.pop().unwrap().account_id.as_deref(),
+        Some(b.as_str())
+    );
+
+    // ReferenceAccount that creates: created then linked, one commit, in that order.
+    let c = account(&s).await?;
+    let n = count(&s).await?;
+    let referenced = reference(&s, &a, &c).await?;
+    let rows: Vec<Raw> = raw(&s).await?.into_iter().skip(n).collect();
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r.event_type.as_str(), r.ordinal))
+            .collect::<Vec<_>>(),
+        [("person_created", 0), ("person_linked", 1)]
+    );
+    assert_eq!(rows[0].revision, rows[1].revision);
+    assert!(
+        rows.iter()
+            .all(|r| r.target_id == referenced && r.actor_id == a)
+    );
+    assert_eq!(rows[1].account_id.as_deref(), Some(c.as_str()));
+
+    // Merge of two people the actor owns: one event on the target naming the source.
+    let source = create_person(&s, &a, "Source", Policy::default()).await?;
+    let target = create_person(&s, &a, "Target", Policy::default()).await?;
+    let n = count(&s).await?;
+    merge(&s, &a, &source, &target, "Merged").await?;
+    let rows: Vec<Raw> = raw(&s).await?.into_iter().skip(n).collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "re-parenting, archiving and renaming are part of the merge"
+    );
+    assert_eq!(
+        (
+            rows[0].event_type.as_str(),
+            rows[0].target_id.as_str(),
+            rows[0].merged_from.as_deref()
+        ),
+        ("person_merged", target.as_str(), Some(source.as_str()))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a1_paths_outside_the_catalogue_and_no_op_writes_record_nothing() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (a, b, c) = (account(&s).await?, account(&s).await?, account(&s).await?);
+    let p = create_person(&s, &a, "Morgan", Policy::default()).await?;
+    let f = create_field(&s, &a, &p, "Hobby", Policy::default()).await?;
+    let n = count(&s).await?;
+
+    // No-op edits, rename and archive: the version moves, the timeline does not.
+    edit(&s, &a, &p, "Morgan", "").await?;
+    edit(&s, &a, &f, "Hobby", "Initial").await?;
+    archive(&s, &a, &f, false).await?;
+    archive(&s, &a, &p, false).await?;
+    revise_field(
+        &s,
+        &a,
+        &f,
+        &p,
+        "Hobby",
+        FieldValue::Text {
+            text: "Initial".into(),
+        },
+    )
+    .await?;
+    // Sharing changes: Grant, Revoke and a whole-policy replacement (D-SHR).
+    let (_, pv) = versions(&s, &p).await?;
+    s.apply(
+        &a,
+        &id(),
+        &[Command::Grant {
+            id: p.clone(),
+            expected_version: pv,
+            account_id: b.clone(),
+            edit: false,
+        }],
+    )
+    .await?;
+    let (_, pv) = versions(&s, &p).await?;
+    s.apply(
+        &a,
+        &id(),
+        &[Command::Revoke {
+            id: p.clone(),
+            expected_version: pv,
+            account_id: b.clone(),
+        }],
+    )
+    .await?;
+    replace_policy(&s, &a, &p, grants(&[(&b, false)])).await?;
+    // Households.
+    household(&s, &a, &c).await?;
+    // Requests that are cancelled or declined, and a merge request.
+    let cancelled = request_link(&s, &a, &b, &p).await?;
+    s.people_command(
+        &a,
+        &id(),
+        &PeopleCommand::CancelRequest { id: cancelled },
+        NOW,
+    )
+    .await?;
+    let declined = request_link(&s, &a, &b, &p).await?;
+    respond(&s, &b, &declined, false).await?;
+    let theirs = create_person(&s, &b, "Theirs", grants(&[(&a, false)])).await?;
+    let preview = s.merge_preview(&a, &p, &theirs).await?;
+    s.people_command(
+        &a,
+        &id(),
+        &PeopleCommand::RequestMerge {
+            id: id(),
+            source_id: p.clone(),
+            target_id: theirs.clone(),
+            preview_token: preview.token,
+            name: "Morgan".into(),
+        },
+        NOW,
+    )
+    .await?;
+    let n_theirs = count(&s).await?;
+    // Referencing an identity that already exists creates nothing.
+    let existing = reference(&s, &a, &c).await?;
+    let n_ref = count(&s).await?;
+    assert_eq!(reference(&s, &b, &c).await?, existing);
+    assert_eq!(count(&s).await?, n_ref);
+    // Tasks, task fields and lists.
+    let (t, _) = task(&s, &a, definition(Goal::Checkbox)).await?;
+    let tf = put_field(
+        &s,
+        &a,
+        &t,
+        "Note",
+        FieldValue::Text { text: "x".into() },
+        Policy::default(),
+    )
+    .await?;
+    revise_field(
+        &s,
+        &a,
+        &tf,
+        &t,
+        "Note 2",
+        FieldValue::Text { text: "y".into() },
+    )
+    .await?;
+    edit(&s, &a, &tf, "Note 3", "z").await?;
+    archive(&s, &a, &tf, true).await?;
+    archive(&s, &a, &t, true).await?;
+    let list = id();
+    s.task_command(
+        &a,
+        &id(),
+        &TaskCommand::CreateList {
+            id: list.clone(),
+            name: "Errands".into(),
+            initial_policy: None,
+        },
+        None,
+        NOW,
+    )
+    .await?;
+    archive(&s, &a, &list, true).await?;
+
+    let rows: Vec<Raw> = raw(&s).await?.into_iter().skip(n).collect();
+    let kinds: Vec<&str> = rows.iter().map(|r| r.event_type.as_str()).collect();
+    // Only the person `theirs` (created by B) and the referenced identity were recorded.
+    assert_eq!(
+        kinds,
+        ["person_created", "person_created", "person_linked"],
+        "{rows:?}"
+    );
+    assert_eq!(rows[0].target_id, theirs);
+    assert_eq!(n_theirs, n + 1);
+    assert!(rows[1..].iter().all(|r| r.target_id == existing));
+    Ok(())
+}
+
+// A2 ------------------------------------------------------------------------------------------
+// Events commit or roll back with their change; nothing is recorded by a failed write.
+
+#[tokio::test]
+async fn a2_a_failed_write_records_nothing_and_its_retry_records_once() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let a = account(&s).await?;
+    let p = create_person(&s, &a, "Morgan", Policy::default()).await?;
+    let n = count(&s).await?;
+    let receipts = || async {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM receipts")
+            .fetch_one(&s.pool)
+            .await
+    };
+    let before_receipts = receipts().await?;
+
+    // A 20-command batch whose last command conflicts.
+    let fields: Vec<String> = (0..19).map(|_| id()).collect();
+    let mut batch: Vec<Command> = fields
+        .iter()
+        .map(|f| Command::CreateField {
+            id: f.clone(),
+            person_id: p.clone(),
+            label: "Item".into(),
+            value: "v".into(),
+            initial_policy: Some(Policy::default()),
+        })
+        .collect();
+    let (version, policy_version) = versions(&s, &p).await?;
+    batch.push(Command::Edit {
+        id: p.clone(),
+        expected_version: version + 7,
+        expected_policy_version: Some(policy_version),
+        label: "Renamed".into(),
+        value: String::new(),
+    });
+    let error = s.apply(&a, &id(), &batch).await.unwrap_err();
+    assert_eq!(code(&error), Some(ErrorCode::Conflict));
+    assert_eq!(count(&s).await?, n);
+    assert_eq!(receipts().await?, before_receipts);
+    // Positive control: the corrected batch records all twenty, in command order.
+    batch[19] = Command::Edit {
+        id: p.clone(),
+        expected_version: version,
+        expected_policy_version: Some(policy_version),
+        label: "Renamed".into(),
+        value: String::new(),
+    };
+    s.apply(&a, &id(), &batch).await?;
+    let rows: Vec<Raw> = raw(&s).await?.into_iter().skip(n).collect();
+    assert_eq!(rows.len(), 20);
+    assert!(rows.iter().all(|r| r.revision == rows[0].revision));
+    assert_eq!(
+        rows.iter().map(|r| r.ordinal).collect::<Vec<_>>(),
+        (0..20).collect::<Vec<_>>()
+    );
+    assert_eq!(rows[19].event_type, "person_renamed");
+    assert_eq!(
+        rows.iter()
+            .take(19)
+            .map(|r| r.target_id.clone())
+            .collect::<Vec<_>>(),
+        fields
+    );
+
+    // Both transaction seams, dropped without commit.
+    let n = count(&s).await?;
+    {
+        let mut tx = s.begin_serial().await?;
+        let (version, policy_version) = versions(&s, &p).await?;
+        Store::apply_in(
+            &mut tx,
+            &a,
+            &id(),
+            &[Command::Edit {
+                id: p.clone(),
+                expected_version: version,
+                expected_policy_version: Some(policy_version),
+                label: "Dropped".into(),
+                value: String::new(),
+            }],
+        )
+        .await?;
+        let inside: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM person_activity_events")
+            .fetch_one(&mut *tx)
+            .await?;
+        assert_eq!(
+            inside as usize,
+            n + 1,
+            "recorded inside the write's transaction"
+        );
+    }
+    {
+        let tx = s.begin_serial().await?;
+        let (version, _) = versions(&s, &p).await?;
+        let (_, tx) = Store::task_command_on(
+            tx,
+            &a,
+            &id(),
+            &TaskCommand::Archive {
+                id: p.clone(),
+                expected_version: version,
+                archived: true,
+            },
+            None,
+            NOW,
+        )
+        .await?;
+        drop(tx);
+    }
+    assert_eq!(count(&s).await?, n);
+
+    // Capacity overflow rejects the create and its event.
+    sqlx::query("UPDATE sync_clock SET resource_count=10000 WHERE id=1")
+        .execute(&s.pool)
+        .await?;
+    let error = create_person(&s, &a, "Overflow", Policy::default())
+        .await
+        .unwrap_err();
+    assert_eq!(code(&error), Some(ErrorCode::SliceCapacity));
+    assert_eq!(count(&s).await?, n);
+    sqlx::query("UPDATE sync_clock SET resource_count=0 WHERE id=1")
+        .execute(&s.pool)
+        .await?;
+
+    // A stale merge preview rejects the merge and its event.
+    let other = create_person(&s, &a, "Other", Policy::default()).await?;
+    let n = count(&s).await?;
+    let error = s
+        .people_command(
+            &a,
+            &id(),
+            &PeopleCommand::Merge {
+                source_id: other.clone(),
+                target_id: p.clone(),
+                preview_token: "stale".into(),
+                name: "Morgan".into(),
+            },
+            NOW,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(&error), Some(ErrorCode::Conflict));
+    assert_eq!(count(&s).await?, n);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a2_a_statement_failing_just_before_recording_rolls_back_the_change() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (a, b) = (account(&s).await?, account(&s).await?);
+    let p = create_person(&s, &a, "Morgan", Policy::default()).await?;
+    link(&s, &a, &b, &p).await?;
+    let n = count(&s).await?;
+    let version = s.person_detail(&b, &p).await?.person.version;
+    let operation = id();
+    let command = PeopleCommand::Unlink {
+        person_id: p.clone(),
+        expected_version: version,
+    };
+    let reached = s.hooks().count("people_activity.before_record");
+    s.hooks().inject_sql_times(
+        "people_activity.before_record",
+        "SELECT no_such_column FROM accounts",
+        1,
+    );
+    s.people_command(&b, &operation, &command, NOW)
+        .await
+        .expect_err("the injected statement fails the write");
+    assert_eq!(count(&s).await?, n);
+    assert_eq!(
+        s.person_detail(&b, &p).await?.linked_account_id.as_deref(),
+        Some(b.as_str()),
+        "the unlink rolled back with its event"
+    );
+    // The same operation retried afterwards succeeds and records once.
+    s.people_command(&b, &operation, &command, NOW).await?;
+    assert_eq!(added(&s, n).await?, [("person_unlinked".into(), p.clone())]);
+    assert_eq!(
+        s.hooks().count("people_activity.before_record"),
+        reached + 2
+    );
+    Ok(())
+}
+
+/// A failure *after* the events are written (the write's own `people_results` insert collides)
+/// must still remove them: they belong to the write's transaction, not to a separate commit. The
+/// colliding row has no receipt, so the operation is not treated as a replay and runs in full.
+#[tokio::test]
+async fn a2_a_failure_after_recording_rolls_the_events_back_with_the_change() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (a, b) = (account(&s).await?, account(&s).await?);
+    let p = create_person(&s, &a, "Morgan", Policy::default()).await?;
+    link(&s, &a, &b, &p).await?;
+    let n = count(&s).await?;
+    let version = s.person_detail(&b, &p).await?.person.version;
+    let operation = id();
+    let command = PeopleCommand::Unlink {
+        person_id: p.clone(),
+        expected_version: version,
+    };
+    sqlx::query("INSERT INTO people_results(account_id,operation_id,person_id) VALUES ($1,$2,$3)")
+        .bind(&b)
+        .bind(&operation)
+        .bind(&p)
+        .execute(&s.pool)
+        .await?;
+    let reached = s.hooks().count("people_activity.before_record");
+    s.people_command(&b, &operation, &command, NOW)
+        .await
+        .expect_err("the result insert after recording collides");
+    assert_eq!(
+        s.hooks().count("people_activity.before_record"),
+        reached + 1,
+        "the write reached the recording step before it failed"
+    );
+    assert_eq!(
+        count(&s).await?,
+        n,
+        "the recorded event rolled back with the change"
+    );
+    assert_eq!(
+        s.person_detail(&b, &p).await?.linked_account_id.as_deref(),
+        Some(b.as_str()),
+        "the unlink rolled back"
+    );
+    // Positive control: without the collision the same operation records once.
+    sqlx::query("DELETE FROM people_results WHERE account_id=$1 AND operation_id=$2")
+        .bind(&b)
+        .bind(&operation)
+        .execute(&s.pool)
+        .await?;
+    s.people_command(&b, &operation, &command, NOW).await?;
+    assert_eq!(added(&s, n).await?, [("person_unlinked".into(), p.clone())]);
+    Ok(())
+}
+
+// A3 ------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a3_a_replayed_operation_records_nothing_more_and_a_reused_id_records_nothing() -> Result<()>
+{
+    let (_dir, s) = fixture().await?;
+    let (a, b) = (account(&s).await?, account(&s).await?);
+    let p = create_person(&s, &a, "Morgan", Policy::default()).await?;
+
+    // Command path.
+    let operation = id();
+    let commands = [Command::CreateField {
+        id: id(),
+        person_id: p.clone(),
+        label: "Hobby".into(),
+        value: "v".into(),
+        initial_policy: Some(Policy::default()),
+    }];
+    let first = s.apply(&a, &operation, &commands).await?;
+    let n = count(&s).await?;
+    assert_eq!(s.apply(&a, &operation, &commands).await?, first);
+    assert_eq!(count(&s).await?, n);
+    let mut changed = commands.clone();
+    if let Command::CreateField { label, .. } = &mut changed[0] {
+        *label = "Other".into();
+    }
+    let error = s.apply(&a, &operation, &changed).await.unwrap_err();
+    assert_eq!(code(&error), Some(ErrorCode::OperationConflict));
+    assert_eq!(count(&s).await?, n);
+
+    // Task command path.
+    let (version, _) = versions(&s, &p).await?;
+    let operation = id();
+    let command = TaskCommand::Archive {
+        id: p.clone(),
+        expected_version: version,
+        archived: true,
+    };
+    let first = s
+        .task_command(&a, &operation, &command, None, NOW)
+        .await?
+        .revision;
+    let n = count(&s).await?;
+    assert_eq!(
+        s.task_command(&a, &operation, &command, None, NOW)
+            .await?
+            .revision,
+        first
+    );
+    assert_eq!(count(&s).await?, n);
+    let other = TaskCommand::Archive {
+        id: p.clone(),
+        expected_version: version,
+        archived: false,
+    };
+    let error = s
+        .task_command(&a, &operation, &other, None, NOW)
+        .await
+        .unwrap_err();
+    assert_eq!(code(&error), Some(ErrorCode::OperationConflict));
+    assert_eq!(count(&s).await?, n);
+    archive(&s, &a, &p, false).await?;
+
+    // People command path.
+    let c = account(&s).await?;
+    let operation = id();
+    let command = PeopleCommand::ReferenceAccount {
+        account_id: c.clone(),
+        person_id: id(),
+    };
+    let first = s.people_command(&b, &operation, &command, NOW).await?;
+    let n = count(&s).await?;
+    let again = s.people_command(&b, &operation, &command, NOW).await?;
+    assert_eq!(
+        (again.revision, again.person_id),
+        (first.revision, first.person_id)
+    );
+    assert_eq!(count(&s).await?, n);
+    let error = s
+        .people_command(
+            &b,
+            &operation,
+            &PeopleCommand::ReferenceAccount {
+                account_id: c,
+                person_id: id(),
+            },
+            NOW,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(&error), Some(ErrorCode::OperationConflict));
+    assert_eq!(count(&s).await?, n);
+    Ok(())
+}
+
+// A4 ------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a4_pages_are_newest_first_bounded_and_complete() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let a = account(&s).await?;
+    let p = id();
+    let fields: Vec<String> = (0..3).map(|_| id()).collect();
+    let mut batch = vec![Command::CreatePerson {
+        id: p.clone(),
+        name: "Morgan".into(),
+        initial_policy: Some(Policy::default()),
+    }];
+    batch.extend(fields.iter().map(|f| Command::CreateField {
+        id: f.clone(),
+        person_id: p.clone(),
+        label: "Item".into(),
+        value: "v".into(),
+        initial_policy: Some(Policy::default()),
+    }));
+    s.apply(&a, &id(), &batch).await?;
+    for i in 0..6 {
+        edit(&s, &a, &fields[i % 3], &format!("Item {i}"), "v").await?;
+    }
+    // Reference model: commit order reversed.
+    let model: Vec<String> = raw(&s).await?.into_iter().rev().map(|r| r.id).collect();
+    assert_eq!(model.len(), 10);
+    let page = s.person_activity(&a, &p, None, 100).await?;
+    assert_eq!(ids_of(&page.items), model);
+    assert_eq!(page.next_after, None);
+    // One batch: the later command first.
+    assert_eq!(
+        types(&page.items[6..]),
+        [
+            T::FieldCreated,
+            T::FieldCreated,
+            T::FieldCreated,
+            T::PersonCreated
+        ]
+    );
+    assert_eq!(page.items[6].target.id, fields[2]);
+    for limit in [1, 2, 3, 9, 10, 11, 50] {
+        assert_eq!(
+            ids_of(&walk(&s, &a, &p, limit).await?),
+            model,
+            "limit {limit}"
+        );
+    }
+    // Exact-limit boundary: a full page continues only when another visible item exists.
+    let full = s.person_activity(&a, &p, None, 10).await?;
+    assert_eq!((full.items.len(), full.next_after), (10, None));
+    let nine = s.person_activity(&a, &p, None, 9).await?;
+    assert_eq!(nine.next_after.as_deref(), Some(model[8].as_str()));
+    let rest = s
+        .person_activity(&a, &p, nine.next_after.as_deref(), 9)
+        .await?;
+    assert_eq!(
+        (ids_of(&rest.items), rest.next_after),
+        (vec![model[9].clone()], None)
+    );
+    // The default page size of 50 is the route's; the core bounds are 1..=100.
+    for limit in [0, 101] {
+        let error = s.person_activity(&a, &p, None, limit).await.unwrap_err();
+        assert_eq!(code(&error), Some(ErrorCode::InvalidValue), "limit {limit}");
+    }
+    let error = s
+        .person_activity(&a, &p, Some("not-a-uuid"), 10)
+        .await
+        .unwrap_err();
+    assert_eq!(code(&error), Some(ErrorCode::InvalidValue));
+
+    // A missing event and another person's event are the same error.
+    let q = create_person(&s, &a, "Other", Policy::default()).await?;
+    let foreign = s.person_activity(&a, &q, None, 1).await?.items[0]
+        .id
+        .clone();
+    let foreign_error = s
+        .person_activity(&a, &p, Some(&foreign), 10)
+        .await
+        .unwrap_err();
+    let missing_error = s
+        .person_activity(&a, &p, Some(&id()), 10)
+        .await
+        .unwrap_err();
+    assert_eq!(code(&foreign_error), Some(ErrorCode::InvalidValue));
+    assert_eq!(foreign_error.to_string(), missing_error.to_string());
+
+    // Writes between page reads never appear after the cursor, and nothing repeats.
+    let first = s.person_activity(&a, &p, None, 4).await?;
+    edit(&s, &a, &fields[0], "Newest", "v").await?;
+    archive(&s, &a, &fields[1], true).await?;
+    let mut seen = ids_of(&first.items);
+    let mut after = first.next_after;
+    while let Some(cursor) = after {
+        let page = s.person_activity(&a, &p, Some(&cursor), 4).await?;
+        seen.extend(ids_of(&page.items));
+        after = page.next_after;
+    }
+    assert_eq!(
+        seen, model,
+        "the walk that began before the writes is exactly the old list"
+    );
+    let fresh = walk(&s, &a, &p, 4).await?;
+    assert_eq!(fresh.len(), 12);
+    assert_eq!(types(&fresh[..2]), [T::FieldArchived, T::FieldEdited]);
+    assert_eq!(ids_of(&fresh[2..]), model);
+    let unique: BTreeSet<String> = ids_of(&fresh).into_iter().collect();
+    assert_eq!(unique.len(), 12, "stable, unique identities");
+
+    // Re-reading gives the identical list (cross-device reads are covered over HTTP).
+    assert_eq!(walk(&s, &a, &p, 5).await?, fresh);
+    Ok(())
+}
+
+// A6 ------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a6_actors_are_named_only_when_the_reader_already_knows_them() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (alice, bob, carol, dave, erin) = (
+        account(&s).await?,
+        account(&s).await?,
+        account(&s).await?,
+        account(&s).await?,
+        account(&s).await?,
+    );
+    let p = create_person(
+        &s,
+        &alice,
+        "Morgan",
+        grants(&[(&bob, true), (&carol, false), (&erin, true)]),
+    )
+    .await?;
+    let f = create_field(
+        &s,
+        &alice,
+        &p,
+        "Hobby",
+        grants(&[(&bob, true), (&carol, false), (&erin, true)]),
+    )
+    .await?;
+    edit(&s, &bob, &f, "Hobby", "Bob's edit").await?;
+    edit(&s, &erin, &f, "Hobby", "Erin's edit").await?;
+
+    let alice_name: String = sqlx::query_scalar("SELECT username FROM accounts WHERE id=$1")
+        .bind(&alice)
+        .fetch_one(&s.pool)
+        .await?;
+    let for_carol = walk(&s, &carol, &p, 50).await?;
+    assert_eq!(
+        types(&for_carol),
+        [
+            T::FieldEdited,
+            T::FieldEdited,
+            T::FieldCreated,
+            T::PersonCreated
+        ]
+    );
+    // Bob and Erin are neither the reader, the owner nor linked: indistinguishable.
+    assert_eq!(for_carol[0].actor, ActivityAccount::SomeoneElse);
+    assert_eq!(for_carol[1].actor, ActivityAccount::SomeoneElse);
+    assert_eq!(
+        serde_json::to_value(&for_carol[0].actor)?,
+        serde_json::to_value(&for_carol[1].actor)?
+    );
+    assert_eq!(
+        serde_json::to_value(&for_carol[0].actor)?,
+        serde_json::json!({"kind":"someone_else"})
+    );
+    let owner = ActivityAccount::Account {
+        account_id: alice.clone(),
+        username: alice_name.clone(),
+    };
+    assert_eq!(for_carol[2].actor, owner);
+    // The owner sees its grantees as someone else too (D-ACT names no grantee).
+    let for_alice = walk(&s, &alice, &p, 50).await?;
+    assert_eq!(for_alice[0].actor, ActivityAccount::SomeoneElse);
+    assert_eq!(for_alice[3].actor, ActivityAccount::You);
+    let for_bob = walk(&s, &bob, &p, 50).await?;
+    assert_eq!(for_bob[1].actor, ActivityAccount::You);
+    assert_eq!(for_bob[0].actor, ActivityAccount::SomeoneElse);
+
+    // A link moves ownership to Dave: Alice becomes someone else for Carol, Dave is named.
+    link(&s, &alice, &dave, &p).await?;
+    let dave_name: String = sqlx::query_scalar("SELECT username FROM accounts WHERE id=$1")
+        .bind(&dave)
+        .fetch_one(&s.pool)
+        .await?;
+    let dave_named = ActivityAccount::Account {
+        account_id: dave.clone(),
+        username: dave_name,
+    };
+    let for_carol = walk(&s, &carol, &p, 50).await?;
+    assert_eq!(for_carol[0].event_type, T::PersonLinked);
+    assert_eq!(for_carol[0].actor, dave_named);
+    assert_eq!(for_carol[0].account, Some(dave_named.clone()));
+    assert_eq!(
+        for_carol.last().unwrap().actor,
+        ActivityAccount::SomeoneElse,
+        "former owner"
+    );
+    let for_dave = walk(&s, &dave, &p, 50).await?;
+    assert_eq!(for_dave[0].account, Some(ActivityAccount::You));
+    // Unlink: Dave still owns the person, so it stays named; nothing else changes.
+    unlink(&s, &dave, &p).await?;
+    let for_carol = walk(&s, &carol, &p, 50).await?;
+    assert_eq!(for_carol[0].event_type, T::PersonUnlinked);
+    assert_eq!(for_carol[0].account, Some(dave_named.clone()));
+    assert_eq!(for_carol[0].actor, dave_named);
+    Ok(())
+}
+
+// A7 ------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a7_a_person_the_reader_cannot_see_is_indistinguishable_from_a_missing_one() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (a, b, outsider) = (account(&s).await?, account(&s).await?, account(&s).await?);
+    let home = household(&s, &a, &b).await?;
+    let p = create_person(
+        &s,
+        &a,
+        "Morgan",
+        Policy {
+            grants: vec![PrincipalGrant::Household {
+                id: home.clone(),
+                edit: false,
+            }],
+            exclude_accounts: vec![],
+        },
+    )
+    .await?;
+    let alias = create_person(&s, &a, "Alias", Policy::default()).await?;
+    merge(&s, &a, &alias, &p, "Morgan").await?;
+    assert!(
+        !walk(&s, &b, &p, 50).await?.is_empty(),
+        "the household member reads it"
+    );
+    for subject in [&p, &alias, &id()] {
+        let error = s
+            .person_activity(&outsider, subject, None, 50)
+            .await
+            .unwrap_err();
+        let detail = s.person_detail(&outsider, subject).await.unwrap_err();
+        assert_eq!(code(&error), Some(ErrorCode::NotFound));
+        assert_eq!(error.to_string(), detail.to_string());
+    }
+    // A cursor from a timeline the reader can see does not open one it cannot.
+    let cursor = s.person_activity(&a, &p, None, 1).await?.items[0]
+        .id
+        .clone();
+    let error = s
+        .person_activity(&outsider, &p, Some(&cursor), 50)
+        .await
+        .unwrap_err();
+    assert_eq!(code(&error), Some(ErrorCode::NotFound));
+    Ok(())
+}
+
+// A8 ------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a8_hidden_events_change_no_page_cursor_or_continuation() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (alice, carol) = (account(&s).await?, account(&s).await?);
+    let home = household(&s, &alice, &carol).await?;
+    let p = create_person(&s, &alice, "Morgan", grants(&[(&carol, false)])).await?;
+    // Hidden events older than every visible one but the first, and newer than all of them.
+    let private = create_field(&s, &alice, &p, "Medical note", Policy::default()).await?;
+    for i in 0..5 {
+        edit(&s, &alice, &private, "Medical note", &format!("secret {i}")).await?;
+    }
+    let shared = create_field(&s, &alice, &p, "Hobby", grants(&[(&carol, false)])).await?;
+    let excluded = create_field(
+        &s,
+        &alice,
+        &p,
+        "Gift ideas",
+        Policy {
+            grants: vec![PrincipalGrant::Household {
+                id: home.clone(),
+                edit: false,
+            }],
+            exclude_accounts: vec![carol.clone()],
+        },
+    )
+    .await?;
+    for i in 0..300 {
+        edit(&s, &alice, &private, "Medical note", &format!("later {i}")).await?;
+    }
+    archive(&s, &alice, &excluded, true).await?;
+
+    let visible: BTreeSet<&str> = [p.as_str(), shared.as_str()].into();
+    let model: Vec<String> = raw(&s)
+        .await?
+        .into_iter()
+        .rev()
+        .filter(|r| visible.contains(r.target_id.as_str()))
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(model.len(), 2);
+    for limit in [1, 2, 3, 50, 100] {
+        let walked = walk(&s, &carol, &p, limit).await?;
+        assert_eq!(ids_of(&walked), model, "limit {limit}");
+    }
+    // Exactly the visible count: no continuation, although 300+ hidden rows exist.
+    let page = s.person_activity(&carol, &p, None, 2).await?;
+    assert_eq!((page.items.len(), page.next_after), (2, None));
+    let first = s.person_activity(&carol, &p, None, 1).await?;
+    assert_eq!(first.next_after.as_deref(), Some(model[0].as_str()));
+    // The owner sees everything, in the same order.
+    let all = walk(&s, &alice, &p, 100).await?;
+    assert_eq!(all.len(), raw(&s).await?.len());
+    // Nothing about the hidden fields reaches Carol.
+    let text = serde_json::to_string(&walk(&s, &carol, &p, 100).await?)?;
+    for hidden in [
+        &private,
+        &excluded,
+        &"Medical note".to_string(),
+        &"Gift ideas".to_string(),
+    ] {
+        assert!(!text.contains(hidden.as_str()), "{hidden} leaked");
+    }
+    Ok(())
+}
+
+// A9 ------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a9_history_follows_current_access_on_every_read() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (alice, bob, carol) = (account(&s).await?, account(&s).await?, account(&s).await?);
+    let home = household(&s, &alice, &bob).await?;
+    let in_home = Policy {
+        grants: vec![
+            PrincipalGrant::Household {
+                id: home.clone(),
+                edit: false,
+            },
+            PrincipalGrant::Account {
+                id: carol.clone(),
+                edit: false,
+            },
+        ],
+        exclude_accounts: vec![],
+    };
+    let p = create_person(&s, &alice, "Morgan", in_home.clone()).await?;
+    let f = create_field(&s, &alice, &p, "Hobby", in_home.clone()).await?;
+    edit(&s, &alice, &f, "Hobby", "Rowing").await?;
+    assert_eq!(walk(&s, &carol, &p, 50).await?.len(), 3);
+    assert_eq!(walk(&s, &bob, &p, 50).await?.len(), 3);
+
+    // Revoking Carol's field grant hides the field's events at once; regaining shows them again
+    // (current permissions, as documented: earlier metadata reappears with access).
+    replace_policy(
+        &s,
+        &alice,
+        &f,
+        Policy {
+            grants: vec![PrincipalGrant::Household {
+                id: home.clone(),
+                edit: false,
+            }],
+            exclude_accounts: vec![],
+        },
+    )
+    .await?;
+    assert_eq!(types(&walk(&s, &carol, &p, 50).await?), [T::PersonCreated]);
+    replace_policy(&s, &alice, &f, in_home.clone()).await?;
+    assert_eq!(walk(&s, &carol, &p, 50).await?.len(), 3);
+    // An exclusion hides them too.
+    replace_policy(
+        &s,
+        &alice,
+        &f,
+        Policy {
+            exclude_accounts: vec![carol.clone()],
+            ..in_home.clone()
+        },
+    )
+    .await?;
+    assert_eq!(types(&walk(&s, &carol, &p, 50).await?), [T::PersonCreated]);
+    replace_policy(&s, &alice, &f, in_home.clone()).await?;
+
+    // Leaving the household removes Bob's access to the person: the timeline is not found.
+    let expected_version = household_version(&s, &bob, &home).await?;
+    manage(
+        &s,
+        &bob,
+        M::RemoveHouseholdMember {
+            household_id: home.clone(),
+            account_id: bob.clone(),
+            expected_version,
+        },
+    )
+    .await?;
+    let error = s.person_activity(&bob, &p, None, 50).await.unwrap_err();
+    assert_eq!(code(&error), Some(ErrorCode::NotFound));
+    // Revoking Carol's person grant does the same, even with a cursor she was given.
+    let cursor = s.person_activity(&carol, &p, None, 1).await?.items[0]
+        .id
+        .clone();
+    replace_policy(
+        &s,
+        &alice,
+        &p,
+        Policy {
+            grants: vec![PrincipalGrant::Household {
+                id: home.clone(),
+                edit: false,
+            }],
+            exclude_accounts: vec![],
+        },
+    )
+    .await?;
+    for after in [None, Some(cursor.as_str())] {
+        let error = s.person_activity(&carol, &p, after, 50).await.unwrap_err();
+        assert_eq!(code(&error), Some(ErrorCode::NotFound));
+    }
+    Ok(())
+}
+
+/// The error a cursor read returns, or `None` when the read succeeds. Includes the rendered
+/// message so a hidden, a missing and a foreign cursor can be compared exactly.
+async fn cursor_error(
+    s: &Store,
+    reader: &str,
+    person: &str,
+    after: &str,
+) -> Option<(Option<ErrorCode>, String)> {
+    match s.person_activity(reader, person, Some(after), 50).await {
+        Ok(_) => None,
+        Err(error) => Some((code(&error), format!("{error:#}"))),
+    }
+}
+
+/// R1 (review 2 November 2026): a cursor is accepted only while its event is one the reader can
+/// currently see. Otherwise a saved event ID would tell a reader that a now-hidden event exists in
+/// this timeline (200) rather than not (422).
+#[tokio::test]
+async fn a9_a_cursor_is_accepted_only_while_its_event_is_visible_to_the_reader() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (alice, carol) = (account(&s).await?, account(&s).await?);
+    let home = household(&s, &alice, &carol).await?;
+    let shared = grants(&[(&carol, false)]);
+    let p = create_person(&s, &alice, "Morgan", shared.clone()).await?;
+    let f = create_field(&s, &alice, &p, "Hobby", shared.clone()).await?;
+    edit(&s, &alice, &f, "Hobby", "Rowing").await?;
+    create_field(&s, &alice, &p, "Pets", shared.clone()).await?;
+    let other = create_person(&s, &alice, "Other", shared.clone()).await?;
+
+    let all = walk(&s, &carol, &p, 50).await?;
+    assert_eq!(
+        types(&all),
+        [
+            T::FieldCreated,
+            T::FieldEdited,
+            T::FieldCreated,
+            T::PersonCreated
+        ]
+    );
+    let (edited, person_created) = (all[1].id.clone(), all[3].id.clone());
+    assert_eq!(all[1].target.id, f);
+    // Positive control: a visible cursor continues strictly after its position.
+    let rest = s.person_activity(&carol, &p, Some(&edited), 50).await?;
+    assert_eq!(ids_of(&rest.items), ids_of(&all[2..]));
+    // The uniform invalid-cursor result: a missing event and another person's event.
+    let missing = cursor_error(&s, &carol, &p, &id()).await;
+    assert_eq!(
+        missing.as_ref().map(|e| e.0),
+        Some(Some(ErrorCode::InvalidValue))
+    );
+    let foreign = walk(&s, &carol, &other, 50).await?[0].id.clone();
+    assert_eq!(cursor_error(&s, &carol, &p, &foreign).await, missing);
+
+    // Each way of losing the field while keeping the person: the field's events become an
+    // invalid cursor for Carol, exactly as a missing one, while the owner can still use them and
+    // the person's own event stays a valid cursor for Carol.
+    let hiders = [
+        Policy::default(),
+        Policy {
+            grants: vec![PrincipalGrant::Household {
+                id: home.clone(),
+                edit: false,
+            }],
+            exclude_accounts: vec![carol.clone()],
+        },
+    ];
+    for hider in hiders {
+        replace_policy(&s, &alice, &f, hider.clone()).await?;
+        assert_eq!(
+            types(&walk(&s, &carol, &p, 50).await?),
+            [T::FieldCreated, T::PersonCreated],
+            "{hider:?}"
+        );
+        for event in [&all[1].id, &all[2].id] {
+            assert_eq!(
+                cursor_error(&s, &carol, &p, event).await,
+                missing,
+                "{hider:?}"
+            );
+            assert!(cursor_error(&s, &alice, &p, event).await.is_none());
+        }
+        let after_person = s
+            .person_activity(&carol, &p, Some(&person_created), 50)
+            .await?;
+        assert!(after_person.items.is_empty());
+        // Regaining access makes the cursor valid again, with the same continuation.
+        replace_policy(&s, &alice, &f, shared.clone()).await?;
+        let regained = s.person_activity(&carol, &p, Some(&edited), 50).await?;
+        assert_eq!(regained.items, rest.items);
+    }
+
+    // The cursor is judged in the read's own snapshot: a revoke that commits while the read is
+    // paused after its person gate does not affect that read, only the next one.
+    let mut gate = s.hooks().arm(BETWEEN);
+    let read = {
+        let (s, carol, p, edited) = (s.clone(), carol.clone(), p.clone(), edited.clone());
+        tokio::spawn(async move { s.person_activity(&carol, &p, Some(&edited), 50).await })
+    };
+    gate.reached().await;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        replace_policy(&s, &alice, &f, Policy::default()).await
+    })
+    .await
+    .expect("the writer was not blocked by the paused reader")?;
+    gate.release();
+    assert_eq!(read.await??.items, rest.items);
+    assert_eq!(cursor_error(&s, &carol, &p, &edited).await, missing);
+    replace_policy(&s, &alice, &f, shared.clone()).await?;
+
+    // A merged source Carol cannot see: its events are omitted from her page, and are an invalid
+    // cursor for her too; the merge event itself is visible and a valid cursor.
+    let source = create_person(&s, &alice, "Secret", Policy::default()).await?;
+    let source_field = create_field(&s, &alice, &source, "Old note", Policy::default()).await?;
+    merge(&s, &alice, &source, &p, "Morgan").await?;
+    let source_events: Vec<Raw> = raw(&s)
+        .await?
+        .into_iter()
+        .filter(|r| r.target_id == source || r.target_id == source_field)
+        .collect();
+    assert_eq!(source_events.len(), 2);
+    for event in &source_events {
+        assert_eq!(cursor_error(&s, &carol, &p, &event.id).await, missing);
+        assert!(cursor_error(&s, &alice, &p, &event.id).await.is_none());
+    }
+    let for_carol = walk(&s, &carol, &p, 50).await?;
+    assert_eq!(for_carol[0].event_type, T::PersonMerged);
+    let after_merge = s
+        .person_activity(&carol, &p, Some(&for_carol[0].id), 50)
+        .await?;
+    assert_eq!(ids_of(&after_merge.items), ids_of(&for_carol[1..]));
+
+    // Losing the person is `not_found` whatever the cursor.
+    replace_policy(&s, &alice, &p, Policy::default()).await?;
+    for after in [edited.as_str(), source_events[0].id.as_str()] {
+        let error = s
+            .person_activity(&carol, &p, Some(after), 50)
+            .await
+            .unwrap_err();
+        assert_eq!(code(&error), Some(ErrorCode::NotFound));
+    }
+    Ok(())
+}
+
+/// Design assessment Q1 (2 November 2026): the case above loses a field through `ReplacePolicy`
+/// and an exclusion. These are the other two ways a reader loses a field while keeping the person:
+/// leaving the household the field is shared with, and a direct `Revoke` of the reader's grant.
+/// Either makes the field's saved cursor exactly the invalid cursor a missing one is, while the
+/// owner keeps it and an unaffected field's cursor stays valid.
+#[tokio::test]
+async fn a9_a_saved_cursor_is_refused_after_household_departure_or_a_direct_revoke() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (alice, carol) = (account(&s).await?, account(&s).await?);
+    let home = household(&s, &alice, &carol).await?;
+    let p = create_person(&s, &alice, "Morgan", grants(&[(&carol, false)])).await?;
+    let by_home = create_field(
+        &s,
+        &alice,
+        &p,
+        "Hobby",
+        Policy {
+            grants: vec![PrincipalGrant::Household {
+                id: home.clone(),
+                edit: false,
+            }],
+            exclude_accounts: vec![],
+        },
+    )
+    .await?;
+    edit(&s, &alice, &by_home, "Hobby", "Rowing").await?;
+    let direct = create_field(&s, &alice, &p, "Pets", grants(&[(&carol, false)])).await?;
+    edit(&s, &alice, &direct, "Pets", "Cat").await?;
+
+    let all = walk(&s, &carol, &p, 50).await?;
+    assert_eq!(
+        types(&all),
+        [
+            T::FieldEdited,
+            T::FieldCreated,
+            T::FieldEdited,
+            T::FieldCreated,
+            T::PersonCreated
+        ]
+    );
+    let edit_of = |field: &str| {
+        all.iter()
+            .find(|e| e.target.id == field && e.event_type == T::FieldEdited)
+            .expect("an edit event")
+            .id
+            .clone()
+    };
+    let (home_cursor, direct_cursor) = (edit_of(&by_home), edit_of(&direct));
+    let person_created = all[4].id.clone();
+    let missing = cursor_error(&s, &carol, &p, &id()).await;
+    assert_eq!(
+        missing.as_ref().map(|e| e.0),
+        Some(Some(ErrorCode::InvalidValue))
+    );
+    // Positive controls: both cursors are valid for Carol before either loss.
+    for cursor in [&home_cursor, &direct_cursor] {
+        assert!(cursor_error(&s, &carol, &p, cursor).await.is_none());
+    }
+
+    // A direct revoke of Carol's grant on one field.
+    let (_, policy_version) = versions(&s, &direct).await?;
+    s.apply(
+        &alice,
+        &id(),
+        &[Command::Revoke {
+            id: direct.clone(),
+            expected_version: policy_version,
+            account_id: carol.clone(),
+        }],
+    )
+    .await?;
+    assert_eq!(cursor_error(&s, &carol, &p, &direct_cursor).await, missing);
+    assert!(cursor_error(&s, &alice, &p, &direct_cursor).await.is_none());
+    assert!(cursor_error(&s, &carol, &p, &home_cursor).await.is_none());
+
+    // Carol leaves the household the other field is shared with.
+    let expected_version = household_version(&s, &carol, &home).await?;
+    manage(
+        &s,
+        &carol,
+        M::RemoveHouseholdMember {
+            household_id: home.clone(),
+            account_id: carol.clone(),
+            expected_version,
+        },
+    )
+    .await?;
+    assert_eq!(types(&walk(&s, &carol, &p, 50).await?), [T::PersonCreated]);
+    assert_eq!(cursor_error(&s, &carol, &p, &home_cursor).await, missing);
+    assert!(cursor_error(&s, &alice, &p, &home_cursor).await.is_none());
+    // The person is still visible to Carol, so its own event remains a valid cursor.
+    let after_person = s
+        .person_activity(&carol, &p, Some(&person_created), 50)
+        .await?;
+    assert!(after_person.items.is_empty());
+    Ok(())
+}
+
+// A10 -----------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a10_merges_combine_timelines_without_widening_the_source_history() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (alice, carol) = (account(&s).await?, account(&s).await?);
+    let source = create_person(&s, &alice, "Source", Policy::default()).await?;
+    let source_field = create_field(&s, &alice, &source, "Old note", Policy::default()).await?;
+    let target = create_person(&s, &alice, "Target", grants(&[(&carol, false)])).await?;
+    let target_field =
+        create_field(&s, &alice, &target, "Hobby", grants(&[(&carol, false)])).await?;
+    merge(&s, &alice, &source, &target, "Merged").await?;
+
+    let for_alice = walk(&s, &alice, &target, 50).await?;
+    assert_eq!(
+        types(&for_alice),
+        [
+            T::PersonMerged,
+            T::FieldCreated,
+            T::PersonCreated,
+            T::FieldCreated,
+            T::PersonCreated
+        ]
+    );
+    let merged = &for_alice[0];
+    assert_eq!(merged.target.id, target);
+    assert_eq!(
+        merged.merged_from.as_ref().map(|m| m.id.as_str()),
+        Some(source.as_str())
+    );
+    // The source's own event: archived, merged into the canonical person.
+    let source_created = &for_alice[4];
+    assert_eq!(source_created.target.id, source);
+    assert_eq!(source_created.target.state, TargetState::Merged);
+    assert_eq!(
+        source_created.target.canonical_person_id.as_deref(),
+        Some(target.as_str())
+    );
+    assert!(source_created.target.archived);
+    // Its field now belongs to the target and is current there.
+    assert_eq!(for_alice[3].target.id, source_field);
+    assert_eq!(for_alice[3].target.state, TargetState::Current);
+    // The source ID resolves to the canonical timeline.
+    let via_alias = s.person_activity(&alice, &source, None, 50).await?;
+    assert_eq!(via_alias.person_id, target);
+    assert_eq!(via_alias.items, for_alice);
+
+    // Carol could not see the source: she gets the merge without its source, and none of the
+    // source's own history.
+    let for_carol = walk(&s, &carol, &target, 50).await?;
+    assert_eq!(
+        types(&for_carol),
+        [T::PersonMerged, T::FieldCreated, T::PersonCreated]
+    );
+    assert_eq!(for_carol[0].merged_from, None);
+    assert_eq!(for_carol[1].target.id, target_field);
+    let text = serde_json::to_string(&for_carol)?;
+    for hidden in [
+        &source,
+        &source_field,
+        &"Source".to_string(),
+        &"Old note".to_string(),
+    ] {
+        assert!(!text.contains(hidden.as_str()), "{hidden} leaked");
+    }
+
+    // Chained: the merged person merged again keeps every alias's history.
+    let last = create_person(&s, &alice, "Last", Policy::default()).await?;
+    merge(&s, &alice, &target, &last, "Last").await?;
+    let chained = walk(&s, &alice, &source, 50).await?;
+    assert_eq!(
+        s.person_activity(&alice, &source, None, 1).await?.person_id,
+        last
+    );
+    assert_eq!(chained.len(), for_alice.len() + 2);
+    assert_eq!(
+        &chained[2..],
+        &for_alice[..]
+            .iter()
+            .cloned()
+            .map(|mut e| {
+                if e.target.kind == atlas_core::people::TargetKind::Person {
+                    e.target.state = TargetState::Merged;
+                    e.target.canonical_person_id = Some(last.clone());
+                    e.target.archived = true;
+                }
+                e
+            })
+            .collect::<Vec<_>>()[..]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a10_accepting_a_link_into_an_existing_person_is_a_merge() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (alice, bob, dave) = (account(&s).await?, account(&s).await?, account(&s).await?);
+    // Bob references Dave: Dave's canonical person, owned by and linked to Dave, added by Bob.
+    let canonical = reference(&s, &bob, &dave).await?;
+    let p = create_person(&s, &alice, "Dave from work", Policy::default()).await?;
+    let request = request_link(&s, &alice, &dave, &p).await?;
+    respond(&s, &dave, &request, true).await?;
+    let merges: Vec<Raw> = raw(&s)
+        .await?
+        .into_iter()
+        .filter(|r| r.event_type == "person_merged")
+        .collect();
+    assert_eq!(merges.len(), 1);
+    assert_eq!(
+        (
+            merges[0].target_id.as_str(),
+            merges[0].merged_from.as_deref(),
+            merges[0].actor_id.as_str()
+        ),
+        (canonical.as_str(), Some(p.as_str()), dave.as_str())
+    );
+    assert!(
+        raw(&s)
+            .await?
+            .iter()
+            .filter(|r| r.event_type == "person_linked")
+            .count()
+            == 1
+    );
+
+    // Dave never saw Alice's person: the merge without its source, and none of its history.
+    let for_dave = walk(&s, &dave, &canonical, 50).await?;
+    assert_eq!(
+        types(&for_dave),
+        [T::PersonMerged, T::PersonLinked, T::PersonCreated]
+    );
+    assert_eq!(for_dave[0].actor, ActivityAccount::You);
+    assert_eq!(for_dave[0].merged_from, None);
+    // Bob created the person, but Dave owns it and is linked: Bob is someone else.
+    assert_eq!(for_dave[1].actor, ActivityAccount::SomeoneElse);
+    assert_eq!(for_dave[1].account, Some(ActivityAccount::You));
+    assert_eq!(for_dave[2].actor, ActivityAccount::SomeoneElse);
+    // Alice saw her person, so the merged identity's audience includes her and she sees both.
+    let for_alice = walk(&s, &alice, &canonical, 50).await?;
+    assert_eq!(
+        types(&for_alice),
+        [
+            T::PersonMerged,
+            T::PersonCreated,
+            T::PersonLinked,
+            T::PersonCreated
+        ]
+    );
+    assert_eq!(
+        for_alice[0].merged_from.as_ref().map(|m| m.id.as_str()),
+        Some(p.as_str())
+    );
+    assert_eq!(for_alice[1].target.id, p);
+    assert_eq!(for_alice[1].target.state, TargetState::Merged);
+    assert_eq!(for_alice[1].actor, ActivityAccount::You);
+    assert!(
+        matches!(&for_alice[0].actor, ActivityAccount::Account { account_id, .. } if *account_id == dave)
+    );
+    Ok(())
+}
+
+/// Accepting a cross-owner merge request (`RespondRequest` on a `Proposal::Merge`) records one
+/// merge, attributed to the accepting recipient, and a replay records nothing more. Requesting
+/// the merge records nothing.
+#[tokio::test]
+async fn a10_accepting_a_cross_owner_merge_request_records_one_merge() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (a, b) = (account(&s).await?, account(&s).await?);
+    let source = create_person(&s, &a, "Morgan", grants(&[(&b, false)])).await?;
+    let target = create_person(&s, &b, "Morgan", grants(&[(&a, false)])).await?;
+    let preview = s.merge_preview(&a, &source, &target).await?;
+    assert!(
+        preview.requires_approval,
+        "a cross-owner merge needs approval"
+    );
+    let before_request = count(&s).await?;
+    let request = id();
+    s.people_command(
+        &a,
+        &id(),
+        &PeopleCommand::RequestMerge {
+            id: request.clone(),
+            source_id: source.clone(),
+            target_id: target.clone(),
+            preview_token: preview.token,
+            name: "Morgan".into(),
+        },
+        NOW,
+    )
+    .await?;
+    assert_eq!(
+        count(&s).await?,
+        before_request,
+        "a request records nothing"
+    );
+    let token = s.recipient_merge_preview(&b, &request, NOW).await?.token;
+    let accept = PeopleCommand::RespondRequest {
+        id: request,
+        accept: true,
+        recipient_preview_token: Some(token),
+    };
+    let operation = id();
+    s.people_command(&b, &operation, &accept, NOW).await?;
+    let rows: Vec<Raw> = raw(&s).await?.into_iter().skip(before_request).collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let merged = &rows[0];
+    assert_eq!(
+        (
+            merged.event_type.as_str(),
+            merged.person_id.as_str(),
+            merged.target_id.as_str(),
+            merged.actor_id.as_str(),
+            merged.merged_from.as_deref(),
+        ),
+        (
+            "person_merged",
+            target.as_str(),
+            target.as_str(),
+            b.as_str(),
+            Some(source.as_str())
+        )
+    );
+    s.people_command(&b, &operation, &accept, NOW).await?;
+    assert_eq!(
+        count(&s).await?,
+        before_request + 1,
+        "a replay records nothing"
+    );
+    // Both parties read the combined timeline, through either ID, newest first.
+    for reader in [&a, &b] {
+        for via in [&source, &target] {
+            let items = walk(&s, reader, via, 50).await?;
+            assert_eq!(
+                types(&items),
+                [T::PersonMerged, T::PersonCreated, T::PersonCreated],
+                "{reader} via {via}"
+            );
+            assert_eq!(items[0].id, merged.id);
+        }
+    }
+    Ok(())
+}
+
+// A11 -----------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a11_labels_are_current_and_no_old_content_is_returned() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let a = account(&s).await?;
+    let p = create_person(&s, &a, "First name", Policy::default()).await?;
+    let f = create_field(&s, &a, &p, "First label", Policy::default()).await?;
+    edit(&s, &a, &f, "Second label", "Sensitive value").await?;
+    edit(&s, &a, &p, "Second name", "").await?;
+    let typed = put_field(
+        &s,
+        &a,
+        &p,
+        "Flag",
+        FieldValue::Boolean { value: true },
+        Policy::default(),
+    )
+    .await?;
+    archive(&s, &a, &typed, true).await?;
+    let items = walk(&s, &a, &p, 50).await?;
+    for e in &items {
+        let expected = if e.target.id == p {
+            "Second name"
+        } else if e.target.id == f {
+            "Second label"
+        } else {
+            "Flag"
+        };
+        assert_eq!(e.target.label, expected, "{e:?}");
+    }
+    let field_events: Vec<_> = items.iter().filter(|e| e.target.id == f).collect();
+    assert_eq!(field_events.len(), 2);
+    assert!(
+        field_events
+            .iter()
+            .all(|e| e.target.field_kind.as_deref() == Some("text"))
+    );
+    assert_eq!(
+        field_events[0].changed.as_deref(),
+        Some(&[ChangedPart::Label, ChangedPart::Value][..])
+    );
+    assert_eq!(field_events[1].changed, None);
+    let flag: Vec<_> = items.iter().filter(|e| e.target.id == typed).collect();
+    assert!(
+        flag.iter()
+            .all(|e| e.target.archived && e.target.field_kind.as_deref() == Some("boolean"))
+    );
+    let text = serde_json::to_string(&items)?;
+    for old in ["First name", "First label", "Initial", "Sensitive value"] {
+        assert!(!text.contains(old), "{old} was returned");
+    }
+    // Summaries are the fixed phrases, never user content.
+    assert!(items.iter().all(|e| e.summary == e.event_type.summary()));
+    assert!(text.contains("\"summary\":\"Edited a field\""));
+    Ok(())
+}
+
+// A13 -----------------------------------------------------------------------------------------
+
+const BETWEEN: &str = "people_activity.between_person_and_events";
+
+#[tokio::test]
+async fn a13_one_page_is_read_from_one_snapshot() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (alice, carol) = (account(&s).await?, account(&s).await?);
+    let p = create_person(&s, &alice, "Morgan", grants(&[(&carol, false)])).await?;
+    let f = create_field(&s, &alice, &p, "Hobby", grants(&[(&carol, false)])).await?;
+    let before = walk(&s, &carol, &p, 50).await?;
+    assert_eq!(before.len(), 2);
+
+    let mut gate = s.hooks().arm(BETWEEN);
+    let read = {
+        let (s, carol, p) = (s.clone(), carol.clone(), p.clone());
+        tokio::spawn(async move { s.person_activity(&carol, &p, None, 50).await })
+    };
+    gate.reached().await;
+    // While the read is paused after its person gate, the owner revokes the field and records a
+    // new event, and both commit.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        replace_policy(&s, &alice, &f, Policy::default()).await?;
+        edit(&s, &alice, &p, "Morgan Lee", "").await
+    })
+    .await
+    .expect("the writer was not blocked by the paused reader")?;
+    gate.release();
+    let page: PersonActivityPage = read.await??;
+    assert_eq!(
+        page.items, before,
+        "every member comes from the snapshot the read began with"
+    );
+    let after = walk(&s, &carol, &p, 50).await?;
+    assert_eq!(
+        types(&after),
+        [T::PersonRenamed, T::PersonCreated],
+        "the next read applies the revoke"
+    );
+    if postgres() {
+        let seen = s.hooks().isolation_seen();
+        assert_eq!(seen.len() as u32, s.hooks().count(BETWEEN));
+        assert!(
+            seen.iter().all(|level| level == "repeatable read"),
+            "{seen:?}"
+        );
+    }
+    Ok(())
+}
+
+// A14 -----------------------------------------------------------------------------------------
+// Tripwire over a mixed history: nothing hidden appears anywhere in any reader's response.
+
+#[tokio::test]
+async fn a14_no_response_carries_a_hidden_identifier_label_account_or_revision() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (alice, bob, carol, dave) = (
+        account(&s).await?,
+        account(&s).await?,
+        account(&s).await?,
+        account(&s).await?,
+    );
+    let p = create_person(
+        &s,
+        &alice,
+        "Visible person",
+        grants(&[(&bob, true), (&carol, false)]),
+    )
+    .await?;
+    let hidden_person =
+        create_person(&s, &alice, "Hidden person", grants(&[(&bob, false)])).await?;
+    let hidden_field =
+        create_field(&s, &alice, &p, "Hidden field", grants(&[(&bob, true)])).await?;
+    let shared = create_field(
+        &s,
+        &alice,
+        &p,
+        "Shared field",
+        grants(&[(&bob, true), (&carol, false)]),
+    )
+    .await?;
+    edit(&s, &bob, &hidden_field, "Hidden field", "bob was here").await?;
+    edit(&s, &bob, &shared, "Shared field", "bob again").await?;
+    merge(&s, &alice, &hidden_person, &p, "Visible person").await?;
+    link(&s, &alice, &dave, &p).await?;
+    unlink(&s, &dave, &p).await?;
+    let usernames: Vec<String> = sqlx::query_scalar("SELECT username FROM accounts WHERE id=$1")
+        .bind(&bob)
+        .fetch_all(&s.pool)
+        .await?;
+    let revisions: Vec<i64> = raw(&s).await?.into_iter().map(|r| r.revision).collect();
+    for limit in [1, 3, 50] {
+        let items = walk(&s, &carol, &p, limit).await?;
+        assert!(!items.is_empty());
+        let text = serde_json::to_string(&items)?;
+        for hidden in [&hidden_person, &hidden_field, &bob, &usernames[0]] {
+            assert!(
+                !text.contains(hidden.as_str()),
+                "{hidden} leaked at limit {limit}"
+            );
+        }
+        for hidden in ["Hidden person", "Hidden field", "bob was here", "bob again"] {
+            assert!(!text.contains(hidden), "{hidden} leaked at limit {limit}");
+        }
+        let json = serde_json::to_value(&items)?;
+        for item in json.as_array().unwrap() {
+            assert!(item.get("revision").is_none());
+            assert!(item.get("ordinal").is_none());
+        }
+        // No revision value appears as any number in a response (occurred_at is NOW-based).
+        let page = serde_json::to_value(s.person_activity(&carol, &p, None, limit).await?)?;
+        let mut numbers = Vec::new();
+        collect_numbers(&page, &mut numbers);
+        assert!(revisions.iter().all(|r| *r < 1_000_000));
+        assert!(
+            numbers.iter().all(|n| *n > 1_000_000),
+            "only timestamps: {numbers:?}"
+        );
+    }
+    Ok(())
+}
+
+fn collect_numbers(value: &serde_json::Value, into: &mut Vec<i64>) {
+    match value {
+        serde_json::Value::Number(n) => into.extend(n.as_i64()),
+        serde_json::Value::Array(items) => items.iter().for_each(|v| collect_numbers(v, into)),
+        serde_json::Value::Object(map) => map.values().for_each(|v| collect_numbers(v, into)),
+        _ => {}
+    }
+}
+
+// R3 ----------------------------------------------------------------------------------------------
+// A page is selected by target (BE-PEOPLE-ACTIVITY R3): the reader's visible targets are found from
+// the current hierarchy and only their events are read. These cases compare every reader's whole
+// timeline with an independent reference, and witness that hidden history adds no work.
+
+/// Every resource `actor` receives in a fresh sync snapshot: an independent composition of the
+/// production visibility rule (owned, granted and household resources), not the activity reader's.
+async fn synced(s: &Store, actor: &str) -> Result<BTreeSet<String>> {
+    use atlas_core::Change;
+    let device = format!("oracle-{}", id());
+    let (mut ids, mut cursor) = (BTreeSet::new(), None::<String>);
+    loop {
+        let page = s.sync(actor, &device, cursor.as_deref(), 200, NOW).await?;
+        for batch in &page.batches {
+            for change in &batch.changes {
+                if let Change::Upsert { resource } = change {
+                    ids.insert(resource.id.clone());
+                }
+            }
+        }
+        if !page.has_more {
+            return Ok(ids);
+        }
+        cursor = Some(page.next_cursor);
+    }
+}
+
+/// The timeline's people, from the alias table.
+async fn family(s: &Store, canonical: &str) -> Result<BTreeSet<String>> {
+    let mut ids: BTreeSet<String> = sqlx::query_scalar::<_, String>(
+        "SELECT source_id FROM person_aliases WHERE canonical_id=$1",
+    )
+    .bind(canonical)
+    .fetch_all(&s.pool)
+    .await?
+    .into_iter()
+    .collect();
+    ids.insert(canonical.to_owned());
+    Ok(ids)
+}
+
+/// Reference model: the family's raw events, newest first, whose target `reader` can see.
+async fn reference_model(s: &Store, canonical: &str, reader: &str) -> Result<Vec<String>> {
+    let people = family(s, canonical).await?;
+    let seen = synced(s, reader).await?;
+    Ok(raw(s)
+        .await?
+        .into_iter()
+        .rev()
+        .filter(|r| people.contains(&r.person_id) && seen.contains(&r.target_id))
+        .map(|r| r.id)
+        .collect())
+}
+
+async fn create_fields(
+    s: &Store,
+    owner: &str,
+    person: &str,
+    policies: Vec<Policy>,
+) -> Result<Vec<String>> {
+    let ids: Vec<String> = policies.iter().map(|_| id()).collect();
+    let commands: Vec<Command> = ids
+        .iter()
+        .zip(policies)
+        .enumerate()
+        .map(|(n, (field, policy))| Command::CreateField {
+            id: field.clone(),
+            person_id: person.into(),
+            label: format!("Field {n}"),
+            value: "Initial".into(),
+            initial_policy: Some(policy),
+        })
+        .collect();
+    for chunk in commands.chunks(20) {
+        s.apply(owner, &id(), chunk).await?;
+    }
+    Ok(ids)
+}
+
+#[tokio::test]
+async fn a15_every_reader_sees_exactly_the_reference_timeline() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    s.hooks().record_activity_work(true);
+    let [alice, carol, dave, erin] = [
+        account(&s).await?,
+        account(&s).await?,
+        account(&s).await?,
+        account(&s).await?,
+    ];
+    let both = || grants(&[(&carol, false), (&dave, false)]);
+    let p = create_person(
+        &s,
+        &alice,
+        "Morgan",
+        grants(&[(&carol, false), (&dave, false), (&erin, false)]),
+    )
+    .await?;
+    // 150 fields: more than one statement's worth of visible targets for Dave, every third one
+    // for Carol, none for Erin; one field hidden from everyone but Alice.
+    let policies = (0..150)
+        .map(|n| match n {
+            75 => Policy::default(),
+            n if n % 3 == 0 => both(),
+            _ => grants(&[(&dave, false)]),
+        })
+        .collect();
+    let fields = create_fields(&s, &alice, &p, policies).await?;
+    let hidden = &fields[75];
+    for n in 0..40 {
+        edit(&s, &alice, hidden, "Field 75", &format!("secret {n}")).await?;
+        edit(
+            &s,
+            &alice,
+            &fields[n * 3],
+            &format!("Field {}", n * 3),
+            "shared",
+        )
+        .await?;
+        if n % 4 == 0 {
+            edit(&s, &alice, &fields[1 + n * 3], "Dave only", "dave").await?;
+        }
+    }
+    // A transitive merge: S1 into S2, then S2 into Morgan. Carol and Dave can see S1 and one of
+    // its fields (and so S2, whose audience the merge joins with S1's); S2's field moves to
+    // Morgan and is shared with them there. S3, which only Alice can see, is merged in too.
+    let s1 = create_person(&s, &alice, "First", both()).await?;
+    let s1_fields = create_fields(&s, &alice, &s1, vec![both(), Policy::default()]).await?;
+    let s2 = create_person(&s, &alice, "Second", Policy::default()).await?;
+    let s2_fields = create_fields(&s, &alice, &s2, vec![Policy::default()]).await?;
+    edit(&s, &alice, &s1_fields[0], "Before", "merge").await?;
+    edit(&s, &alice, &s1_fields[1], "Before", "hidden").await?;
+    merge(&s, &alice, &s1, &s2, "Second").await?;
+    merge(&s, &alice, &s2, &p, "Morgan").await?;
+    let s3 = create_person(&s, &alice, "Third", Policy::default()).await?;
+    let s3_fields = create_fields(&s, &alice, &s3, vec![Policy::default()]).await?;
+    edit(&s, &alice, &s3_fields[0], "Third note", "private").await?;
+    merge(&s, &alice, &s3, &p, "Morgan").await?;
+    replace_policy(&s, &alice, &s2_fields[0], both()).await?;
+    // Moved fields edited after the merges; one of them archived.
+    edit(&s, &alice, &s1_fields[0], "After", "merge").await?;
+    edit(&s, &alice, &s2_fields[0], "After", "moved").await?;
+    archive(&s, &alice, &s1_fields[0], true).await?;
+    for n in 0..10 {
+        edit(&s, &alice, hidden, "Field 75", &format!("later {n}")).await?;
+    }
+
+    // The targets the read found cover every target the timeline has ever recorded.
+    let people = family(&s, &p).await?;
+    s.person_activity(&alice, &p, None, 1).await?;
+    let found: BTreeSet<String> = s.hooks().activity_work().targets.into_iter().collect();
+    let recorded: BTreeSet<String> = raw(&s)
+        .await?
+        .into_iter()
+        .filter(|r| people.contains(&r.person_id))
+        .map(|r| r.target_id)
+        .collect();
+    assert!(
+        recorded.is_subset(&found),
+        "{:?}",
+        recorded.difference(&found)
+    );
+    assert_eq!(people.len(), 4);
+
+    for (reader, stream, statements) in [
+        (&alice, "member", 4),
+        (&carol, "targets", 1),
+        (&dave, "targets", 2),
+        (&erin, "targets", 1),
+    ] {
+        let model = reference_model(&s, &p, reader).await?;
+        assert!(!model.is_empty());
+        for limit in [1, 2, 7, 50, 100] {
+            let walked = walk(&s, reader, &p, limit).await?;
+            assert_eq!(ids_of(&walked), model, "limit {limit}");
+        }
+        let first = s.person_activity(reader, &p, None, 50).await?;
+        let work = s.hooks().activity_work();
+        assert!(work.statements.iter().all(|w| w.stream == stream));
+        assert_eq!(work.statements.len(), statements);
+        assert!(work.statements.iter().all(|w| w.rows <= 51));
+        // A merge's source is shown exactly when the reader can see it.
+        let seen = synced(&s, reader).await?;
+        for event in walk(&s, reader, &p, 100).await?.iter().chain(&first.items) {
+            if event.event_type == T::PersonMerged {
+                let raw_source = raw(&s)
+                    .await?
+                    .into_iter()
+                    .find(|r| r.id == event.id)
+                    .and_then(|r| r.merged_from)
+                    .expect("a merge records its source");
+                assert_eq!(
+                    event.merged_from.as_ref().map(|m| m.id.clone()),
+                    seen.contains(&raw_source).then_some(raw_source)
+                );
+            }
+        }
+    }
+    // The fixture covers what it claims: Carol sees S1, S2 and the shared or moved fields, but not
+    // S3, its field, S1's private field or the hidden field.
+    let carol_seen = synced(&s, &carol).await?;
+    for visible in [&s1, &s2, &s1_fields[0], &s2_fields[0]] {
+        assert!(carol_seen.contains(visible), "{visible}");
+    }
+    for hidden in [&s3, &s3_fields[0], &s1_fields[1], hidden] {
+        assert!(!carol_seen.contains(hidden), "{hidden}");
+    }
+    Ok(())
+}
+
+/// Rows PostgreSQL examined in `person_activity_events` for one recorded statement, from EXPLAIN
+/// ANALYZE: for every node that reads the table's rows (sequential, index or bitmap heap scan), its
+/// returned rows times loops plus the rows its filter or recheck removed. Index entries a bitmap
+/// heap scan then fetches are counted once, at the heap scan.
+async fn examined(
+    s: &Store,
+    statement: &atlas_core::hooks::ActivityStatement,
+) -> Result<(i64, String)> {
+    use atlas_core::hooks::Bind;
+    let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) {}",
+        statement.sql
+    )));
+    for bind in &statement.binds {
+        query = match bind {
+            Bind::Text(t) => query.bind(t.clone()),
+            Bind::Int(i) => query.bind(*i),
+        };
+    }
+    let plan = query.fetch_all(&s.pool).await?;
+    let number = |text: &str, key: &str| -> Option<i64> {
+        let rest = &text[text.find(key)? + key.len()..];
+        rest.split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()
+    };
+    let (mut total, mut counting) = (0, false);
+    for line in &plan {
+        if line.contains("(actual") {
+            // A new node: count it only when it scans the event table itself.
+            counting = line.contains(" on person_activity_events (actual");
+            if counting {
+                total += number(line, "rows=").unwrap_or(0) * number(line, "loops=").unwrap_or(1);
+            }
+        } else if counting {
+            for key in [
+                "Rows Removed by Filter: ",
+                "Rows Removed by Index Recheck: ",
+            ] {
+                total += number(line, key).unwrap_or(0);
+            }
+        }
+    }
+    assert!(
+        plan.iter()
+            .any(|l| l.contains(" on person_activity_events (actual")),
+        "no scan of the event table found in {plan:#?}"
+    );
+    Ok((total, plan.join("; ")))
+}
+
+/// SQLite's plan for one recorded statement.
+async fn sqlite_plan(
+    s: &Store,
+    statement: &atlas_core::hooks::ActivityStatement,
+) -> Result<String> {
+    use atlas_core::hooks::Bind;
+    use sqlx::Row;
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "EXPLAIN QUERY PLAN {}",
+        statement.sql
+    )));
+    for bind in &statement.binds {
+        query = match bind {
+            Bind::Text(t) => query.bind(t.clone()),
+            Bind::Int(i) => query.bind(*i),
+        };
+    }
+    Ok(query
+        .fetch_all(&s.pool)
+        .await?
+        .iter()
+        .map(|r| r.get::<String, _>(3))
+        .collect::<Vec<_>>()
+        .join("; "))
+}
+
+/// The work of one read: its statements (stream, SQL, rows) and its visibility checks, plus the
+/// rows PostgreSQL examined or SQLite's plans.
+async fn work_of(
+    s: &Store,
+    reader: &str,
+    person: &str,
+    after: Option<&str>,
+) -> Result<(
+    PersonActivityPage,
+    Vec<(String, String, usize, String)>,
+    usize,
+)> {
+    let page = s.person_activity(reader, person, after, 50).await?;
+    let work = s.hooks().activity_work();
+    let mut statements = Vec::new();
+    for statement in &work.statements {
+        let witness = if postgres() {
+            let (rows, plan) = examined(s, statement).await?;
+            format!("{rows} | {plan}")
+        } else {
+            sqlite_plan(s, statement).await?
+        };
+        if std::env::var_os("ATLAS_TEST_ACTIVITY_WORK").is_some() {
+            eprintln!(
+                "activity-work reader={reader} after={after:?} stream={} rows={} checks={} witness={witness} sql={}",
+                statement.stream, statement.rows, work.visibility_checks, statement.sql
+            );
+        }
+        statements.push((
+            statement.stream.to_owned(),
+            statement.sql.clone(),
+            statement.rows,
+            witness,
+        ));
+    }
+    Ok((page, statements, work.visibility_checks))
+}
+
+#[tokio::test]
+async fn a16_hidden_history_adds_no_work_to_a_restricted_or_a_deep_read() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    s.hooks().record_activity_work(true);
+    let (alice, carol) = (account(&s).await?, account(&s).await?);
+    let p = create_person(&s, &alice, "Morgan", grants(&[(&carol, false)])).await?;
+    let shared = create_field(&s, &alice, &p, "Hobby", grants(&[(&carol, false)])).await?;
+    let hidden = create_field(&s, &alice, &p, "Medical note", Policy::default()).await?;
+    for n in 0..120 {
+        edit(&s, &alice, &shared, "Hobby", &format!("v{n}")).await?;
+    }
+    // Another person's long history, which no statement may read either.
+    let other = create_person(&s, &alice, "Other", Policy::default()).await?;
+    let other_field = create_field(&s, &alice, &other, "Other", Policy::default()).await?;
+
+    let mut previous = None;
+    let mut hidden_total = 0;
+    for step in [0, 300, 600] {
+        while hidden_total < step {
+            edit(
+                &s,
+                &alice,
+                &hidden,
+                "Medical note",
+                &format!("h{hidden_total}"),
+            )
+            .await?;
+            edit(
+                &s,
+                &alice,
+                &other_field,
+                "Other",
+                &format!("o{hidden_total}"),
+            )
+            .await?;
+            hidden_total += 1;
+        }
+        // Statistics change what a planner may choose: Atlas never gathers them, but an operator
+        // or autovacuum can. The last step reads with them on both engines.
+        if step == 600 {
+            sqlx::query("ANALYZE person_activity_events")
+                .execute(&s.pool)
+                .await?;
+        }
+        let (first, first_work, first_checks) = work_of(&s, &carol, &p, None).await?;
+        let after = first
+            .next_after
+            .clone()
+            .expect("Carol has more than a page");
+        let (second, second_work, second_checks) = work_of(&s, &carol, &p, Some(&after)).await?;
+        let (third, third_work, _) = work_of(&s, &carol, &p, second.next_after.as_deref()).await?;
+        assert_eq!(third.next_after, None);
+        // Morgan's creation, the shared field's creation and its 120 edits.
+        assert_eq!(
+            first.items.len() + second.items.len() + third.items.len(),
+            122
+        );
+        // Carol reads only her two visible targets, never the hidden field or the other person.
+        for (stream, _, rows, witness) in first_work.iter().chain(&second_work).chain(&third_work) {
+            assert_eq!(stream, "targets");
+            assert!(*rows <= 51);
+            if postgres() {
+                // The rows of the two visible targets at most (122 events), whatever is hidden.
+                // PostgreSQL's plan follows its statistics (ANALYZE runs below), so the bound,
+                // not the exact count, is the hidden-history invariant there.
+                let rows: i64 = witness.split(" | ").next().unwrap_or_default().parse()?;
+                assert!(rows <= 122, "examined {witness}");
+            } else {
+                assert!(
+                    witness.contains("USING INDEX person_activity_events_target (target_id=?)"),
+                    "{witness}"
+                );
+                assert!(
+                    !witness.contains("SCAN person_activity_events"),
+                    "{witness}"
+                );
+            }
+        }
+        // The owner's deep page seeks straight to the cursor.
+        // A fixed old event with 69 older ones, however much newer history there is.
+        let everything = walk(&s, &alice, &p, 100).await?;
+        let deep_from = &everything[everything.len() - 70].id;
+        let (_, owner_work, owner_checks) = work_of(&s, &alice, &p, Some(deep_from)).await?;
+        assert_eq!(owner_work.len(), 1);
+        let (stream, _, rows, witness) = &owner_work[0];
+        assert_eq!((stream.as_str(), *rows), ("member", 51));
+        if postgres() {
+            // The cursor bound is an index condition, so nothing newer than the cursor (where
+            // all the added history is) is read: at most the 69 older rows and the boundary.
+            let examined: i64 = witness.split(" | ").next().unwrap_or_default().parse()?;
+            assert!(
+                examined <= 70,
+                "the owner's continuation examined {witness}"
+            );
+            let condition = witness
+                .split("; ")
+                .find(|line| line.contains("Cond: ((person_id = "))
+                .unwrap_or_default();
+            assert!(condition.contains(") AND (revision <= "), "{witness}");
+        } else {
+            assert!(
+                witness.contains(
+                    "USING INDEX person_activity_events_person (person_id=? AND revision<?)"
+                ),
+                "{witness}"
+            );
+            assert!(!witness.contains("TEMP B-TREE"), "{witness}");
+        }
+        // The same statements, rows and visibility checks at every amount of hidden history, and
+        // on SQLite the same plans (PostgreSQL's are bounded above instead).
+        let shape = |w: &Vec<(String, String, usize, String)>| {
+            w.iter()
+                .map(|(stream, sql, rows, witness)| {
+                    let plan = if postgres() {
+                        String::new()
+                    } else {
+                        witness.clone()
+                    };
+                    (stream.clone(), sql.clone(), *rows, plan)
+                })
+                .collect::<Vec<_>>()
+        };
+        let now = (
+            ids_of(&first.items),
+            ids_of(&second.items),
+            shape(&first_work),
+            shape(&second_work),
+            first_checks,
+            second_checks,
+            owner_checks,
+        );
+        if let Some(previous) = &previous {
+            assert_eq!(
+                &now, previous,
+                "hidden history changed the work at step {step}"
+            );
+        }
+        previous = Some(now);
+    }
+    Ok(())
+}
+
+const TARGETS: &str = "people_activity.between_targets_and_events";
+
+#[tokio::test]
+async fn a13_a_page_paused_after_its_target_selection_reads_one_snapshot() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (alice, carol) = (account(&s).await?, account(&s).await?);
+    let p = create_person(&s, &alice, "Morgan", grants(&[(&carol, false)])).await?;
+    let f = create_field(&s, &alice, &p, "Hobby", grants(&[(&carol, false)])).await?;
+    let g = create_field(&s, &alice, &p, "Gift ideas", Policy::default()).await?;
+    let before = walk(&s, &carol, &p, 50).await?;
+    assert_eq!(before.len(), 2);
+
+    let mut gate = s.hooks().arm(TARGETS);
+    let read = {
+        let (s, carol, p) = (s.clone(), carol.clone(), p.clone());
+        tokio::spawn(async move { s.person_activity(&carol, &p, None, 50).await })
+    };
+    gate.reached().await;
+    // Paused after its targets were judged: revoke one, share the other, and add an event.
+    tokio::time::timeout(Duration::from_secs(20), async {
+        replace_policy(&s, &alice, &f, Policy::default()).await?;
+        replace_policy(&s, &alice, &g, grants(&[(&carol, false)])).await?;
+        edit(&s, &alice, &p, "Morgan Lee", "").await
+    })
+    .await
+    .expect("the writer was not blocked by the paused reader")?;
+    gate.release();
+    let page: PersonActivityPage = read.await??;
+    assert_eq!(
+        page.items, before,
+        "events come from the snapshot the targets were judged in"
+    );
+    let after = walk(&s, &carol, &p, 50).await?;
+    assert_eq!(
+        types(&after),
+        [T::PersonRenamed, T::FieldCreated, T::PersonCreated]
+    );
+    assert_eq!(after[1].target.id, g);
+    if postgres() {
+        let seen = s.hooks().isolation_seen();
+        assert!(!seen.is_empty());
+        assert!(
+            seen.iter().all(|level| level == "repeatable read"),
+            "{seen:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a17_an_event_outside_the_hierarchy_is_refused_never_shown() -> Result<()> {
+    let (_dir, s) = fixture().await?;
+    let (alice, carol) = (account(&s).await?, account(&s).await?);
+    let p = create_person(&s, &alice, "Morgan", grants(&[(&carol, false)])).await?;
+    let f = create_field(&s, &alice, &p, "Hobby", grants(&[(&carol, false)])).await?;
+    create_field(&s, &alice, &p, "Medical note", Policy::default()).await?;
+    let elsewhere = create_person(&s, &alice, "Elsewhere", grants(&[(&carol, false)])).await?;
+    let before_owner = walk(&s, &alice, &p, 50).await?;
+    let before_carol = walk(&s, &carol, &p, 50).await?;
+    // Forced corruption: an event of Morgan's timeline whose target is another person. No writer
+    // can produce it; the hierarchy triggers keep every target inside the timeline.
+    sqlx::query("INSERT INTO person_activity_events(id,revision,ordinal,person_id,target_id,event_type,actor_id,occurred_at) VALUES ($1,1000000,0,$2,$3,'field_edited',$4,0)")
+        .bind(id())
+        .bind(&p)
+        .bind(&elsewhere)
+        .bind(&alice)
+        .execute(&s.pool)
+        .await?;
+    // A reader who sees every target fails closed rather than presenting it.
+    let error = s.person_activity(&alice, &p, None, 50).await.unwrap_err();
+    assert_eq!(
+        code(&error),
+        None,
+        "an internal error, not a client error: {error}"
+    );
+    // A restricted reader reads only the targets found in the hierarchy.
+    assert_eq!(walk(&s, &carol, &p, 50).await?, before_carol);
+    assert_eq!(before_owner.len(), 3);
+    assert_eq!(before_carol.len(), 2);
+    assert_eq!(before_carol[0].target.id, f);
+    Ok(())
+}

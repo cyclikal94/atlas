@@ -8,7 +8,10 @@ use anyhow::Result;
 use sqlx::{Any, Transaction};
 use std::{
     collections::HashMap,
-    sync::{Mutex, MutexGuard},
+    sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 use tokio::sync::oneshot;
 
@@ -24,6 +27,34 @@ struct State {
     split_reads: bool,
     read_committed: bool,
     unverified: bool,
+    activity: ActivityWork,
+}
+
+/// A value bound to a recorded People activity event statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Bind {
+    Text(String),
+    Int(i64),
+}
+
+/// One event statement of a People activity read, as executed.
+#[derive(Clone, Debug)]
+pub struct ActivityStatement {
+    /// `"member"` (one timeline alias, through `person_activity_events_person`) or `"targets"`
+    /// (a chunk of visible targets, through `person_activity_events_target`).
+    pub stream: &'static str,
+    pub sql: String,
+    pub binds: Vec<Bind>,
+    pub rows: usize,
+}
+
+/// The work of the most recent People activity read: the event statements it ran, the target
+/// resources it found for the timeline and how many IDs it submitted to the visibility rule.
+#[derive(Clone, Debug, Default)]
+pub struct ActivityWork {
+    pub statements: Vec<ActivityStatement>,
+    pub targets: Vec<String>,
+    pub visibility_checks: usize,
 }
 
 /// Held by a test for one armed point. Dropping it without `release` also releases the point,
@@ -52,7 +83,7 @@ impl Gate {
 }
 
 #[derive(Default)]
-pub struct Hooks(Mutex<State>);
+pub struct Hooks(Mutex<State>, AtomicBool);
 
 impl Hooks {
     fn state(&self) -> MutexGuard<'_, State> {
@@ -99,7 +130,8 @@ impl Hooks {
     }
 
     /// Negative control for the sharing snapshot: read the households on a second, later
-    /// snapshot instead of the one the defaults were read in, on either engine.
+    /// snapshot instead of the one the defaults were read in, on either engine. The dependency
+    /// graph uses the same switch to expand on a later snapshot than its root read.
     pub fn split_snapshot_reads(&self, enabled: bool) {
         self.state().split_reads = enabled;
     }
@@ -118,8 +150,9 @@ impl Hooks {
 
     /// `SHOW transaction_isolation` as observed after the locking reads of each attempt,
     /// between the two halves of a sharing snapshot, between a People summary's id query and
-    /// its enrichment, and between a field-audience page's effective-access qualification and
-    /// its counts.
+    /// its enrichment, between a field-audience page's effective-access qualification and
+    /// its counts, between a People activity read's person gate and its events, and after a
+    /// dependency graph's root read.
     pub fn isolation_seen(&self) -> Vec<String> {
         self.state().isolation_seen.clone()
     }
@@ -160,6 +193,43 @@ impl Hooks {
         !self.state().unverified
     }
 
+    /// Record the work of each People activity read (off by default, so a hook-enabled build such
+    /// as the load example pays one atomic load per read for it).
+    pub fn record_activity_work(&self, enabled: bool) {
+        self.1.store(enabled, Ordering::Relaxed);
+    }
+
+    /// The work witness of the most recent People activity read while recording was on.
+    pub fn activity_work(&self) -> ActivityWork {
+        self.state().activity.clone()
+    }
+
+    pub(crate) fn records_activity(&self) -> bool {
+        self.1.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn activity_begin(&self) {
+        if self.records_activity() {
+            self.state().activity = ActivityWork::default();
+        }
+    }
+
+    pub(crate) fn activity_targets(&self, targets: &std::collections::BTreeSet<String>) {
+        if self.records_activity() {
+            self.state().activity.targets = targets.iter().cloned().collect();
+        }
+    }
+
+    pub(crate) fn activity_visibility(&self, ids: usize) {
+        if self.records_activity() {
+            self.state().activity.visibility_checks += ids;
+        }
+    }
+
+    pub(crate) fn activity_statement(&self, statement: ActivityStatement) {
+        self.state().activity.statements.push(statement);
+    }
+
     /// Reach a point outside any transaction (or one that must not run injected SQL).
     pub async fn reach(&self, point: &str) {
         let gate = {
@@ -188,6 +258,8 @@ impl Hooks {
                 | "sharing_snapshot.between_reads"
                 | "people_summary.between_reads"
                 | "people_summary.between_qualify_and_count"
+                | "people_activity.between_person_and_events"
+                | "dependency_graph.after_root_read"
         ) && !sqlite
         {
             let level: String = sqlx::query_scalar("SHOW transaction_isolation")

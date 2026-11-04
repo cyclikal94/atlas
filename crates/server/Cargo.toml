@@ -8,6 +8,19 @@ publish = false
 [features]
 # Test-only schedule control; enables the same feature in atlas-core. Never enabled by a normal build.
 test-hooks = ["atlas-core/test-hooks"]
+# BE-Q23 R3: the separately named `atlas-sync-diagnostic` fixture executable. Never enabled by a
+# normal build; without it neither the executable nor its sync-time source is compiled.
+sync-diagnostic = []
+
+[[bin]]
+name = "atlas-sync-diagnostic"
+path = "src/bin/atlas-sync-diagnostic.rs"
+required-features = ["sync-diagnostic"]
+
+[[test]]
+name = "sync_diagnostic"
+path = "tests/sync_diagnostic.rs"
+required-features = ["sync-diagnostic"]
 
 [dependencies]
 atlas-core = { workspace = true }

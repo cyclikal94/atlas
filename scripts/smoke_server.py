@@ -12,7 +12,7 @@ import urllib.request
 import uuid
 
 from smoke.client import ContractClient
-from smoke import calendars, sharing, households, tasks, people, devices, timers, labels, people_summary, sync_pages
+from smoke import calendars, sharing, households, tasks, people, devices, timers, labels, people_summary, people_activity, bounded_sync, sync_pages
 
 root = Path(__file__).resolve().parents[1]
 binary = Path(os.environ.get('ATLAS_TEST_BINARY', root / 'target/debug/atlas-server'))
@@ -72,6 +72,7 @@ with tempfile.TemporaryDirectory(prefix='atlas-server-smoke-') as temporary:
             print(json.dumps(timers.run(call, accounts, tokens, document)))
             print(json.dumps(labels.run(call, tokens, secrets)))
             print(json.dumps(people_summary.run(call, accounts, tokens)))
+            print(json.dumps(people_activity.run(call, accounts, tokens)))
             print(json.dumps(sync_pages.run(call, tokens, secrets)))
             def seed(account, device, kind):
                 """Fixture rows for devices.run: no OpenID provider or push endpoint exists here."""
@@ -95,6 +96,7 @@ with tempfile.TemporaryDirectory(prefix='atlas-server-smoke-') as temporary:
                             'secret,version,active) VALUES (?,?,?,?,?,1,1)',
                             (str(uuid.uuid4()), account, device, 'ntfy', 'fixture'))
             devices.run(call, tokens, secrets, seed)
+            print(json.dumps(bounded_sync.run(call, accounts, tokens, secrets)))
             secrets.append('replacement-smoke-password-456')
             call('POST', '/api/experimental/v1/password', tokens['alice'],
                 {'current_password':secrets[0], 'new_password':secrets[-1]}, expected=204)
@@ -117,4 +119,4 @@ with tempfile.TemporaryDirectory(prefix='atlas-server-smoke-') as temporary:
     logged_ids = {event['request_id'] for event in events if event['event'] == 'http_request'}
     if request_ids != logged_ids:
         raise RuntimeError('Requests and logs are not correlated')
-print('Live contract smoke passed: authentication, sharing, households, tasks, people, independent timers, calendars, session/device labels and capacity, viewer-safe People summaries, sync page counts, device retirement and sanitised logs')
+print('Live contract smoke passed: authentication, sharing, households, tasks, people, independent timers, calendars, session/device labels and capacity, viewer-safe People summaries, People activity, sync page counts, device retirement, bounded sync delivery and sanitised logs')

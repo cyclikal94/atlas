@@ -15,13 +15,15 @@ recovery. Start `target/debug/atlas-server` with no arguments to serve requests.
 Atlas is unreleased. Current startup creates the complete schema transactionally,
 or validates its baseline identity. An ordered chain of additive in-place steps upgrades
 a database recorded at an earlier supported version: today `1000 → 1001` through
-`1005 → 1006`, each adding tables, columns or indexes without changing an existing row
+`1006 → 1007`, each adding tables, columns or indexes without changing an existing row
 (`1003 → 1004` only swaps the unique timer index for one scoped to each occurrence and
 adds a history index; on PostgreSQL its index build blocks timer writes for the seconds it
 takes, about two on a million rows; `1004 → 1005` adds three nullable label columns to
 `sessions`, which rewrites no row, and the empty `device_profiles` table; `1005 → 1006` adds
 the empty `person_attributions` table and backfills nothing, because no existing record
-proves who created an existing person, so those people read as unknown attribution). Each step runs inside the
+proves who created an existing person, so those people read as unknown attribution; `1006 → 1007`
+adds the empty `person_activity_events` table and the one-row `person_activity_coverage`
+table recording when recording began, and backfills no event). Each step runs inside the
 serialising startup transaction (an advisory lock on PostgreSQL, an immediate transaction
 on SQLite), so replicas starting together upgrade once. Any other recorded version, and any
 database that is not a single recorded version, produces a reset-required error. There is
@@ -130,6 +132,12 @@ failures, storage exhaustion and PostgreSQL lock waits. Authenticated calendar-s
 and notification-delivery endpoints expose integration health; they are private API
 resources, not public metrics. Health responses do not attest provider availability.
 No Prometheus endpoint or production throughput guarantee is supplied.
+
+People activity events (schema `1007`) are metadata only, about 200 bytes each, one per
+supported People change. They are kept for the lifetime of the person or field (Kieran's
+1 November 2026 decision), so the table grows with use and is not swept by the expiry job;
+include it when sizing storage. Backups contain these rows and the coverage start, and a
+restore keeps them row for row. No setting shortens their retention.
 
 If the database is unavailable, restore connectivity before restarting repeatedly.
 If storage is full, free/expand storage without deleting the database or WAL. If workers

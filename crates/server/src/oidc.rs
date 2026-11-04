@@ -4,9 +4,10 @@ use axum::response::Redirect;
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use openidconnect::{
     AccessTokenHash, AsyncHttpClient, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
-    EndpointMaybeSet, EndpointNotSet, EndpointSet, HttpRequest, HttpResponse, IssuerUrl, Nonce,
-    OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, TokenResponse,
-    core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata},
+    EndpointMaybeSet, EndpointNotSet, EndpointSet, HttpRequest, HttpResponse, IssuerUrl,
+    JsonWebKey, JwsSigningAlgorithm, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
+    PkceCodeVerifier, RedirectUrl, TokenResponse,
+    core::{CoreAuthenticationFlow, CoreClient, CoreJsonWebKey, CoreProviderMetadata},
     reqwest,
 };
 use std::{future::Future, pin::Pin};
@@ -336,16 +337,29 @@ pub(super) async fn callback(
         .claims(&verifier, &nonce)
         .map_err(|_| anyhow!(ErrorCode::Unauthenticated))?;
     if let Some(expected) = claims.access_token_hash() {
-        let actual = AccessTokenHash::from_token(
-            token.access_token(),
-            id_token
-                .signing_alg()
-                .map_err(|_| anyhow!(ErrorCode::Unauthenticated))?,
+        let alg = id_token
+            .signing_alg()
+            .map_err(|_| anyhow!(ErrorCode::Unauthenticated))?;
+        // `claims` verified an HS256/384/512 signature with the confidential client secret (a
+        // public client refuses them), and a published JWKS never holds that secret, so the
+        // hash key is the library's own symmetric key from that secret, built exactly as its
+        // claims verifier builds it. Any other algorithm keeps the published-key lookup. (The
+        // hash depends only on the algorithm; the key must merely be compatible with it.)
+        let shared;
+        let key = if alg.uses_shared_secret() {
+            let secret = config
+                .secret
+                .as_ref()
+                .ok_or_else(|| anyhow!(ErrorCode::Unauthenticated))?;
+            shared = CoreJsonWebKey::new_symmetric(secret.secret().clone().into_bytes());
+            &shared
+        } else {
             id_token
                 .signing_key(&verifier)
-                .map_err(|_| anyhow!(ErrorCode::Unauthenticated))?,
-        )
-        .map_err(|_| anyhow!(ErrorCode::Unauthenticated))?;
+                .map_err(|_| anyhow!(ErrorCode::Unauthenticated))?
+        };
+        let actual = AccessTokenHash::from_token(token.access_token(), alg, key)
+            .map_err(|_| anyhow!(ErrorCode::Unauthenticated))?;
         ensure_api(actual == *expected, ErrorCode::Unauthenticated)?;
     }
     let subject = claims.subject().as_str();
