@@ -229,6 +229,33 @@ pub(super) async fn dependencies(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct GraphFilter {
+    max_depth: Option<i64>,
+}
+/// The caller-authorised prerequisite graph of one occurrence (BE-DEPENDENCY-GRAPH). A display
+/// and editor read: completion still uses the preview token above.
+pub(super) async fn dependency_graph(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    query: Result<Query<GraphFilter>, QueryRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (actor, _) = identity(&app, &headers).await?;
+    let Query(filter) = query.map_err(|_| anyhow!(ErrorCode::MalformedRequest))?;
+    // Any integer parses, so an out-of-range depth is `invalid_value` rather than malformed.
+    let max_depth = match filter.max_depth {
+        None => atlas_core::tasks::DEPENDENCY_GRAPH_MAX_DEPTH,
+        Some(depth) => u16::try_from(depth).map_err(|_| anyhow!(ErrorCode::InvalidValue))?,
+    };
+    Ok(Json(serde_json::to_value(
+        app.store
+            .dependency_graph(&actor, &id, max_depth, now())
+            .await?,
+    )?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct TimerFilter {
     pub(crate) after: Option<String>,
     pub(crate) limit: Option<u16>,
